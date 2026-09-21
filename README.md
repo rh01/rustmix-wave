@@ -148,7 +148,7 @@ Use the Wi-Fi firmware release for normal Wi-Fi transfer, weather, NTP/time sync
 - Rotary-first product shell with Reader, Productivity, Games, Tools, and Settings categories.
 - Physical **Power short press** opens a display-maintenance menu for manual ghost-clearing refresh.
 - Physical **Power long press** enters the accepted random sleep-image mode with network suspension and route restoration after wake.
-- Reader supports TXT and bounded reflowable EPUB files, TOC navigation, bookmarks, per-book resume, typography preferences, paragraph alignment, and FAT 8.3-safe persistence.
+- Reader supports TXT and bounded reflowable EPUB files, TOC navigation, bookmarks, per-book resume, Chinese (CJK) text via SD `/fonts` TTF/OTF plus Unifont/GB2312 fallback, in-reader font sizes 16/20/24/32/48/72, typography preferences, paragraph alignment, and FAT 8.3-safe persistence.
 - Voice Notes records PCM16 mono 16 kHz WAV files to SD, supports microphone gain, pause/resume, saved-note playback, titles, timestamps, delete confirmation, storage telemetry, and LAN export.
 - Native Dictionary reuses the Rustmix X4 prefix-shard SD pack and uses BOOT-short `NAV H` / `NAV V` keyboard-axis switching.
 - Native Calendar loads personal events and the U.S.-only 2026 pack, renders a daily agenda, and supports recovery-safe personal-event creation, editing, and deletion.
@@ -228,6 +228,34 @@ The ESP-IDF main task remains the narrow hardware-orchestration owner. It owns d
 | Voice Notes capture and playback | Cooperative bounded I2S chunks while native `AudioRuntime` retains codec ownership |
 
 `AppState` is heap-boxed, runtime memory snapshots report main-stack high-water margin and internal/PSRAM heap state, and workers return compact results before terminating. Lua apps never receive panel SPI, raw I2C, networking, or long-lived hardware handles.
+
+## CJK fonts, Reader sizes, and fast refresh
+
+This Wi-Fi feature line keeps transfer, NTP, and weather enabled. It does not use the BLE build that disables Wi-Fi.
+
+Chinese TXT/EPUB pages, titles, and filenames no longer collapse to `?`. Rendering order:
+
+1. Optional SD TTF/OTF faces in `/sdcard/fonts` or `/sdcard/RUSTMIX/FONTS` (OFL families such as Noto Sans SC or Source Han Sans SC). Files larger than 2 MiB are skipped so PSRAM stays available for Wi-Fi, Reader cache, and audio.
+2. Embedded GNU Unifont GB2312 16x16 subset (~261 KiB flash) scaled to the active size.
+
+While reading, SELECT → Reading Preferences cycles:
+
+- font size **16 / 20 / 24 / 32 / 48 / 72** px
+- font face: built-in Latin Inter / Atkinson / Serif / Literata, CJK Unifont, and any loaded SD CJK face
+- existing theme, orientation, paragraph alignment, and progress display
+
+Preferences persist to `/RUSTMIX/READER/PREFS.TXT` and are mirrored to NVS namespace `rw_read`.
+
+Menus, settings, library, Reader page turns, and the Wi-Fi portal use fast partial refresh. Full refresh remains only for boot, wake, manual ghost clean, the 32-frame periodic threshold, sleep images, and safety fallback.
+
+Flash / PSRAM impact:
+
+- Unifont GB2312 subset: about 261 KiB in firmware flash
+- fontdue TTF rasterizer: additional flash for code
+- SD font bytes and the 512 KiB glyph cache allocate from PSRAM (`CONFIG_SPIRAM_USE_MALLOC`)
+- Wi-Fi, NTP, weather, and power/sleep paths are unchanged
+
+See [`docs/SD_CARD_SETUP.md`](docs/SD_CARD_SETUP.md) for SD font install steps.
 
 ## Repository layout
 

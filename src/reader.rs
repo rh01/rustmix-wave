@@ -322,72 +322,115 @@ impl ReaderOrientation {
     }
 }
 
-/// Reader-specific book font size. This is intentionally independent from
-/// `/sdcard/RUSTMIX/DISPLAY.TXT`.
+/// Reader-specific book font size in exact e-paper pixels.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum BookFontSize {
-    Small,
+    Px16,
+    Px20,
     #[default]
-    Medium,
-    Large,
-    XLarge,
+    Px24,
+    Px32,
+    Px48,
+    Px72,
 }
 
 impl BookFontSize {
+    pub const ALL: [Self; 6] = [
+        Self::Px16,
+        Self::Px20,
+        Self::Px24,
+        Self::Px32,
+        Self::Px48,
+        Self::Px72,
+    ];
+
+    #[must_use]
+    pub const fn pixels(self) -> u8 {
+        match self {
+            Self::Px16 => 16,
+            Self::Px20 => 20,
+            Self::Px24 => 24,
+            Self::Px32 => 32,
+            Self::Px48 => 48,
+            Self::Px72 => 72,
+        }
+    }
+
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Small => "Small",
-            Self::Medium => "Medium",
-            Self::Large => "Large",
-            Self::XLarge => "XLarge",
+            Self::Px16 => "16 px",
+            Self::Px20 => "20 px",
+            Self::Px24 => "24 px",
+            Self::Px32 => "32 px",
+            Self::Px48 => "48 px",
+            Self::Px72 => "72 px",
         }
     }
 
     #[must_use]
     pub const fn marker(self) -> &'static str {
         match self {
-            Self::Small => "small",
-            Self::Medium => "medium",
-            Self::Large => "large",
-            Self::XLarge => "xlarge",
+            Self::Px16 => "16",
+            Self::Px20 => "20",
+            Self::Px24 => "24",
+            Self::Px32 => "32",
+            Self::Px48 => "48",
+            Self::Px72 => "72",
+        }
+    }
+
+    pub fn from_pixels(px: u8) -> Result<Self, String> {
+        match crate::fonts::clamp_reader_px(px) {
+            16 => Ok(Self::Px16),
+            20 => Ok(Self::Px20),
+            24 => Ok(Self::Px24),
+            32 => Ok(Self::Px32),
+            48 => Ok(Self::Px48),
+            72 => Ok(Self::Px72),
+            other => Err(format!("unsupported book_font_size value {other}")),
         }
     }
 
     #[must_use]
     pub const fn next(self) -> Self {
         match self {
-            Self::Small => Self::Medium,
-            Self::Medium => Self::Large,
-            Self::Large => Self::XLarge,
-            Self::XLarge => Self::Small,
+            Self::Px16 => Self::Px20,
+            Self::Px20 => Self::Px24,
+            Self::Px24 => Self::Px32,
+            Self::Px32 => Self::Px48,
+            Self::Px48 => Self::Px72,
+            Self::Px72 => Self::Px16,
         }
     }
 
     #[must_use]
     pub const fn previous(self) -> Self {
         match self {
-            Self::Small => Self::XLarge,
-            Self::Medium => Self::Small,
-            Self::Large => Self::Medium,
-            Self::XLarge => Self::Large,
+            Self::Px16 => Self::Px72,
+            Self::Px20 => Self::Px16,
+            Self::Px24 => Self::Px20,
+            Self::Px32 => Self::Px24,
+            Self::Px48 => Self::Px32,
+            Self::Px72 => Self::Px48,
         }
     }
 
     fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "small" => Ok(Self::Small),
-            "medium" => Ok(Self::Medium),
-            "large" => Ok(Self::Large),
-            "xlarge" | "extra-large" | "extra_large" => Ok(Self::XLarge),
+            "16" | "small" => Ok(Self::Px16),
+            "20" => Ok(Self::Px20),
+            "24" | "medium" => Ok(Self::Px24),
+            "32" | "large" => Ok(Self::Px32),
+            "48" | "xlarge" | "extra-large" | "extra_large" => Ok(Self::Px48),
+            "72" => Ok(Self::Px72),
             other => Err(format!("unsupported book_font_size value {other:?}")),
         }
     }
 }
 
-/// Reader-specific body font family. Reader-only generated bitmap strikes are
-/// printable-ASCII subsets; raw font files are not distributed. Persisted
-/// `serif` and `atkinson-hyperlegible` keys remain stable for compatibility.
+/// Reader-specific body font family. Built-in Latin strikes remain ASCII-only;
+/// CJK uses SD TTF/OTF when present and the embedded Unifont GB2312 fallback.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum BookFont {
     Inter,
@@ -395,6 +438,8 @@ pub enum BookFont {
     #[default]
     Serif,
     Literata,
+    CjkUnifont,
+    SdCjk,
 }
 
 impl BookFont {
@@ -405,6 +450,19 @@ impl BookFont {
             Self::AtkinsonHyperlegible => "Atkinson",
             Self::Serif => "Serif",
             Self::Literata => "Literata",
+            Self::CjkUnifont => "CJK Unifont",
+            Self::SdCjk => "SD CJK",
+        }
+    }
+
+    #[must_use]
+    pub fn display_label(self, sd_file: Option<&str>) -> String {
+        match (self, sd_file) {
+            (Self::SdCjk, Some(name)) => name
+                .rsplit_once('.')
+                .map(|(stem, _)| stem.to_string())
+                .unwrap_or_else(|| name.to_string()),
+            _ => self.label().to_string(),
         }
     }
 
@@ -415,37 +473,25 @@ impl BookFont {
             Self::AtkinsonHyperlegible => "atkinson-hyperlegible",
             Self::Serif => "serif",
             Self::Literata => "literata",
+            Self::CjkUnifont => "cjk-unifont",
+            Self::SdCjk => "sd-cjk",
         }
     }
 
-    #[must_use]
-    pub const fn next(self) -> Self {
-        match self {
-            Self::Inter => Self::AtkinsonHyperlegible,
-            Self::AtkinsonHyperlegible => Self::Serif,
-            Self::Serif => Self::Literata,
-            Self::Literata => Self::Inter,
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let trimmed = value.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("sd:") || lower.starts_with("sd-cjk") {
+            return Ok(Self::SdCjk);
         }
-    }
-
-    #[must_use]
-    pub const fn previous(self) -> Self {
-        match self {
-            Self::Inter => Self::Literata,
-            Self::AtkinsonHyperlegible => Self::Inter,
-            Self::Serif => Self::AtkinsonHyperlegible,
-            Self::Literata => Self::Serif,
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self, String> {
-        match value.trim().to_ascii_lowercase().as_str() {
+        match lower.as_str() {
             "inter" => Ok(Self::Inter),
             "atkinson" | "atkinson-hyperlegible" | "atkinson_hyperlegible" => {
                 Ok(Self::AtkinsonHyperlegible)
             }
             "serif" | "dejavu-serif" => Ok(Self::Serif),
             "literata" => Ok(Self::Literata),
+            "cjk" | "cjk-unifont" | "unifont" | "gb2312" => Ok(Self::CjkUnifont),
             other => Err(format!("unsupported book_font value {other:?}")),
         }
     }
@@ -518,6 +564,9 @@ impl ParagraphAlignment {
 pub struct ReaderLayout {
     pub chars_per_line: usize,
     pub lines_per_page: usize,
+    pub max_line_width_px: i32,
+    pub ascii_advance_px: i32,
+    pub font_size_px: u8,
     pub orientation: ReaderOrientation,
     pub font_size: BookFontSize,
     pub book_font: BookFont,
@@ -533,6 +582,7 @@ pub struct ReaderPreferences {
     pub book_font: BookFont,
     pub paragraph_alignment: ParagraphAlignment,
     pub show_progress: bool,
+    sd_cjk_file: [u8; 13],
 }
 
 impl Default for ReaderPreferences {
@@ -540,75 +590,85 @@ impl Default for ReaderPreferences {
         Self {
             theme: ReadingTheme::Classic,
             orientation: ReaderOrientation::Portrait,
-            font_size: BookFontSize::Medium,
+            font_size: BookFontSize::Px24,
             book_font: BookFont::Serif,
             paragraph_alignment: ParagraphAlignment::Justified,
             show_progress: true,
+            sd_cjk_file: [0; 13],
         }
     }
 }
 
 impl ReaderPreferences {
     #[must_use]
-    pub const fn layout(self) -> ReaderLayout {
-        // Reader pages share one bounded body viewport across Classic and
-        // High Contrast. Serif and Literata use proportional glyphs, so their
-        // conservative character budgets are slightly smaller than the UI-family strikes.
-        // A final pixel clip in the renderer guards unusually wide lines.
-        let (chars_per_line, lines_per_page) =
-            match (self.orientation, self.font_size, self.book_font) {
-                (
-                    ReaderOrientation::Portrait,
-                    BookFontSize::Small,
-                    BookFont::Serif | BookFont::Literata,
-                ) => (39, 25),
-                (
-                    ReaderOrientation::Portrait,
-                    BookFontSize::Medium,
-                    BookFont::Serif | BookFont::Literata,
-                ) => (35, 22),
-                (
-                    ReaderOrientation::Portrait,
-                    BookFontSize::Large,
-                    BookFont::Serif | BookFont::Literata,
-                ) => (30, 19),
-                (
-                    ReaderOrientation::Portrait,
-                    BookFontSize::XLarge,
-                    BookFont::Serif | BookFont::Literata,
-                ) => (25, 16),
-                (ReaderOrientation::Portrait, BookFontSize::Small, _) => (43, 25),
-                (ReaderOrientation::Portrait, BookFontSize::Medium, _) => (38, 22),
-                (ReaderOrientation::Portrait, BookFontSize::Large, _) => (33, 19),
-                (ReaderOrientation::Portrait, BookFontSize::XLarge, _) => (27, 16),
-                (
-                    ReaderOrientation::Landscape,
-                    BookFontSize::Small,
-                    BookFont::Serif | BookFont::Literata,
-                ) => (68, 13),
-                (
-                    ReaderOrientation::Landscape,
-                    BookFontSize::Medium,
-                    BookFont::Serif | BookFont::Literata,
-                ) => (58, 11),
-                (
-                    ReaderOrientation::Landscape,
-                    BookFontSize::Large,
-                    BookFont::Serif | BookFont::Literata,
-                ) => (49, 10),
-                (
-                    ReaderOrientation::Landscape,
-                    BookFontSize::XLarge,
-                    BookFont::Serif | BookFont::Literata,
-                ) => (41, 8),
-                (ReaderOrientation::Landscape, BookFontSize::Small, _) => (72, 13),
-                (ReaderOrientation::Landscape, BookFontSize::Medium, _) => (64, 11),
-                (ReaderOrientation::Landscape, BookFontSize::Large, _) => (55, 10),
-                (ReaderOrientation::Landscape, BookFontSize::XLarge, _) => (45, 8),
-            };
+    pub fn sd_cjk_file_name(&self) -> Option<&str> {
+        let end = self
+            .sd_cjk_file
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(self.sd_cjk_file.len());
+        if end == 0 {
+            None
+        } else {
+            core::str::from_utf8(&self.sd_cjk_file[..end]).ok()
+        }
+    }
+
+    pub fn set_sd_cjk_file_name(&mut self, name: Option<&str>) {
+        self.sd_cjk_file = [0; 13];
+        let Some(name) = name else {
+            return;
+        };
+        let bytes = name.as_bytes();
+        let len = bytes.len().min(self.sd_cjk_file.len());
+        self.sd_cjk_file[..len].copy_from_slice(&bytes[..len]);
+    }
+
+    pub fn apply_parsed_book_font(&mut self, font: BookFont, raw: &str) {
+        self.book_font = font;
+        if font == BookFont::SdCjk {
+            let file = raw
+                .trim()
+                .split_once(':')
+                .map(|(_, name)| name.trim())
+                .filter(|name| !name.is_empty());
+            self.set_sd_cjk_file_name(file);
+        } else {
+            self.set_sd_cjk_file_name(None);
+        }
+    }
+
+    #[must_use]
+    pub fn nvs_face_marker(&self) -> String {
+        if self.book_font == BookFont::SdCjk {
+            if let Some(name) = self.sd_cjk_file_name() {
+                return format!("sd:{name}");
+            }
+        }
+        self.book_font.marker().to_string()
+    }
+
+    #[must_use]
+    pub fn layout(self) -> ReaderLayout {
+        let px = self.font_size.pixels();
+        let (width_px, height_px) = match self.orientation {
+            ReaderOrientation::Portrait => (432, 594),
+            ReaderOrientation::Landscape => (752, 300),
+        };
+        let line_step = i32::from(px) + i32::from(px) / 4 + 2;
+        let lines_per_page = (height_px / line_step).max(4) as usize;
+        let ascii_advance_px = match self.book_font {
+            BookFont::Serif | BookFont::Literata => (i32::from(px) * 10 / 20).max(6),
+            BookFont::CjkUnifont | BookFont::SdCjk => (i32::from(px) / 2).max(6),
+            _ => (i32::from(px) * 11 / 20).max(6),
+        };
+        let chars_per_line = (width_px / ascii_advance_px).max(8) as usize;
         ReaderLayout {
             chars_per_line,
             lines_per_page,
+            max_line_width_px: width_px,
+            ascii_advance_px,
+            font_size_px: px,
             orientation: self.orientation,
             font_size: self.font_size,
             book_font: self.book_font,
@@ -625,7 +685,7 @@ impl ReaderPreferences {
             self.theme.marker(),
             self.orientation.marker(),
             self.font_size.marker(),
-            self.book_font.marker(),
+            self.nvs_face_marker(),
             self.paragraph_alignment.marker(),
             show_progress,
         )
@@ -647,7 +707,10 @@ impl ReaderPreferences {
                 "theme" => prefs.theme = ReadingTheme::parse(value)?,
                 "orientation" => prefs.orientation = ReaderOrientation::parse(value)?,
                 "font_size" => prefs.font_size = BookFontSize::parse(value)?,
-                "book_font" => prefs.book_font = BookFont::parse(value)?,
+                "book_font" => {
+                    let parsed = BookFont::parse(value)?;
+                    prefs.apply_parsed_book_font(parsed, value);
+                }
                 "paragraph_alignment" => {
                     prefs.paragraph_alignment = ParagraphAlignment::parse(value)?
                 }
@@ -1095,10 +1158,10 @@ pub enum ReadingPreference {
 
 impl ReadingPreference {
     pub const ALL: [Self; 6] = [
-        Self::ReadingTheme,
-        Self::Orientation,
         Self::BookFontSize,
         Self::BookFont,
+        Self::ReadingTheme,
+        Self::Orientation,
         Self::ParagraphAlignment,
         Self::ShowProgress,
     ];
@@ -1165,6 +1228,7 @@ pub struct ReaderUiState {
     persistence_event: Option<String>,
     last_persistence_event: Option<String>,
     clear_ghost_requested: bool,
+    pub sd_cjk_faces: Vec<crate::fonts::SdFontFace>,
 }
 
 impl Default for ReaderUiState {
@@ -1193,11 +1257,45 @@ impl Default for ReaderUiState {
             persistence_event: None,
             last_persistence_event: None,
             clear_ghost_requested: false,
+            sd_cjk_faces: Vec::new(),
         }
     }
 }
 
 impl ReaderUiState {
+    pub fn refresh_font_catalog(&mut self) {
+        self.sd_cjk_faces = crate::fonts::sd_faces();
+        if self.preferences.book_font == BookFont::SdCjk {
+            let wanted = self.preferences.sd_cjk_file_name();
+            let matched = wanted.and_then(|name| {
+                self.sd_cjk_faces
+                    .iter()
+                    .find(|face| face.file_name.eq_ignore_ascii_case(name))
+            });
+            if let Some(face) = matched {
+                self.preferences.set_sd_cjk_file_name(Some(&face.file_name));
+                crate::fonts::set_preferred_sd_file(Some(&face.file_name));
+            } else if self.sd_cjk_faces.is_empty() {
+                self.preferences.book_font = BookFont::CjkUnifont;
+                self.preferences.set_sd_cjk_file_name(None);
+                crate::fonts::set_preferred_sd_file(None);
+            } else {
+                let face = &self.sd_cjk_faces[0];
+                self.preferences.set_sd_cjk_file_name(Some(&face.file_name));
+                crate::fonts::set_preferred_sd_file(Some(&face.file_name));
+            }
+        } else {
+            crate::fonts::set_preferred_sd_file(self.preferences.sd_cjk_file_name());
+        }
+    }
+
+    #[must_use]
+    pub fn book_font_display_label(&self) -> String {
+        self.preferences
+            .book_font
+            .display_label(self.preferences.sd_cjk_file_name())
+    }
+
     #[must_use]
     pub fn with_books_root(root: impl Into<String>) -> Self {
         Self {
@@ -1230,6 +1328,10 @@ impl ReaderUiState {
                 false
             }
         };
+        if !preferences_loaded {
+            let _ = crate::reader_nvs::load_reader_preferences_overlay(&mut self.preferences);
+        }
+        self.refresh_font_catalog();
         self.resume = match load_location_record(&self.state_path()) {
             Ok(value) => value,
             Err(error) => {
@@ -1859,9 +1961,8 @@ impl ReaderUiState {
                 true
             }
             ReadingPreference::BookFont => {
-                self.preferences.book_font = self.preferences.book_font.next();
-                self.last_message =
-                    Some(format!("Book font: {}", self.preferences.book_font.label()));
+                self.cycle_book_font_choice();
+                self.last_message = Some(format!("Book font: {}", self.book_font_display_label()));
                 true
             }
             ReadingPreference::ParagraphAlignment => {
@@ -1926,9 +2027,47 @@ impl ReaderUiState {
     }
 
     pub fn cycle_book_font(&mut self) -> bool {
-        self.preferences.book_font = self.preferences.book_font.next();
-        self.last_message = Some(format!("Book font: {}", self.preferences.book_font.label()));
+        self.cycle_book_font_choice();
+        self.last_message = Some(format!("Book font: {}", self.book_font_display_label()));
         self.request_layout_rebuild()
+    }
+
+    fn cycle_book_font_choice(&mut self) {
+        let next = match self.preferences.book_font {
+            BookFont::Inter => BookFont::AtkinsonHyperlegible,
+            BookFont::AtkinsonHyperlegible => BookFont::Serif,
+            BookFont::Serif => BookFont::Literata,
+            BookFont::Literata => BookFont::CjkUnifont,
+            BookFont::CjkUnifont if self.sd_cjk_faces.is_empty() => BookFont::Inter,
+            BookFont::CjkUnifont => BookFont::SdCjk,
+            BookFont::SdCjk => {
+                let current = self.preferences.sd_cjk_file_name();
+                let index = current
+                    .and_then(|name| {
+                        self.sd_cjk_faces
+                            .iter()
+                            .position(|face| face.file_name.eq_ignore_ascii_case(name))
+                    })
+                    .unwrap_or(0);
+                if index + 1 < self.sd_cjk_faces.len() {
+                    self.preferences
+                        .set_sd_cjk_file_name(Some(&self.sd_cjk_faces[index + 1].file_name));
+                    crate::fonts::set_preferred_sd_file(self.preferences.sd_cjk_file_name());
+                    self.preferences.book_font = BookFont::SdCjk;
+                    return;
+                }
+                BookFont::Inter
+            }
+        };
+        if next == BookFont::SdCjk {
+            if let Some(face) = self.sd_cjk_faces.first() {
+                self.preferences.set_sd_cjk_file_name(Some(&face.file_name));
+            }
+        } else if next != BookFont::SdCjk {
+            self.preferences.set_sd_cjk_file_name(None);
+        }
+        self.preferences.book_font = next;
+        crate::fonts::set_preferred_sd_file(self.preferences.sd_cjk_file_name());
     }
 
     pub fn toggle_show_progress(&mut self) {
@@ -2217,6 +2356,7 @@ impl ReaderUiState {
         {
             errors.push(format!("PREFS.TXT: {error}"));
         }
+        crate::reader_nvs::save_reader_preferences(&self.preferences);
         self.finish_persistence("preferences", errors);
     }
 
@@ -2524,6 +2664,10 @@ fn normalize_decoded(decoded: &[(char, u64)]) -> Vec<(char, u64)> {
 }
 
 fn push_normalized_character(output: &mut Vec<(char, u64)>, character: char, next_offset: u64) {
+    if crate::fonts::is_cjk_codepoint(character) {
+        output.push((character, next_offset));
+        return;
+    }
     let replacement: &str = match character {
         '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{00AB}' | '\u{00BB}' => "\"",
         '\u{2018}' | '\u{2019}' | '\u{201A}' => "'",
@@ -2562,6 +2706,7 @@ fn is_word_character(character: char) -> bool {
 fn paginate_decoded(decoded: &[(char, u64)], layout: ReaderLayout) -> (Vec<ReaderPageLine>, u64) {
     let mut lines = Vec::new();
     let mut line = String::new();
+    let mut line_width = 0i32;
     let mut consumed = decoded
         .first()
         .map_or(0, |(_, offset)| offset.saturating_sub(1));
@@ -2573,6 +2718,7 @@ fn paginate_decoded(decoded: &[(char, u64)], layout: ReaderLayout) -> (Vec<Reade
                     text: core::mem::take(&mut line),
                     paragraph_end: true,
                 });
+                line_width = 0;
                 consumed = next_offset;
                 if lines.len() >= layout.lines_per_page {
                     break;
@@ -2582,11 +2728,25 @@ fn paginate_decoded(decoded: &[(char, u64)], layout: ReaderLayout) -> (Vec<Reade
             value if value.is_control() => ' ',
             value => value,
         };
-        if line.chars().count() >= layout.chars_per_line {
+        let advance = if character.is_ascii() {
+            if character == ' ' {
+                layout.ascii_advance_px
+            } else {
+                layout.ascii_advance_px
+            }
+        } else {
+            crate::fonts::unicode_advance(
+                character,
+                layout.font_size_px,
+                layout.ascii_advance_px as u8,
+            )
+        };
+        if !line.is_empty() && line_width + advance > layout.max_line_width_px {
             lines.push(ReaderPageLine {
                 text: core::mem::take(&mut line),
                 paragraph_end: false,
             });
+            line_width = 0;
             if lines.len() >= layout.lines_per_page {
                 break;
             }
@@ -2594,9 +2754,11 @@ fn paginate_decoded(decoded: &[(char, u64)], layout: ReaderLayout) -> (Vec<Reade
         if character.is_whitespace() {
             if !line.is_empty() && !line.ends_with(' ') {
                 line.push(' ');
+                line_width += advance;
             }
         } else {
             line.push(character);
+            line_width += advance;
         }
         consumed = next_offset;
     }
@@ -2656,6 +2818,8 @@ fn book_fingerprint(book: &ReaderBook, layout: ReaderLayout) -> u64 {
     feed(&mut hash, book.format.marker().as_bytes());
     feed(&mut hash, &layout.lines_per_page.to_le_bytes());
     feed(&mut hash, &layout.chars_per_line.to_le_bytes());
+    feed(&mut hash, &layout.max_line_width_px.to_le_bytes());
+    feed(&mut hash, &layout.font_size_px.to_le_bytes());
     feed(&mut hash, layout.orientation.marker().as_bytes());
     feed(&mut hash, layout.font_size.marker().as_bytes());
     feed(&mut hash, layout.book_font.marker().as_bytes());
@@ -3096,13 +3260,14 @@ mod tests {
 
     use super::{
         atomic_replace_text, book_format_from_path, detect_txt_encoding, is_fat83_safe_file_name,
-        load_location_record, normalize_decoded, parse_location_fields, parse_location_record,
-        scan_txt_library, serialize_location, serialize_location_fields, BookFont, BookFontSize,
-        BookFormat, ParagraphAlignment, ReaderBook, ReaderChapterPageLabel, ReaderLoadingStage,
-        ReaderLocation, ReaderOrientation, ReaderPreferences, ReaderSession, ReaderTickOutcome,
-        ReaderUiState, ReadingPreference, ReadingTheme, TextEncoding, LEGACY_READER_POSITIONS_FILE,
-        READER_BOOKMARKS_FILE, READER_EPUB_INDEX_YIELD_EVERY_PAGES, READER_EPUB_INDEX_YIELD_MILLIS,
-        READER_POSITIONS_FILE, READER_PREFS_FILE, READER_RECENT_FILE, READER_STATE_FILE,
+        load_location_record, normalize_decoded, paginate_decoded, parse_location_fields,
+        parse_location_record, scan_txt_library, serialize_location, serialize_location_fields,
+        BookFont, BookFontSize, BookFormat, ParagraphAlignment, ReaderBook, ReaderChapterPageLabel,
+        ReaderLoadingStage, ReaderLocation, ReaderOrientation, ReaderPreferences, ReaderSession,
+        ReaderTickOutcome, ReaderUiState, ReadingPreference, ReadingTheme, TextEncoding,
+        LEGACY_READER_POSITIONS_FILE, READER_BOOKMARKS_FILE, READER_EPUB_INDEX_YIELD_EVERY_PAGES,
+        READER_EPUB_INDEX_YIELD_MILLIS, READER_POSITIONS_FILE, READER_PREFS_FILE,
+        READER_RECENT_FILE, READER_STATE_FILE,
     };
     use crate::buttons::ButtonEvent;
 
@@ -3359,6 +3524,31 @@ mod tests {
     }
 
     #[test]
+    fn cjk_text_is_preserved_and_wraps_on_pixel_width() {
+        let decoded: Vec<(char, u64)> = "中文阅读器ABCDEF"
+            .chars()
+            .enumerate()
+            .map(|(index, value)| (value, index as u64 + 1))
+            .collect();
+        let normalized: String = normalize_decoded(&decoded)
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert!(normalized.contains('中'));
+        assert!(normalized.contains('文'));
+        assert!(!normalized.contains('?'));
+        let layout = ReaderPreferences {
+            font_size: BookFontSize::Px16,
+            book_font: BookFont::CjkUnifont,
+            ..ReaderPreferences::default()
+        }
+        .layout();
+        let (lines, _) = paginate_decoded(&normalize_decoded(&decoded), layout);
+        assert!(!lines.is_empty());
+        assert!(lines.iter().any(|line| line.text.contains('中')));
+    }
+
+    #[test]
     fn theme_switch_keeps_layout_geometry_and_cache_fingerprint_inputs_stable() {
         let classic = ReaderPreferences::default();
         let mut contrast = classic;
@@ -3367,19 +3557,27 @@ mod tests {
     }
 
     #[test]
-    fn reader_font_cycle_preserves_legacy_keys_and_adds_literata() {
+    fn reader_font_cycle_preserves_legacy_keys_and_adds_cjk_faces() {
         assert_eq!(
             BookFont::AtkinsonHyperlegible.marker(),
             "atkinson-hyperlegible"
         );
         assert_eq!(BookFont::Serif.marker(), "serif");
         assert_eq!(BookFont::Literata.marker(), "literata");
-        assert_eq!(BookFont::Inter.next(), BookFont::AtkinsonHyperlegible);
-        assert_eq!(BookFont::AtkinsonHyperlegible.next(), BookFont::Serif);
-        assert_eq!(BookFont::Serif.next(), BookFont::Literata);
-        assert_eq!(BookFont::Literata.next(), BookFont::Inter);
-        assert_eq!(BookFont::Inter.previous(), BookFont::Literata);
+        assert_eq!(BookFont::CjkUnifont.marker(), "cjk-unifont");
         assert_eq!(BookFont::parse("literata").unwrap(), BookFont::Literata);
+        assert_eq!(
+            BookFont::parse("cjk-unifont").unwrap(),
+            BookFont::CjkUnifont
+        );
+        assert_eq!(BookFont::parse("sd:NOTOSC.TTF").unwrap(), BookFont::SdCjk);
+        assert_eq!(BookFontSize::parse("24").unwrap(), BookFontSize::Px24);
+        assert_eq!(BookFontSize::parse("xlarge").unwrap(), BookFontSize::Px48);
+        assert_eq!(BookFontSize::Px24.next(), BookFontSize::Px32);
+        assert_eq!(
+            BookFontSize::ALL.map(BookFontSize::pixels),
+            [16, 20, 24, 32, 48, 72]
+        );
     }
 
     #[test]
@@ -3390,11 +3588,11 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.theme, ReadingTheme::HighContrast);
         assert_eq!(parsed.orientation, ReaderOrientation::Landscape);
-        assert_eq!(parsed.font_size, BookFontSize::XLarge);
+        assert_eq!(parsed.font_size, BookFontSize::Px48);
         assert_eq!(parsed.book_font, BookFont::Serif);
         assert_eq!(parsed.paragraph_alignment, ParagraphAlignment::Right);
         assert!(!parsed.show_progress);
-        assert!(parsed.serialized().contains("font_size=xlarge"));
+        assert!(parsed.serialized().contains("font_size=48"));
         assert!(parsed.serialized().contains("book_font=serif"));
         assert!(parsed.serialized().contains("paragraph_alignment=right"));
     }
@@ -3477,17 +3675,17 @@ mod tests {
         reader.begin_preferences_edit();
         assert_eq!(
             reader.selected_preference(),
-            ReadingPreference::ReadingTheme
+            ReadingPreference::BookFontSize
         );
         reader.cycle_preference_next();
-        assert_eq!(reader.selected_preference(), ReadingPreference::Orientation);
+        assert_eq!(reader.selected_preference(), ReadingPreference::BookFont);
         reader.cycle_preference_previous();
         assert_eq!(
             reader.selected_preference(),
-            ReadingPreference::ReadingTheme
+            ReadingPreference::BookFontSize
         );
         assert!(!reader.activate_selected_preference());
-        assert_eq!(reader.preferences.theme, ReadingTheme::HighContrast);
+        assert_eq!(reader.preferences.font_size, BookFontSize::Px32);
     }
 
     #[test]

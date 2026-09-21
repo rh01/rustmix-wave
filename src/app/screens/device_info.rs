@@ -20,6 +20,7 @@ use crate::{
     },
     build_info::{FIRMWARE_VERSION, PRODUCT_NAME},
     orientation::OrientedFrameBuffer,
+    panel_refresh::PANEL_PARTIAL_REFRESH_LIMIT,
 };
 
 /// Page 1/3: product firmware and display contract.
@@ -31,7 +32,10 @@ pub fn render_device_info(
     let body = state.display.body_style();
     let version = format!("v{FIRMWARE_VERSION}");
     let orientation = state.orientation.label();
-    let partials = format!("{} / 24", state.partial_refreshes);
+    let partials = format!(
+        "{} / {PANEL_PARTIAL_REFRESH_LIMIT}",
+        state.partial_refreshes
+    );
 
     draw_header(
         display,

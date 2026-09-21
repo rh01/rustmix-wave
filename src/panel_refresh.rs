@@ -7,7 +7,10 @@
 //! isolated hardware experiment.
 
 /// Periodic ghost-cleanup cadence shared by menus, Reader screens and games.
-pub const PANEL_PARTIAL_REFRESH_LIMIT: u8 = 24;
+/// UI navigation, library browsing, Reader page turns and the Wi-Fi portal all
+/// use partial refresh until this threshold, a wake/boot, a manual ghost
+/// clean, sleep-image display, or a safety fallback.
+pub const PANEL_PARTIAL_REFRESH_LIMIT: u8 = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PanelRefreshRequest {

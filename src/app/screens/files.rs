@@ -88,7 +88,7 @@ pub fn render_files(
         )
         .draw(display)?;
         Text::new(
-            &truncate_label(&entry.name, 29),
+            &heading.truncate(&entry.name, 29, 300),
             Point::new(62, top + 23),
             heading,
         )

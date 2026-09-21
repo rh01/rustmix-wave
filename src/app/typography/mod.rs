@@ -11,6 +11,7 @@ use embedded_graphics::{
 };
 
 use super::display::{DisplayPreferences, UiFontFamily, UiFontSize};
+use crate::fonts::{self, ClipRect};
 
 mod assets;
 
@@ -88,8 +89,18 @@ impl TextBounds {
     }
 
     #[must_use]
-    const fn contains(self, point: Point) -> bool {
+    pub const fn contains(self, point: Point) -> bool {
         point.x >= self.left && point.x < self.right && point.y >= self.top && point.y < self.bottom
+    }
+
+    #[must_use]
+    pub const fn clip(self) -> ClipRect {
+        ClipRect {
+            left: self.left,
+            top: self.top,
+            right: self.right,
+            bottom: self.bottom,
+        }
     }
 }
 
@@ -98,27 +109,82 @@ impl TextBounds {
 pub struct UiTextStyle {
     font: &'static BitmapFont,
     color: BinaryColor,
+    pixel_scale: u8,
+    cjk_px: u8,
 }
 
 impl UiTextStyle {
     #[must_use]
     pub const fn new(font: &'static BitmapFont, color: BinaryColor) -> Self {
-        Self { font, color }
+        Self {
+            font,
+            color,
+            pixel_scale: 1,
+            cjk_px: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_scale(self, pixel_scale: u8) -> Self {
+        Self {
+            font: self.font,
+            color: self.color,
+            pixel_scale: if pixel_scale == 0 { 1 } else { pixel_scale },
+            cjk_px: self.cjk_px,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_cjk_px(self, cjk_px: u8) -> Self {
+        Self {
+            font: self.font,
+            color: self.color,
+            pixel_scale: self.pixel_scale,
+            cjk_px,
+        }
     }
 
     #[must_use]
     pub const fn line_height(self) -> u8 {
-        self.font.line_height
+        let scale = if self.pixel_scale == 0 {
+            1
+        } else {
+            self.pixel_scale
+        };
+        self.font.line_height.saturating_mul(scale)
     }
 
-    /// Measure one printable-ASCII Reader line using this bitmap strike.
-    /// Unsupported characters follow the same `?` fallback as drawing.
+    #[must_use]
+    pub fn cjk_px(self) -> u8 {
+        if self.cjk_px == 0 {
+            fonts::ui_cjk_px(self.line_height())
+        } else {
+            self.cjk_px
+        }
+    }
+
+    #[must_use]
+    fn latin_advance(self, character: char) -> u8 {
+        self.font
+            .glyph(character)
+            .advance
+            .saturating_mul(self.pixel_scale.max(1))
+    }
+
+    /// Measure mixed Latin + CJK text. ASCII uses the bitmap strike; CJK uses
+    /// the Unifont/SD fallback cell.
     #[must_use]
     pub fn text_width(self, text: &str) -> i32 {
-        text.chars()
-            .filter(|character| *character != '\n')
-            .map(|character| i32::from(self.font.glyph(character).advance))
-            .sum()
+        fonts::measure_mixed(text, self.cjk_px(), |character| {
+            self.latin_advance(character)
+        })
+    }
+
+    #[must_use]
+    pub fn truncate(self, text: &str, max_chars: usize, max_px: i32) -> String {
+        fonts::truncate_to_width(text, max_chars, max_px, self.cjk_px(), |character| {
+            self.latin_advance(character)
+        })
     }
 }
 
@@ -173,12 +239,23 @@ impl<'a> Text<'a> {
         for character in self.text.chars() {
             if character == '\n' {
                 cursor.x = start_x;
-                cursor.y += i32::from(self.style.font.line_height);
+                cursor.y += i32::from(self.style.line_height());
+                continue;
+            }
+            if let Some(advance) = fonts::draw_mixed_char(
+                display,
+                cursor,
+                character,
+                self.style.cjk_px(),
+                self.style.color,
+                bounds.map(TextBounds::clip),
+            )? {
+                cursor.x += i32::from(advance);
                 continue;
             }
             let glyph = self.style.font.glyph(character);
             draw_glyph(display, cursor, glyph, self.style, bounds)?;
-            cursor.x += i32::from(glyph.advance);
+            cursor.x += i32::from(self.style.latin_advance(character));
         }
         Ok(cursor)
     }
@@ -194,6 +271,7 @@ fn draw_glyph<D>(
 where
     D: DrawTarget<Color = BinaryColor>,
 {
+    let scale = usize::from(style.pixel_scale.max(1));
     let stride = (usize::from(glyph.width) + 7) / 8;
     let offset = glyph.offset as usize;
     for row in 0..usize::from(glyph.height) {
@@ -202,12 +280,22 @@ where
             if byte & (0x80 >> (column % 8)) == 0 {
                 continue;
             }
-            let point = Point::new(
-                baseline.x + i32::from(glyph.left) + column as i32,
-                baseline.y + i32::from(glyph.top) + row as i32,
-            );
-            if bounds.map_or(true, |clip| clip.contains(point)) {
-                display.draw_iter(core::iter::once(Pixel(point, style.color)))?;
+            for dy in 0..scale {
+                for dx in 0..scale {
+                    let point = Point::new(
+                        baseline.x
+                            + i32::from(glyph.left) * scale as i32
+                            + column as i32 * scale as i32
+                            + dx as i32,
+                        baseline.y
+                            + i32::from(glyph.top) * scale as i32
+                            + row as i32 * scale as i32
+                            + dy as i32,
+                    );
+                    if bounds.map_or(true, |clip| clip.contains(point)) {
+                        display.draw_iter(core::iter::once(Pixel(point, style.color)))?;
+                    }
+                }
             }
         }
     }
@@ -332,6 +420,18 @@ mod tests {
             .draw_clipped(&mut display, TextBounds::new(0, 0, 10, 64))
             .unwrap();
         assert!(cursor.x > 10);
+    }
+
+    #[test]
+    fn renders_cjk_without_ascii_fallback() {
+        let mut display = MockDisplay::<BinaryColor>::new();
+        display.set_allow_overdraw(true);
+        display.set_allow_out_of_bounds_drawing(true);
+        let style = DisplayPreferences::default().body_style();
+        let cursor = Text::new("中", Point::new(0, 24), style)
+            .draw(&mut display)
+            .unwrap();
+        assert!(cursor.x >= 16);
     }
 
     #[test]

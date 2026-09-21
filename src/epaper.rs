@@ -132,12 +132,13 @@ where
         self.turn_on_display(0xF7)
     }
 
-    /// Apply a full-screen partial refresh. This intentionally mirrors the
-    /// vendor UI behavior while keeping the API narrow for the first milestone.
+    /// Apply a full-screen fast/partial refresh. Subsequent UI frames skip the
+    /// long hardware-reset used by `initialize` / `show_base` so menus, Reader
+    /// page turns and the Wi-Fi portal stay on the DU waveform.
     pub fn show_partial_fullscreen(&mut self, frame: &[u8]) -> Result<()> {
         validate_frame(frame)?;
         info!("epd397: partial full-screen refresh");
-        self.hardware_reset()?;
+        self.hardware_reset_fast()?;
         self.command_data(0x18, &[0x80])?;
         self.command_data(0x3C, &[0x80])?;
         self.command_data(0x44, &[0x00, 0x00, 0x18, 0x03])?; // 0 .. 792
@@ -164,6 +165,22 @@ where
             .set_low()
             .map_err(|error| anyhow!("EPD_DC low failed: {error:?}"))?;
         self.power.disable_panel_rail()?;
+        self.delay.delay_ms(10);
+        Ok(())
+    }
+
+    fn hardware_reset_fast(&mut self) -> Result<()> {
+        self.reset
+            .set_high()
+            .map_err(|error| anyhow!("EPD_RST high failed: {error:?}"))?;
+        self.delay.delay_ms(10);
+        self.reset
+            .set_low()
+            .map_err(|error| anyhow!("EPD_RST low failed: {error:?}"))?;
+        self.delay.delay_ms(2);
+        self.reset
+            .set_high()
+            .map_err(|error| anyhow!("EPD_RST high failed: {error:?}"))?;
         self.delay.delay_ms(10);
         Ok(())
     }

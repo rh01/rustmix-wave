@@ -57,6 +57,7 @@ mod firmware {
         },
         dictionary::{DICTIONARY_ROOT, DICTIONARY_SHARD_MAX_BYTES},
         epaper::Epaper397,
+        fonts::{self, SD_FONT_DIRECTORIES},
         framebuffer::FrameBuffer,
         games::dirty_regions::MAX_DIRTY_REGIONS,
         imu_events::IMU_EVENT_SAMPLE_INTERVAL_MS,
@@ -348,6 +349,17 @@ mod firmware {
         let mut panel_refresh = PanelRefreshCoordinator::default();
         sync_panel_refresh_diagnostics(&mut state, &panel_refresh);
         state.display = display_preferences;
+        let font_status = fonts::init_from_sd(&[]);
+        for note in fonts::load_notes() {
+            info!("rustmix-wave=cjk-sd-font {note}");
+        }
+        info!(
+            "rustmix-wave=cjk-font-engine-ready fallback=unifont-gb2312 unifont-glyphs={} unifont-bytes={} sd-faces={} sd-dirs={} cache-budget-bytes=524288 psram=spiram-malloc flash-impact=unifont-subset+fontdue",
+            font_status.unifont_glyphs,
+            font_status.unifont_bytes,
+            font_status.sd_faces,
+            SD_FONT_DIRECTORIES.join(",")
+        );
         let reader_persistence = state.reader.load_persistent_state();
         state.reader.refresh_library();
         if _mounted_sd.is_some() {
@@ -546,7 +558,7 @@ mod firmware {
         info!("rustmix-wave=reader-loading-ui-ready stages=open,encoding,resume,first-page,cache cancel=boot-long-press refresh=coarse-stage-boundaries");
         info!("rustmix-wave=reader-options-shell-ready toc=none-for-txt,list-for-epub bookmarks=persistent clear-ghosting=manual-global-refresh");
         info!("rustmix-wave=reader-ux-repair-ready menu=continue,library,bookmarks-ready normalization=utf8-punctuation,latin1,underscore-emphasis byte-offsets=preserved");
-        info!("rustmix-wave=reader-preferences-ready path=/sdcard/RUSTMIX/READER/PREFS.TXT theme=classic,high-contrast orientation=portrait,landscape font-size=small,medium,large,xlarge book-font=inter,atkinson-hyperlegible,serif,literata paragraph-alignment=justified,left,center,right show-progress=on,off atomic-replace=tmp-primary-backup");
+        info!("rustmix-wave=reader-preferences-ready path=/sdcard/RUSTMIX/READER/PREFS.TXT nvs=rw_read theme=classic,high-contrast orientation=portrait,landscape font-size=16,20,24,32,48,72 book-font=inter,atkinson-hyperlegible,serif,literata,cjk-unifont,sd-cjk paragraph-alignment=justified,left,center,right show-progress=on,off atomic-replace=tmp-primary-backup");
         info!("rustmix-wave=reader-high-contrast-layout-ready viewport=shared border=outside-text top-padding=true clip=right,bottom theme-change=redraw-only ghost-refresh=global-base");
         info!("rustmix-wave=reader-txt-emphasis-cleanup-ready multiline-gutenberg=true word-internal-underscores=preserved repeated-separators=preserved byte-offsets=preserved");
         info!("rustmix-wave=reader-per-book-resume-ready path=/sdcard/RUSTMIX/READER/POSITS.TXT records=64 fingerprint=path,size,modified,format atomic-replace=tmp-primary-backup routes=continue,books,files,bookmark");
@@ -562,10 +574,10 @@ mod firmware {
         info!("rustmix-wave=reader-epub-parser-stack-isolation-ready worker=epub-parser stack-bytes=65536 main-task-stack-bytes=16384 policy=short-lived-worker-join");
         info!("rustmix-wave=reader-epub-chapter-aware-presentation-ready page-label=chapter,page-of-total bookmarks=chapter,page-of-total library-title=opf-metadata fallback=fat-filename txt-path=preserved");
         info!("rustmix-wave=reader-epub-watchdog-memory-pressure-repair-ready index-yield-every-pages=4 index-yield-ms=1 session-release=before-book-open layout-rebuild=move-document toc-jump=no-document-clone parser-worker-stack-bytes=65536 title-worker-stack-bytes=32768");
-        info!("rustmix-wave=reader-eink-font-pack-ready fonts=inter,atkinson-hyperlegible,serif,literata atkinson-source=atkinson-hyperlegible-next-medium literata-source=literata-medium glyphs=printable-ascii persisted-keys=serif,atkinson-hyperlegible cache-fingerprint=book-font epub-repagination=layout-rebuild bookmarks=byte-offset txt-epub-aligned=true");
+        info!("rustmix-wave=reader-eink-font-pack-ready fonts=inter,atkinson-hyperlegible,serif,literata,cjk-unifont,sd-ttf-otf atkinson-source=atkinson-hyperlegible-next-medium literata-source=literata-medium glyphs=printable-ascii+gb2312-unifont persisted-keys=serif,atkinson-hyperlegible,cjk-unifont,sd-cjk cache-fingerprint=book-font epub-repagination=layout-rebuild bookmarks=byte-offset txt-epub-aligned=true cjk=sd-fonts-or-unifont-fallback");
         info!("rustmix-wave=lua-runtime-foundation-ready mode=bootstrap-static,event-bridge root={LUA_APPS_DIRECTORY} manifest=APP.TOM entry=MAIN.LUA script-max-bytes=65536 vm-callbacks=sudoku,minesweeper,tilt-maze,motion-2048,sokoban-tilt-bounded-native");
         info!("rustmix-wave=lua-native-dirty-region-canvas-ready commands=256 text-bytes=160 dirty-regions={MAX_DIRTY_REGIONS} partial-limit={PANEL_PARTIAL_REFRESH_LIMIT} transport=existing-fullscreen-partial panel-api=rust-owned");
-        info!("rustmix-wave=panel-refresh-coordinator-ready partial-limit={PANEL_PARTIAL_REFRESH_LIMIT} transport=existing-fullscreen-partial state=main-loop-owned lua-route-global-refresh=false");
+        info!("rustmix-wave=panel-refresh-coordinator-ready partial-limit={PANEL_PARTIAL_REFRESH_LIMIT} transport=fast-fullscreen-partial reset=short-partial ui=menus,settings,library,reader-page-turns,wifi-portal full-refresh=boot,wake,manual-ghost-clean,periodic-threshold,sleep,safety");
         info!("rustmix-wave=runtime-worker-boundary-ready workers=weather-fetch,lua-loader policy=short-lived-named-stack panel-spi=main-task-only");
         info!("rustmix-wave=lua-loader-stack-isolation-ready worker=lua-loader stack-bytes={LUA_LOADER_WORKER_STACK_BYTES} main-task-stack-bytes=16384 policy=short-lived-worker-join");
         info!("rustmix-wave=lua-sudoku-event-bridge-ready sample=SUDOKU input=up,down,select,boot-short-context board=native dirty=old-cell,new-cell,status refresh=shared-panel-coordinator transport=existing-fullscreen-partial panel-api=rust-owned");
@@ -2556,7 +2568,7 @@ mod firmware {
             PanelRefreshPlan::PartialFullscreen { partial_count } => {
                 panel.show_partial_fullscreen(frame.as_bytes())?;
                 info!(
-                    "rustmix-wave=panel-refresh plan=partial-fullscreen reason=normal partial-count={partial_count} partial-limit={PANEL_PARTIAL_REFRESH_LIMIT} transport=existing-fullscreen-partial"
+                    "rustmix-wave=panel-refresh plan=partial-fullscreen reason=normal partial-count={partial_count} partial-limit={PANEL_PARTIAL_REFRESH_LIMIT} transport=fast-fullscreen-partial"
                 );
             }
         }

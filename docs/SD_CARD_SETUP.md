@@ -127,6 +127,30 @@ The device creates Reader state automatically:
 
 Reader writes use `.TMP` and `.BAK` siblings for recovery.
 
+## CJK fonts
+
+Chinese Reader pages, titles, and filenames need glyphs the built-in Latin strikes do not contain. Install open-licensed `.ttf` or `.otf` files (Noto Sans SC or Source Han Sans SC subsets recommended) in either:
+
+```text
+/fonts/*.ttf
+/fonts/*.otf
+/RUSTMIX/FONTS/*.ttf
+/RUSTMIX/FONTS/*.otf
+```
+
+Keep each file at or below 2 MiB so it fits in PSRAM. A GB2312 or SC subset is enough for most books; full Noto Sans SC Regular is too large for the 8 MB PSRAM budget.
+
+Without an SD face, firmware still renders GB2312 Chinese from the embedded GNU Unifont subset (blocky at large sizes, but usable).
+
+Example, after shrinking a local OFL font:
+
+```bash
+mkdir -p /Volumes/YOUR_SD_CARD/fonts
+cp NotoSansSC-subset.otf /Volumes/YOUR_SD_CARD/fonts/NOTOSC.OTF
+```
+
+The Wi-Fi transfer portal can also drop files into `/RUSTMIX/FONTS`.
+
 ## Voice Notes
 
 The device creates:

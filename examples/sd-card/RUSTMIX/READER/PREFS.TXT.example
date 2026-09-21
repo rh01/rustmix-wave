@@ -1,10 +1,12 @@
 # RustMix Wave Reader preferences
 # The Reader creates /RUSTMIX/READER/PREFS.TXT automatically after a change.
-# book_font values: inter | atkinson-hyperlegible | serif | literata
+# font_size values: 16 | 20 | 24 | 32 | 48 | 72
+#   (legacy small/medium/large/xlarge still load)
+# book_font values: inter | atkinson-hyperlegible | serif | literata | cjk-unifont | sd:FILENAME.TTF
 version=1
 theme=classic
 orientation=portrait
-font_size=medium
+font_size=24
 book_font=serif
 paragraph_alignment=justified
 show_progress=true

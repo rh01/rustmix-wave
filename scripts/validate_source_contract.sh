@@ -268,7 +268,7 @@ power = Path('src/power_key.rs').read_text()
 
 for module in (
     'calendar', 'dictionary', 'keyboard_navigation', 'power_key', 'power_key_menu',
-    'reader', 'epub', 'voice_notes', 'voice_note_metadata', 'wifi_transfer',
+    'reader', 'reader_nvs', 'fonts', 'epub', 'voice_notes', 'voice_note_metadata', 'wifi_transfer',
     'alarm', 'sleep_mode', 'sleep_images', 'sleep_network', 'lua_runtime', 'games',
 ):
     assert f'pub mod {module};' in lib, f'library module missing: {module}'
@@ -281,6 +281,8 @@ for marker in (
     'rustmix-wave=offline-dictionary-x4-pack-native-foundation-ready',
     'rustmix-wave=voice-notes-organizer-controls-export-ready',
     'rustmix-wave=wifi-transfer-web-portal-ready',
+    'rustmix-wave=cjk-font-engine-ready',
+    'rustmix-wave=panel-refresh-coordinator-ready',
 ):
     assert marker in main, f'runtime readiness marker missing: {marker}'
 
@@ -442,6 +444,9 @@ check sd-examples-contract sd_examples_contract
 check font-notice-serif contains docs/licenses/FONT_NOTICES.md 'DejaVu Serif'
 check font-notice-atkinson contains docs/licenses/FONT_NOTICES.md 'Atkinson Hyperlegible Next Medium'
 check font-notice-literata contains docs/licenses/FONT_NOTICES.md 'Literata Medium'
+check font-notice-unifont contains docs/licenses/FONT_NOTICES.md 'GNU Unifont'
+check cjk-font-engine contains src/fonts/mod.rs 'READER_FONT_SIZE_STEPS'
+check unifont-pack-present test -f src/fonts/unifont_gb2312.bin
 check no-raw-font-files bash -c '! find . -type f \( -iname "*.ttf" -o -iname "*.otf" -o -iname "*.woff" -o -iname "*.woff2" \) -print -quit | grep -q .'
 for script in scripts/*.sh; do
   check "bash-syntax-$(basename "$script")" bash -n "$script"

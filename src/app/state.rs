@@ -1229,28 +1229,31 @@ mod tests {
 
     #[test]
     fn reader_preferences_use_settings_style_move_then_select_change() {
-        use crate::reader::{ReadingPreference, ReadingTheme};
+        use crate::reader::ReadingPreference;
 
         let mut state = AppState::default();
         state.router.navigate_to(ScreenRoute::ReaderPreferences);
         assert_eq!(
             state.reader.selected_preference(),
-            ReadingPreference::ReadingTheme
+            ReadingPreference::BookFontSize
         );
-        let initial_theme = state.reader.preferences.theme;
+        let initial_size = state.reader.preferences.font_size;
         state.apply(ButtonEvent::Down);
         assert_eq!(
             state.reader.selected_preference(),
-            ReadingPreference::Orientation
+            ReadingPreference::BookFont
         );
-        assert_eq!(state.reader.preferences.theme, initial_theme);
+        assert_eq!(state.reader.preferences.font_size, initial_size);
         state.apply(ButtonEvent::Up);
         assert_eq!(
             state.reader.selected_preference(),
-            ReadingPreference::ReadingTheme
+            ReadingPreference::BookFontSize
         );
         state.apply(ButtonEvent::Select);
-        assert_eq!(state.reader.preferences.theme, ReadingTheme::HighContrast);
+        assert_eq!(
+            state.reader.preferences.font_size,
+            crate::reader::BookFontSize::Px32
+        );
         assert_eq!(state.active_route(), ScreenRoute::ReaderPreferences);
         state.back();
         assert_eq!(state.active_route(), ScreenRoute::ReaderOptions);

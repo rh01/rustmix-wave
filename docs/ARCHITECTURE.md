@@ -29,7 +29,7 @@ ESP-IDF event loop and native hardware ownership
         |     src/app/typography/*
         |
         +-- Domain modules
-              reader.rs / epub.rs
+              reader.rs / reader_nvs.rs / fonts/* / epub.rs
               voice_notes.rs / voice_note_metadata.rs
               dictionary.rs / keyboard_navigation.rs
               calendar.rs
@@ -103,13 +103,14 @@ The game scripts declare bounded app content. Native Rust owns state mutation, s
 
 The SSD1677 panel is native `800 × 480`. UI screens render to a logical portrait `480 × 800` framebuffer through `src/orientation.rs`.
 
-`src/panel_refresh.rs` is the single refresh policy boundary. It tracks partial refreshes and requests a global-base refresh for:
+`src/panel_refresh.rs` is the single refresh policy boundary. Menus, settings, library browsing, Reader page turns and the Wi-Fi portal use the fast full-screen partial transport. Global-base refresh is reserved for:
 
-- periodic ghost cleanup after the configured partial-refresh limit
+- initial boot
 - wake restoration
+- Power-key / Reader manual ghost cleanup
+- periodic ghost cleanup after `PANEL_PARTIAL_REFRESH_LIMIT` (32) partial frames
+- sleep-image display
 - safety fallbacks
-- Reader clear-ghosting actions
-- Power short-press display-maintenance actions
 
 The physical Power key does not write the panel directly. A short Power press opens `src/power_key_menu.rs`; selecting `Clear ghosting now` queues the shared manual global refresh path. A long Power press enters the existing sleep-image path.
 
@@ -146,7 +147,7 @@ Reader state lives below:
   CACHE/<8HEX>.CCH
 ```
 
-Reader writes use FAT 8.3-safe `.TMP` and `.BAK` siblings. Bookmarks retain byte offsets as authoritative anchors.
+Reader writes use FAT 8.3-safe `.TMP` and `.BAK` siblings. Bookmarks retain byte offsets as authoritative anchors. CJK rendering lives in `src/fonts/`: SD TTF/OTF faces under `/fonts` or `/RUSTMIX/FONTS` are rasterized into a PSRAM cache; GNU Unifont GB2312 is the flash fallback. Reader font sizes are the exact pixel steps 16, 20, 24, 32, 48 and 72.
 
 ## Voice Notes boundary
 

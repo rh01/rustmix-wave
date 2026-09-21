@@ -14,3 +14,11 @@ RustMix Wave v0.16.2 also embeds generated printable-ASCII Reader-page raster st
 
 
 RustMix Wave v0.17.2 adds Reader-only generated printable-ASCII raster strikes derived from Atkinson Hyperlegible Next Medium and Literata Medium. The generated Rust arrays live in `src/app/reader_atkinson_next_assets.rs` and `src/app/reader_literata_assets.rs`. The existing persisted Reader preference keys `atkinson-hyperlegible` and `serif` remain unchanged; `literata` is a new explicit key. Raw font files are intentionally not distributed. Both new source families are used under the SIL Open Font License 1.1 retained in `docs/licenses/OFL-1.1.txt`.
+
+RustMix Wave also embeds a GNU Unifont GB2312 16x16 1-bpp subset in `src/fonts/unifont_gb2312.bin` as the CJK fallback when no SD TTF/OTF face is installed. GNU Unifont is distributed under the SIL Open Font License 1.1. The license text is retained in `docs/licenses/OFL-1.1.txt`. The firmware does not ship raw `.ttf` / `.otf` files; optional CJK quality faces are installed on the SD card under `/fonts` or `/RUSTMIX/FONTS`.
+
+Recommended SD CJK families (OFL, install a subset under 2 MiB):
+
+- Noto Sans SC
+- Source Han Sans SC
+

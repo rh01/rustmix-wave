@@ -40,7 +40,7 @@ pub fn render_continue_reading(
     let body = state.display.body_style();
     if let Some(session) = state.reader.session.as_ref() {
         Text::new(
-            &truncate(&session.book.title, 38),
+            &heading.truncate(&session.book.title, 38, 420),
             Point::new(24, 190),
             heading,
         )
@@ -56,7 +56,12 @@ pub fn render_continue_reading(
         .draw(display)?;
         Text::new("SELECT resumes the open page.", Point::new(24, 284), body).draw(display)?;
     } else if let Some(resume) = state.reader.resume.as_ref() {
-        Text::new(&truncate(&resume.title, 38), Point::new(24, 190), heading).draw(display)?;
+        Text::new(
+            &heading.truncate(&resume.title, 38, 420),
+            Point::new(24, 190),
+            heading,
+        )
+        .draw(display)?;
         Text::new(
             &format!("Saved page {} is ready to restore.", resume.page_index + 1),
             Point::new(24, 240),
@@ -93,6 +98,7 @@ pub fn render_library(
 ) -> Result<(), Infallible> {
     let reader = &state.reader;
     let body = state.display.body_style();
+    let heading = state.display.heading_style();
     let detail = state.display.detail_style();
     draw_header(display, state.display, "LIBRARY", "TXT / REFLOWABLE EPUB")?;
     let status = library_status(reader.library_tab, reader.visible_entries().len());
@@ -137,7 +143,7 @@ pub fn render_library(
             state,
             248 + index as i32 * 58,
             selected,
-            &truncate(&entry.book.title, 25),
+            &heading.truncate(&entry.book.title, 25, 270),
             columns.badge.as_str(),
             columns.suffix.as_str(),
         )?;
@@ -255,6 +261,7 @@ pub fn render_bookmarks(
         },
     )?;
     let body = state.display.body_style();
+    let heading = state.display.heading_style();
     if state.reader.bookmarks.is_empty() {
         Text::new(
             "No saved bookmarks",
@@ -283,7 +290,7 @@ pub fn render_bookmarks(
                 state,
                 top,
                 state.reader.bookmarks_selected == index,
-                &truncate(&bookmark.title, 23),
+                &heading.truncate(&bookmark.title, 23, 250),
                 columns.badge.as_str(),
                 columns.suffix.as_str(),
             )?;
@@ -307,7 +314,12 @@ pub fn render_loading(
     let loading = state.reader.loading.as_ref();
     let title = loading.map_or("Book", |value| value.book.title.as_str());
     let stage = loading.map_or(ReaderLoadingStage::OpeningFile, |value| value.stage);
-    Text::new(&truncate(title, 36), Point::new(24, 176), heading).draw(display)?;
+    Text::new(
+        &heading.truncate(title, 36, 420),
+        Point::new(24, 176),
+        heading,
+    )
+    .draw(display)?;
     Text::new(stage.label(), Point::new(24, 238), body).draw(display)?;
     draw_progress(display, stage.progress())?;
     let message = loading.map_or("Preparing reader...", |value| value.message.as_str());
@@ -344,6 +356,7 @@ pub fn render_page(
     );
     let ui_body = state.display.body_style();
     let ui_detail = state.display.detail_style();
+    let heading = state.display.header_title_style();
 
     Rectangle::new(
         Point::new(0, 0),
@@ -352,7 +365,11 @@ pub fn render_page(
     .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
     .draw(display)?;
     Text::new(
-        &truncate(&session.book.title, if landscape { 52 } else { 27 }),
+        &heading.truncate(
+            &session.book.title,
+            if landscape { 52 } else { 27 },
+            if landscape { 760 } else { 444 },
+        ),
         Point::new(18, if landscape { 28 } else { 32 }),
         state.display.header_title_style(),
     )
@@ -405,12 +422,8 @@ pub fn render_page(
         )
         .draw(display)?;
     } else {
-        Text::new(
-            state.reader.preferences.book_font.label(),
-            Point::new(24, status_baseline),
-            ui_body,
-        )
-        .draw(display)?;
+        let font_label = state.reader.book_font_display_label();
+        Text::new(&font_label, Point::new(24, status_baseline), ui_body).draw(display)?;
         Text::new(
             session.content_badge(),
             Point::new(if landscape { 370 } else { 210 }, status_baseline),
@@ -577,11 +590,12 @@ pub fn render_preferences(
         "SETTINGS-STYLE ROW EDITOR",
     )?;
     for (index, preference) in ReadingPreference::ALL.iter().copied().enumerate() {
+        let font_label = state.reader.book_font_display_label();
         let badge = match preference {
             ReadingPreference::ReadingTheme => state.reader.preferences.theme.label(),
             ReadingPreference::Orientation => state.reader.preferences.orientation.label(),
             ReadingPreference::BookFontSize => state.reader.preferences.font_size.label(),
-            ReadingPreference::BookFont => state.reader.preferences.book_font.label(),
+            ReadingPreference::BookFont => font_label.as_str(),
             ReadingPreference::ParagraphAlignment => {
                 state.reader.preferences.paragraph_alignment.label()
             }

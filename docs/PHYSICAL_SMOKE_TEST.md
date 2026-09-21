@@ -24,8 +24,10 @@ Run this checklist after a release build or any cross-cutting runtime change.
 
 1. Open one TXT book and one EPUB or `.EPU` book.
 2. Confirm staged loading, page navigation, Reader Options, preferences, TOC behavior, and bookmark add/remove.
-3. Reboot and confirm Continue Reading restores the prior book and page.
-4. Confirm `/RUSTMIX/READER/POSITS.TXT` and `CACHE/<8HEX>.CCH` exist.
+3. In Reading Preferences confirm font size steps 16/20/24/32/48/72 and CJK Unifont / SD CJK faces.
+4. Open a Chinese TXT or EPUB if available and confirm glyphs are not `?`.
+5. Reboot and confirm Continue Reading restores the prior book and page.
+6. Confirm `/RUSTMIX/READER/POSITS.TXT` and `CACHE/<8HEX>.CCH` exist.
 
 ## Dictionary
 

@@ -107,7 +107,13 @@ Navigation: rotate to highlight an action, SELECT to activate, BOOT long to retu
 
 <img src="../screenshots/reader-reading-prefs.jpg" width="360" alt="Reading Preferences">
 
-Preferences include theme, orientation, book font size, font family, paragraph alignment, and progress display. Rotate to move; press SELECT to change a setting; hold BOOT to return.
+Preferences, in order:
+
+- **Book Font Size**: exact steps `16`, `20`, `24`, `32`, `48`, `72` pixels
+- **Book Font**: built-in Latin faces (Inter, Atkinson, Serif, Literata), CJK Unifont fallback, and any TTF/OTF loaded from SD `/fonts`
+- Theme, orientation, paragraph alignment, and progress display
+
+Chinese titles, filenames, and TXT/EPUB body text render through the SD CJK face when present, otherwise the embedded Unifont GB2312 subset. Rotate to move; press SELECT to change a setting; hold BOOT to return. Changes persist to `/RUSTMIX/READER/PREFS.TXT` and NVS.
 
 ### EPUB Table of Contents
 

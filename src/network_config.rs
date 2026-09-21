@@ -105,6 +105,35 @@ impl NetworkConfig {
             ntp_server,
         })
     }
+
+    /// Serialize credentials for SD `/RUSTMIX/WIFI.TXT` (and SoftAP write-back).
+    #[must_use]
+    pub fn serialized(&self) -> String {
+        format!(
+            "# Rustmix Wave Wi-Fi. Edit this file or use Settings > Network > Configure Wi-Fi.\n\
+ssid={}\n\
+password={}\n\
+timezone={}\n\
+ntp_server={}\n",
+            self.ssid, self.password, self.timezone, self.ntp_server
+        )
+    }
+
+    /// Atomically replace `WIFI.TXT` when the SD card is present.
+    pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        let temporary = path.with_extension("TMP");
+        fs::write(&temporary, self.serialized())
+            .with_context(|| format!("write {}", temporary.display()))?;
+        if let Err(error) = fs::rename(&temporary, path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error).with_context(|| format!("replace {}", path.display()));
+        }
+        Ok(())
+    }
 }
 
 fn required<'a>(values: &'a BTreeMap<String, String>, key: &str) -> Result<&'a str> {
@@ -152,5 +181,22 @@ mod tests {
         assert!(NetworkConfig::parse("ssid=Lab\nextra=value\n").is_err());
         assert!(NetworkConfig::parse("ssid=Lab\nssid=Other\n").is_err());
         assert!(NetworkConfig::parse("ssid=Lab\npassword=short\n").is_err());
+    }
+
+    #[test]
+    fn save_round_trips_through_wifi_txt() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rustmix-wifi-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("WIFI.TXT");
+        let original = NetworkConfig::parse("ssid=Lab WiFi\npassword=correct-horse\n").unwrap();
+        original.save_to_path(&path).unwrap();
+        let loaded = NetworkConfig::load_from_path(&path).unwrap();
+        assert_eq!(loaded.ssid, "Lab WiFi");
+        assert_eq!(loaded.password, "correct-horse");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -1,0 +1,46 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rustmix Wi-Fi Setup</title>
+<style>
+body{font-family:sans-serif;max-width:32rem;margin:1.5rem auto;padding:0 1rem;line-height:1.4}
+button,input,select{font:inherit;padding:.6rem;margin:.2rem 0;width:100%;box-sizing:border-box}
+li{list-style:none;margin:0;padding:0}ul{padding:0}
+button.ssid{text-align:left;background:#f4f4f4;border:1px solid #ccc}
+.status{min-height:1.4rem;color:#333}
+</style></head><body>
+<h1>Rustmix Wave</h1>
+<p>Join AP <code>Rustmix-Setup</code>, then open <code>http://192.168.4.1</code>.</p>
+<p><button type="button" onclick="scan(true)">Refresh networks</button></p>
+<ul id="list"></ul>
+<form method="POST" action="/save">
+<label>SSID <input name="ssid" id="ssid" required maxlength="32" autocomplete="off"></label>
+<label>Password <input name="password" id="password" type="password" maxlength="63" placeholder="leave empty if open"></label>
+<label>Timezone <select name="timezone"><option>America/New_York</option><option>UTC</option></select></label>
+<button type="submit">Save and connect</button>
+</form>
+<p class="status" id="status">Scanning…</p>
+<script>
+const status=t=>document.getElementById('status').textContent=t;
+function esc(s){
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+async function scan(refresh){
+  status(refresh?'Scanning…':'Updating…');
+  try{
+    const rows=JSON.parse(await fetch('/scan'+(refresh?'?refresh=1':'')).then(r=>r.text()));
+    const list=document.getElementById('list');
+    list.innerHTML='';
+    if(!rows.length){status('No networks yet. Tap Refresh.');return;}
+    for(const n of rows){
+      const li=document.createElement('li');
+      const b=document.createElement('button');
+      b.type='button'; b.className='ssid';
+      b.innerHTML=esc(n.ssid)+' <small>'+n.rssi+' dBm'+(n.open?' · open':'')+'</small>';
+      b.onclick=()=>{document.getElementById('ssid').value=n.ssid;};
+      li.appendChild(b); list.appendChild(li);
+    }
+    status(rows.length+' networks');
+  }catch(e){status(e.message||'Scan failed');}
+}
+scan(false); setInterval(()=>scan(false), 2000);
+</script></body></html>

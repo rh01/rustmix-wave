@@ -61,16 +61,23 @@ pub fn render_network(
     Text::new("Actions", Point::new(22, 404), heading).draw(display)?;
     draw_action(
         display,
-        448,
+        424,
         transfer_label,
         state.network_action_selected == 0,
         body,
     )?;
     draw_action(
         display,
-        516,
-        "Provisioning details",
+        484,
+        "Configure Wi-Fi",
         state.network_action_selected == 1,
+        body,
+    )?;
+    draw_action(
+        display,
+        544,
+        "Provisioning details",
+        state.network_action_selected == 2,
         body,
     )?;
     draw_footer(
@@ -125,6 +132,55 @@ pub fn render_wifi_transfer(
     Ok(())
 }
 
+pub fn render_wifi_setup(
+    display: &mut OrientedFrameBuffer<'_>,
+    state: &AppState,
+) -> Result<(), Infallible> {
+    let heading = state.display.heading_style();
+    let body = state.display.body_style();
+    let detail = state.display.detail_style();
+    let setup = &state.wifi_setup;
+    let scanned = format!("{} networks", setup.network_count);
+
+    draw_header(
+        display,
+        state.display,
+        "CONFIGURE WI-FI",
+        "SOFTAP SETUP PORTAL",
+    )?;
+    draw_status_row(
+        display,
+        state.display,
+        StatusRow {
+            left: setup.state.label(),
+            middle: "SOFTAP",
+            right: "SETUP",
+        },
+    )?;
+
+    Text::new("Join this network", Point::new(22, 164), heading).draw(display)?;
+    line(display, 212, "AP SSID", setup.ap_ssid.as_str(), body)?;
+    line(display, 252, "Open", setup.url_label(), detail)?;
+    line(display, 292, "Scanned", &scanned, body)?;
+
+    Text::new("Phone steps", Point::new(22, 372), heading).draw(display)?;
+    Text::new("1. Join Rustmix-Setup", Point::new(22, 420), body).draw(display)?;
+    Text::new("2. Open http://192.168.4.1", Point::new(22, 460), body).draw(display)?;
+    Text::new("3. Pick SSID, save password", Point::new(22, 500), body).draw(display)?;
+    Text::new(&setup.last_action, Point::new(22, 548), detail).draw(display)?;
+    if let Some(error) = setup.error.as_deref() {
+        Text::new(error, Point::new(22, 588), detail).draw(display)?;
+    }
+
+    draw_action(display, 640, "Stop setup", true, body)?;
+    draw_footer(
+        display,
+        state.display,
+        "SELECT STOP  HOLD BOOT KEEP AP + BACK",
+    )?;
+    Ok(())
+}
+
 pub fn render_network_details(
     display: &mut OrientedFrameBuffer<'_>,
     state: &AppState,
@@ -140,7 +196,7 @@ pub fn render_network_details(
         display,
         state.display,
         "NETWORK DETAILS",
-        "SD-CARD PROVISIONING",
+        "SD FILE AND SOFTAP",
     )?;
     draw_status_row(
         display,
@@ -155,12 +211,17 @@ pub fn render_network_details(
     Text::new("Configuration file", Point::new(22, 164), heading).draw(display)?;
     Text::new(NetworkSnapshot::config_path(), Point::new(22, 212), body).draw(display)?;
     Text::new(
-        "Edit the SD-card file and reboot",
+        "WIFI.TXT is the first-class SD path.",
         Point::new(22, 264),
         body,
     )
     .draw(display)?;
-    Text::new("to apply Wi-Fi changes.", Point::new(22, 304), body).draw(display)?;
+    Text::new(
+        "SoftAP also writes WIFI.TXT and NVS.",
+        Point::new(22, 304),
+        body,
+    )
+    .draw(display)?;
 
     Text::new("Regional settings", Point::new(22, 382), heading).draw(display)?;
     line(display, 430, "Timezone", &zone, body)?;
@@ -217,7 +278,7 @@ fn draw_action(
 
 #[cfg(test)]
 mod tests {
-    use super::{render_network, render_network_details, render_wifi_transfer};
+    use super::{render_network, render_network_details, render_wifi_setup, render_wifi_transfer};
     use crate::{app::AppState, framebuffer::FrameBuffer, orientation::OrientedFrameBuffer};
 
     #[test]
@@ -228,5 +289,6 @@ mod tests {
         render_network(&mut display, &state).unwrap();
         render_network_details(&mut display, &state).unwrap();
         render_wifi_transfer(&mut display, &state).unwrap();
+        render_wifi_setup(&mut display, &state).unwrap();
     }
 }

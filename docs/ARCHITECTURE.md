@@ -33,7 +33,7 @@ ESP-IDF event loop and native hardware ownership
               voice_notes.rs / voice_note_metadata.rs
               dictionary.rs / keyboard_navigation.rs
               calendar.rs
-              wifi_transfer.rs
+              wifi_transfer.rs / wifi_setup.rs / wifi_nvs.rs
               alarm.rs / rtc.rs / rtc_alarm_interrupt.rs
               power_key.rs / power_key_menu.rs
               sleep_mode.rs / sleep_images.rs / sleep_network.rs
@@ -195,7 +195,11 @@ Personal rows in `EVENTS.TXT` are writable. `US2026.TXT` is read-only. `HINDU26.
 
 ## Wi-Fi transfer boundary
 
-`src/wifi_transfer.rs` owns an explicit LAN-only portal rooted at `/sdcard/RUSTMIX`. It is off after boot and starts only from Settings. Requests require the displayed session code, remain root-confined, use bounded stream buffers, and write replacement files atomically.
+`src/wifi_transfer.rs` owns an explicit LAN-only portal rooted at `/sdcard/RUSTMIX`. It is off after boot and starts only from Settings while the device is a Wi-Fi station. Requests require the displayed session code, remain root-confined, use bounded stream buffers, and write replacement files atomically.
+
+## SoftAP Wi-Fi setup
+
+`src/wifi_setup.rs` owns the captive setup portal. Station credentials still load first from `/RUSTMIX/WIFI.TXT`. NVS (`rw_wifi`) is the fallback when that file is missing. SoftAP `Rustmix-Setup` at `http://192.168.4.1` starts when the file is missing, STA join fails, or Settings → Network → Configure Wi-Fi is selected. Saving writes NVS and, when the SD card is present, writes `WIFI.TXT`, then switches to STA. The transfer portal stays a separate STA-only service on port 80.
 
 Protected paths include device configuration and internal sidecars such as:
 
@@ -268,6 +272,7 @@ Writable exceptions are deliberately narrow:
 - Voice Notes WAV and sidecar files
 - Calendar personal events
 - explicit Wi-Fi portal writes
+- SoftAP write-back of `WIFI.TXT`
 
 ## Screenshot-driven user documentation
 

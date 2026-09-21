@@ -55,11 +55,13 @@ Run this checklist after a release build or any cross-cutting runtime change.
 
 ## Network, alarms, and settings
 
-1. Confirm Wi-Fi connection and SNTP status.
-2. Start the explicit Wi-Fi transfer portal, access it with the displayed code, then stop it.
-3. Confirm an alarm can sound, snooze, and dismiss.
-4. Confirm alarm behavior is not hidden by the Power-key display menu.
-5. Confirm Display settings persist after reboot.
+1. Confirm Wi-Fi connection and SNTP status, or SoftAP setup when `WIFI.TXT` is missing.
+2. From a phone, join `Rustmix-Setup`, open `http://192.168.4.1`, scan SSIDs, save, and confirm STA join plus `WIFI.TXT` write-back.
+3. Start the explicit Wi-Fi transfer portal after STA join, access it with the displayed code, then stop it.
+4. Confirm Settings → Network → Configure Wi-Fi can reopen SoftAP while keeping `WIFI.TXT` as a manual path.
+5. Confirm an alarm can sound, snooze, and dismiss.
+6. Confirm alarm behavior is not hidden by the Power-key display menu.
+7. Confirm Display settings persist after reboot.
 
 ## Games and sensors
 

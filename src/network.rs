@@ -11,6 +11,7 @@ pub enum WifiConnectionState {
     Disabled,
     #[default]
     ConfigurationMissing,
+    Provisioning,
     Connecting,
     Connected,
     Failed,
@@ -22,6 +23,7 @@ impl WifiConnectionState {
         match self {
             Self::Disabled => "DISABLED",
             Self::ConfigurationMissing => "NO CONFIG",
+            Self::Provisioning => "SETUP",
             Self::Connecting => "CONNECTING",
             Self::Connected => "CONNECTED",
             Self::Failed => "FAILED",
@@ -96,6 +98,18 @@ impl Default for NetworkSnapshot {
 }
 
 impl NetworkSnapshot {
+    /// Render SoftAP provisioning before STA credentials exist or after STA fails.
+    #[must_use]
+    pub fn provisioning() -> Self {
+        Self {
+            wifi_state: WifiConnectionState::Provisioning,
+            ntp_state: NtpSyncState::WaitingForWifi,
+            ssid: Some(crate::wifi_setup::WIFI_SETUP_AP_SSID.into()),
+            ipv4_address: Some(crate::wifi_setup::WIFI_SETUP_AP_IP.into()),
+            ..Self::default()
+        }
+    }
+
     /// Render a provisioned-but-not-yet-connected boot state before Wi-Fi is
     /// started after the first e-paper frame.
     #[must_use]
@@ -115,6 +129,7 @@ impl NetworkSnapshot {
         match (self.wifi_state, self.ntp_state) {
             (WifiConnectionState::Connected, NtpSyncState::Synchronized) => "NTP OK",
             (WifiConnectionState::Connected, _) => "WIFI OK",
+            (WifiConnectionState::Provisioning, _) => "SETUP",
             (WifiConnectionState::ConfigurationMissing, _) => "NO CFG",
             (WifiConnectionState::Connecting, _) => "WAIT",
             (WifiConnectionState::Disabled, _) => "OFF",
@@ -170,7 +185,9 @@ pub mod espidf {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use anyhow::{Context, Result};
-    use embedded_svc::wifi::{AuthMethod, ClientConfiguration, Configuration};
+    use embedded_svc::wifi::{
+        AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration,
+    };
     use esp_idf_svc::{
         eventloop::EspSystemEventLoop,
         hal::modem::WifiModemPeripheral,
@@ -185,6 +202,7 @@ pub mod espidf {
         network_config::NetworkConfig,
         ntp::{utc_from_unix_seconds, MIN_VALID_SNTP_UNIX_SECONDS},
         rtc::RtcDateTime,
+        wifi_setup::{collapse_scan_results, ScannedNetwork, WIFI_SETUP_AP_IP, WIFI_SETUP_AP_SSID},
     };
 
     /// Own Wi-Fi and SNTP services for as long as the firmware is running.
@@ -227,15 +245,40 @@ pub mod espidf {
             }
         }
 
-        /// Start Wi-Fi after the initial e-paper frame is already visible.
-        pub fn connect<M>(modem: M, config: &NetworkConfig) -> Result<Self>
+        /// Take the Wi-Fi modem once and keep the driver for STA or SoftAP.
+        pub fn new<M>(modem: M) -> Result<Self>
         where
             M: WifiModemPeripheral + 'static,
         {
             let sys_loop = EspSystemEventLoop::take()?;
             let nvs = EspDefaultNvsPartition::take()?;
-            let mut wifi =
+            let wifi =
                 BlockingWifi::wrap(EspWifi::new(modem, sys_loop.clone(), Some(nvs))?, sys_loop)?;
+            Ok(Self {
+                wifi: Some(wifi),
+                sntp: None,
+                snapshot: NetworkSnapshot::default(),
+                ntp_reported: false,
+                suspended: false,
+            })
+        }
+
+        /// Start Wi-Fi after the initial e-paper frame is already visible.
+        pub fn connect<M>(modem: M, config: &NetworkConfig) -> Result<Self>
+        where
+            M: WifiModemPeripheral + 'static,
+        {
+            let mut runtime = Self::new(modem)?;
+            runtime.connect_station(config)?;
+            Ok(runtime)
+        }
+
+        /// Associate as a station. Stops SoftAP first so port 80 is free for transfer.
+        pub fn connect_station(&mut self, config: &NetworkConfig) -> Result<()> {
+            let wifi = self.wifi.as_mut().context("Wi-Fi runtime is unavailable")?;
+            let _ = self.sntp.take();
+            let _ = wifi.disconnect();
+            let _ = wifi.stop();
             let auth_method = if config.password.is_empty() {
                 AuthMethod::None
             } else {
@@ -262,24 +305,84 @@ pub mod espidf {
             let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
             let mut conf = SntpConf::default();
             conf.servers[0] = config.ntp_server.as_str();
-            let sntp = EspSntp::new(&conf)?;
-            Ok(Self {
-                wifi: Some(wifi),
-                sntp: Some(sntp),
-                snapshot: NetworkSnapshot {
-                    wifi_state: WifiConnectionState::Connected,
-                    ntp_state: NtpSyncState::Synchronizing,
-                    ssid: Some(config.ssid.clone()),
-                    ipv4_address: Some(format!("{}", ip_info.ip)),
-                    rssi_dbm: read_rssi_dbm(),
-                    timezone_name: config.timezone.clone(),
-                    ntp_server: config.ntp_server.clone(),
-                    last_sync_utc: None,
-                    error: None,
+            self.sntp = Some(EspSntp::new(&conf)?);
+            self.snapshot = NetworkSnapshot {
+                wifi_state: WifiConnectionState::Connected,
+                ntp_state: NtpSyncState::Synchronizing,
+                ssid: Some(config.ssid.clone()),
+                ipv4_address: Some(format!("{}", ip_info.ip)),
+                rssi_dbm: read_rssi_dbm(),
+                timezone_name: config.timezone.clone(),
+                ntp_server: config.ntp_server.clone(),
+                last_sync_utc: None,
+                error: None,
+            };
+            self.ntp_reported = false;
+            self.suspended = false;
+            Ok(())
+        }
+
+        /// Open `Rustmix-Setup` in APSTA so phones can join and the STA radio can scan.
+        pub fn start_softap(&mut self) -> Result<()> {
+            let wifi = self.wifi.as_mut().context("Wi-Fi runtime is unavailable")?;
+            let _ = self.sntp.take();
+            let _ = wifi.disconnect();
+            let _ = wifi.stop();
+            wifi.set_configuration(&Configuration::Mixed(
+                ClientConfiguration::default(),
+                AccessPointConfiguration {
+                    ssid: WIFI_SETUP_AP_SSID
+                        .try_into()
+                        .context("setup SSID exceeds embedded Wi-Fi capacity")?,
+                    ssid_hidden: false,
+                    channel: 6,
+                    auth_method: AuthMethod::None,
+                    max_connections: 4,
+                    ..Default::default()
                 },
-                ntp_reported: false,
-                suspended: false,
-            })
+            ))?;
+            wifi.start()?;
+            let mut ip = WIFI_SETUP_AP_IP.to_string();
+            for _ in 0..25 {
+                if let Ok(info) = wifi.wifi().ap_netif().get_ip_info() {
+                    ip = format!("{}", info.ip);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            self.snapshot = NetworkSnapshot {
+                wifi_state: WifiConnectionState::Provisioning,
+                ntp_state: NtpSyncState::WaitingForWifi,
+                ssid: Some(WIFI_SETUP_AP_SSID.into()),
+                ipv4_address: Some(ip),
+                rssi_dbm: None,
+                timezone_name: self.snapshot.timezone_name.clone(),
+                ntp_server: self.snapshot.ntp_server.clone(),
+                last_sync_utc: None,
+                error: None,
+            };
+            self.ntp_reported = false;
+            self.suspended = false;
+            Ok(())
+        }
+
+        pub fn scan_networks(&mut self) -> Result<Vec<ScannedNetwork>> {
+            let wifi = self.wifi.as_mut().context("Wi-Fi runtime is unavailable")?;
+            let raw = wifi.scan()?;
+            let mapped = raw
+                .into_iter()
+                .map(|ap| ScannedNetwork {
+                    ssid: ap.ssid.to_string(),
+                    rssi_dbm: i32::from(ap.signal_strength),
+                    open: ap.auth_method == AuthMethod::None,
+                })
+                .collect();
+            Ok(collapse_scan_results(mapped))
+        }
+
+        #[must_use]
+        pub const fn has_radio(&self) -> bool {
+            self.wifi.is_some()
         }
 
         #[must_use]
@@ -315,25 +418,7 @@ pub mod espidf {
         /// visible. Failed recovery is non-fatal and remains visible in the
         /// product-facing network snapshot.
         pub fn resume(&mut self, config: &NetworkConfig) -> Result<()> {
-            let wifi = self.wifi.as_mut().context("Wi-Fi runtime is unavailable")?;
-            wifi.start()?;
-            wifi.connect()?;
-            wifi.wait_netif_up()?;
-            let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
-            let mut conf = SntpConf::default();
-            conf.servers[0] = config.ntp_server.as_str();
-            self.sntp = Some(EspSntp::new(&conf)?);
-            self.snapshot.wifi_state = WifiConnectionState::Connected;
-            self.snapshot.ntp_state = NtpSyncState::Synchronizing;
-            self.snapshot.ssid = Some(config.ssid.clone());
-            self.snapshot.ipv4_address = Some(format!("{}", ip_info.ip));
-            self.snapshot.rssi_dbm = read_rssi_dbm();
-            self.snapshot.timezone_name = config.timezone.clone();
-            self.snapshot.ntp_server = config.ntp_server.clone();
-            self.snapshot.error = None;
-            self.ntp_reported = false;
-            self.suspended = false;
-            Ok(())
+            self.connect_station(config)
         }
 
         pub fn record_resume_failure(&mut self, error: impl Into<String>) {
@@ -406,6 +491,15 @@ mod tests {
             ..NetworkSnapshot::default()
         };
         assert_eq!(snapshot.home_badge(), "NTP OK");
+    }
+
+    #[test]
+    fn provisioning_snapshot_shows_setup_ap() {
+        let snapshot = NetworkSnapshot::provisioning();
+        assert_eq!(snapshot.wifi_state, WifiConnectionState::Provisioning);
+        assert_eq!(snapshot.home_badge(), "SETUP");
+        assert_eq!(snapshot.ssid_label(), "Rustmix-Setup");
+        assert_eq!(snapshot.ipv4_label(), "192.168.4.1");
     }
     #[test]
     fn log_fingerprint_ignores_rssi_churn() {

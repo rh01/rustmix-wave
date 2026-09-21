@@ -45,6 +45,13 @@ The generic installer preserves an existing Dictionary and Calendar tree. Use th
 
 ## Wi-Fi
 
+Two first-class paths, both kept on the Wi-Fi firmware line (not the BLE build):
+
+1. **SD `/RUSTMIX/WIFI.TXT`** — copy or edit this file, insert the card, and boot. If it exists and the station associates, the device stays in STA mode.
+2. **SoftAP web setup** — when `WIFI.TXT` is missing, station join fails, or you choose **Settings → Network → Configure Wi-Fi**, the device opens an open access point named `Rustmix-Setup`. Join it from a phone and open `http://192.168.4.1`. The page lists nearby SSIDs (refreshable), accepts a password or a manual SSID, then saves.
+
+SoftAP save writes **NVS and `WIFI.TXT`** (when the SD card is mounted) and switches to STA. After join, **Start Wi-Fi Transfer** is unchanged: LAN portal on the home network.
+
 Copy or edit `/RUSTMIX/WIFI.TXT`:
 
 ```text
@@ -54,7 +61,7 @@ timezone=America/New_York
 ntp_server=pool.ntp.org
 ```
 
-Do not commit real credentials.
+Do not commit real credentials. `WIFI.TXT` remains valid after a SoftAP save; you can still edit it on a computer as a manual path.
 
 ## Weather
 

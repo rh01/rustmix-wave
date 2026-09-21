@@ -1,11 +1,12 @@
 # Changelog
 
-## Unreleased — CJK fonts, fast refresh, in-reader size steps (Wi-Fi line)
+## Unreleased — CJK fonts, fast refresh, in-reader size steps, SoftAP Wi-Fi setup (Wi-Fi line)
 
 - Render Chinese in Reader TXT/EPUB pages, titles, and filenames using SD `/fonts` TTF/OTF plus an embedded GNU Unifont GB2312 fallback and a PSRAM glyph cache.
 - Keep Wi-Fi transfer, NTP, and weather on this line; do not enable the BLE build that disables Wi-Fi.
 - Prefer fast partial refresh for menus, settings, library, Reader page turns, and the Wi-Fi portal. Full refresh remains boot, wake, manual ghost clean, the 32-frame periodic threshold, sleep, and safety.
 - In-reader Reading Preferences cycle font sizes 16/20/24/32/48/72 px and built-in Latin plus SD CJK faces. Persist to `PREFS.TXT` and NVS.
+- Add SoftAP Wi-Fi setup at `http://192.168.4.1` (`Rustmix-Setup`) when `WIFI.TXT` is missing, STA join fails, or Settings → Network → Configure Wi-Fi is selected. Keep SD `WIFI.TXT` as a first-class path; SoftAP save writes NVS and `WIFI.TXT`.
 - Document SD font install and flash/PSRAM impact.
 
 ## v1.0.0-r3 — Screenshot User Guide and Architecture Documentation

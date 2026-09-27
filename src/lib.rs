@@ -15,6 +15,7 @@ pub mod dictionary;
 pub mod environment;
 pub mod epaper;
 pub mod epub;
+pub mod epub_page_index;
 pub mod fonts;
 pub mod framebuffer;
 pub mod games;

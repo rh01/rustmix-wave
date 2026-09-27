@@ -17,7 +17,7 @@ use crate::weread::{
         MAX_CHAPTER_TEXT, MAX_META_BYTES, MAX_SHARD_BYTES, MAX_TITLE_CHARS,
     },
     parse::{ChapterMeta, ReadingProgress},
-    session::atomic_write,
+    session::{self, atomic_write},
     text::{self, Block, ImageRef},
 };
 
@@ -101,7 +101,7 @@ pub fn save_catalog(
 }
 
 pub fn load_psvts(root: &Path, book_id: &str) -> String {
-    let Ok(bytes) = read_capped(&book_dir(root, book_id).join("META.TXT"), MAX_META_BYTES) else {
+    let Ok(bytes) = read_capped(&restored(&book_dir(root, book_id), "META"), MAX_META_BYTES) else {
         return String::new();
     };
     let text = String::from_utf8_lossy(&bytes);
@@ -113,7 +113,7 @@ pub fn load_psvts(root: &Path, book_id: &str) -> String {
 }
 
 pub fn load_catalog(root: &Path, book_id: &str) -> Option<Vec<ChapterMeta>> {
-    let path = book_dir(root, book_id).join("TOC.TXT");
+    let path = restored(&book_dir(root, book_id), "TOC");
     let bytes = read_capped(&path, 128 * 1024).ok()?;
     let text = String::from_utf8_lossy(&bytes);
     if !text
@@ -594,7 +594,7 @@ fn write_skip_file(
 
 #[must_use]
 pub fn load_download_skip(root: &Path, book_id: &str) -> Vec<u32> {
-    let Ok(bytes) = read_capped(&book_dir(root, book_id).join("SKIP.TXT"), 16 * 1024) else {
+    let Ok(bytes) = read_capped(&restored(&book_dir(root, book_id), "SKIP"), 16 * 1024) else {
         return Vec::new();
     };
     let text = String::from_utf8_lossy(&bytes);
@@ -622,7 +622,7 @@ pub fn load_download_skip(root: &Path, book_id: &str) -> Vec<u32> {
 /// Image slots recorded in `SKIP.TXT`. Chapter index lines are ignored here.
 #[must_use]
 pub fn load_image_skips(root: &Path, book_id: &str) -> Vec<(u32, u16)> {
-    let Ok(bytes) = read_capped(&book_dir(root, book_id).join("SKIP.TXT"), 16 * 1024) else {
+    let Ok(bytes) = read_capped(&restored(&book_dir(root, book_id), "SKIP"), 16 * 1024) else {
         return Vec::new();
     };
     let text = String::from_utf8_lossy(&bytes);
@@ -727,8 +727,41 @@ pub fn chapter_image_refs(root: &Path, book_id: &str, index: u32) -> Vec<ImageRe
         .collect()
 }
 
+/// `dir/<stem>.TXT`, after restoring it from `<stem>.BAK` if an interrupted
+/// [`atomic_write`] left only the backup.
+fn restored(dir: &Path, stem: &str) -> PathBuf {
+    let path = dir.join(format!("{stem}.TXT"));
+    session::restore_backup(&path, &dir.join(format!("{stem}.BAK")));
+    path
+}
+
+/// `CHAP.BAK` is shared by every chapter in a book. It is only moved back
+/// when its header names the chapter being opened.
+fn restore_chapter_backup(dir: &Path, index: u32, path: &Path) {
+    if path.exists() {
+        return;
+    }
+    let backup = dir.join("CHAP.BAK");
+    let Ok(mut file) = File::open(&backup) else {
+        return;
+    };
+    let Some(header) = read_through_separator(&mut file, 1024) else {
+        return;
+    };
+    drop(file);
+    let magic_ok = header
+        .lines()
+        .next()
+        .is_some_and(|line| matches!(line.trim(), "WRCH1" | "WRRAW1"));
+    if magic_ok && field(&header, "idx").parse::<u32>().ok() == Some(index) {
+        session::restore_backup(path, &backup);
+    }
+}
+
 pub fn load_chapter(root: &Path, book_id: &str, index: u32) -> Option<CachedChapter> {
-    let path = book_dir(root, book_id).join(chapter_name(index));
+    let dir = book_dir(root, book_id);
+    let path = dir.join(chapter_name(index));
+    restore_chapter_backup(&dir, index, &path);
     match file_magic(&path)? {
         ChapterMagic::Plain => load_plain_chapter(&path, index),
         ChapterMagic::Raw => load_raw_chapter(root, book_id, index, &path),
@@ -952,7 +985,7 @@ pub fn save_last_open(
 }
 
 pub fn load_last_open(root: &Path) -> Option<LastOpen> {
-    let bytes = read_capped(&root.join("WEREAD").join("LAST.TXT"), 512).ok()?;
+    let bytes = read_capped(&restored(&root.join("WEREAD"), "LAST"), 512).ok()?;
     let text = String::from_utf8_lossy(&bytes);
     if !text
         .lines()
@@ -973,7 +1006,7 @@ pub fn load_last_open(root: &Path) -> Option<LastOpen> {
 }
 
 pub fn load_local_progress(root: &Path, book_id: &str) -> Option<(ReadingProgress, usize)> {
-    let bytes = read_capped(&book_dir(root, book_id).join("PROG.TXT"), 1024).ok()?;
+    let bytes = read_capped(&restored(&book_dir(root, book_id), "PROG"), 1024).ok()?;
     let text = String::from_utf8_lossy(&bytes);
     if !text
         .lines()
@@ -1241,6 +1274,44 @@ mod tests {
         super::save_download_skip(&dir, &book, &[3, 9, 3]).unwrap();
         assert_eq!(super::load_download_skip(&dir, &book), vec![3, 9]);
         assert!(super::load_download_skip(&dir, "missing").is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_chapter_left_only_as_chap_bak_is_restored_on_the_next_load() {
+        let dir = std::env::temp_dir().join(format!("weread-bak-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let book = "43208843";
+        let chapter = |index: u32, text: &str| CachedChapter {
+            uid: index.to_string(),
+            index,
+            title: format!("Chapter {index}"),
+            text: text.into(),
+        };
+        save_chapter(&dir, book, &chapter(2, "second chapter body")).unwrap();
+        let book_dir = super::book_dir(&dir, book);
+        let primary = book_dir.join(super::chapter_name(2));
+        let backup = book_dir.join("CHAP.BAK");
+        // Both renames in atomic_write failed: only the backup is left.
+        fs::rename(&primary, &backup).unwrap();
+        assert!(!super::chapter_cached(&dir, book, 2));
+
+        assert!(
+            load_chapter(&dir, book, 3).is_none(),
+            "a backup for another chapter stays put"
+        );
+        assert!(backup.is_file());
+
+        let restored = load_chapter(&dir, book, 2).unwrap();
+        assert_eq!(restored.text, "second chapter body");
+        assert!(primary.is_file());
+        assert!(!backup.exists());
+
+        save_catalog(&dir, book, "Title", "Author", "epub", "ps", &[]).unwrap();
+        let meta = book_dir.join("META.TXT");
+        fs::rename(&meta, book_dir.join("META.BAK")).unwrap();
+        assert_eq!(super::load_psvts(&dir, book), "ps");
+        assert!(meta.is_file());
         let _ = fs::remove_dir_all(&dir);
     }
 

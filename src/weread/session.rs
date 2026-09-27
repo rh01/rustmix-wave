@@ -222,7 +222,9 @@ pub struct PortalUpdate {
 }
 
 pub fn load_session(root: &Path) -> Session {
-    let mut session = read_session_file(&session_path(root)).unwrap_or_default();
+    let path = session_path(root);
+    restore_backup(&path, &path.with_file_name(SESSION_BAK));
+    let mut session = read_session_file(&path).unwrap_or_default();
     if let Some(update) = read_config(root) {
         if let Some(key) = update.api_key {
             session.api_key = key;
@@ -268,6 +270,7 @@ pub fn apply_portal_update(root: &Path, update: &PortalUpdate) -> Result<Session
 }
 
 fn read_config(root: &Path) -> Option<PortalUpdate> {
+    restore_backup(&root.join("WEREAD.TXT"), &root.join("WEREAD.BAK"));
     let text = fs::read_to_string(root.join("WEREAD.TXT")).ok()?;
     parse_config_text(&text).ok()
 }
@@ -315,6 +318,25 @@ fn read_session_file(path: &Path) -> Result<Session, &'static str> {
 
 fn session_path(root: &Path) -> PathBuf {
     root.join("WEREAD").join(SESSION_FILE)
+}
+
+/// Put `backup` back at `path` when `path` is missing.
+///
+/// [`atomic_write`] moves the old file to its backup before renaming the new
+/// temp into place. If both that rename and the restore fail, the backup is the
+/// only good copy. Loaders call this first so the next read finds it.
+pub fn restore_backup(path: &Path, backup: &Path) -> bool {
+    if path.exists() || !backup.is_file() {
+        return false;
+    }
+    let restored = fs::rename(backup, path).is_ok();
+    if restored {
+        log::warn!(
+            "rustmix-wave=weread-storage status=restored-backup path={}",
+            path.display()
+        );
+    }
+    restored
 }
 
 pub fn atomic_write(

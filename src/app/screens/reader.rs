@@ -21,8 +21,8 @@ use crate::{
     },
     orientation::OrientedFrameBuffer,
     reader::{
-        BookFontSize, BookFormat, ParagraphAlignment, ReaderLibraryTab, ReaderLoadingStage,
-        ReaderOption, ReadingPreference, ReadingTheme,
+        BookFormat, ParagraphAlignment, ReaderLibraryTab, ReaderLoadingStage, ReaderOption,
+        ReadingPreference, ReadingTheme,
     },
 };
 
@@ -688,7 +688,7 @@ pub fn render_preferences(
         draw_row(
             display,
             state,
-            148 + index as i32 * 68,
+            PREFERENCE_ROWS_TOP + index as i32 * 68,
             state.reader.preferences_selected == index,
             preference.label(),
             badge,
@@ -703,20 +703,30 @@ pub fn render_preferences(
     draw_footer(display, state.display, footer)
 }
 
+/// The 72px sample needs about 110px. Eight 68px rows from here end above the
+/// footer rule at 746.
+const PREFERENCE_ROWS_TOP: i32 = 212;
+const PREVIEW_SAMPLE_TOP: i32 = 100;
+
 fn draw_preference_preview(
     display: &mut OrientedFrameBuffer<'_>,
     state: &AppState,
 ) -> Result<(), Infallible> {
     let prefs = state.reader.preferences;
-    let sample = reader_body_style(prefs.book_font, BookFontSize::Px20, prefs.theme)
+    let sample = reader_body_style(prefs.book_font, prefs.font_size, prefs.theme)
         .with_tracking(prefs.letter_spacing.pixels());
     let caption = format!(
-        "{}  {}",
+        "PREVIEW  {}  {}",
         prefs.font_size.label(),
         prefs.letter_spacing.label()
     );
-    Text::new("Aa Bb", Point::new(24, 112), sample).draw(display)?;
-    Text::new(&caption, Point::new(250, 112), state.display.detail_style()).draw(display)?;
+    Text::new(&caption, Point::new(24, 92), state.display.detail_style()).draw(display)?;
+    let baseline = (PREVIEW_SAMPLE_TOP + i32::from(sample.line_height()) * 4 / 5)
+        .min(PREFERENCE_ROWS_TOP - 12);
+    Text::new("Aa Bb Cc", Point::new(24, baseline), sample).draw_clipped(
+        display,
+        TextBounds::new(18, PREVIEW_SAMPLE_TOP - 4, 462, PREFERENCE_ROWS_TOP - 6),
+    )?;
     Ok(())
 }
 

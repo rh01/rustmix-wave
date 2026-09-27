@@ -843,9 +843,8 @@ impl WereadUi {
         self.pages
             .iter()
             .take(self.page_index)
-            .flat_map(|page| page.iter())
-            .map(text::flow_text_chars)
-            .fold(0u32, |sum, chars| sum.saturating_add(chars as u32))
+            .map(|page| text::page_resume_units(page))
+            .fold(0u32, |sum, units| sum.saturating_add(units))
     }
 
     /// Resume by text offset. A stored page number shifts when a placeholder

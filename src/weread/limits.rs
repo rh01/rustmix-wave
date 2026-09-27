@@ -23,8 +23,9 @@ pub const MAX_CHAPTER_IMAGE_BYTES: usize = 1024 * 1024;
 /// PNG source edge. Larger headers are a placeholder.
 ///
 /// Chosen so a 1 MiB file, one RGBA buffer, and the 256 KiB zlib window still
-/// fit beside the resident buffers with [`IMAGE_SAFETY_MARGIN_BYTES`] left over.
-pub const MAX_IMAGE_EDGE: u32 = 320;
+/// fit beside the resident buffers, including seven bitmaps already upscaled
+/// to the reader content box, with [`IMAGE_SAFETY_MARGIN_BYTES`] left over.
+pub const MAX_IMAGE_EDGE: u32 = 192;
 /// Pixel count accepted for one PNG.
 pub const MAX_DECODE_PIXELS: u32 = MAX_IMAGE_EDGE * MAX_IMAGE_EDGE;
 /// One PNG output buffer (RGBA, 4 bytes per pixel).
@@ -39,8 +40,8 @@ pub const MAX_JPEG_EDGE: u32 = 256;
 pub const PNG_ZLIB_OUT_BYTES: usize = 256 * 1024;
 /// Headroom that must remain after the worst-case decode peak.
 pub const IMAGE_SAFETY_MARGIN_BYTES: usize = 512 * 1024;
-/// Widest reader measure. Bitmaps are decoded to this and scaled again to the
-/// open layout when the chapter is drawn.
+/// Widest reader measure. Decode stays at [`MAX_IMAGE_EDGE`] / [`MAX_JPEG_EDGE`];
+/// the luma is upscaled to this box only after the file and coefficients are gone.
 pub const IMAGE_TARGET_WIDTH: u32 = 752;
 /// Tallest reader page the bitmap is scaled into before pagination.
 pub const IMAGE_TARGET_HEIGHT: u32 = 594;
@@ -104,13 +105,21 @@ pub const HTTP_IO_BUFFER_BYTES: usize = 2 * 1024;
 /// Waveshare ESP32-S3-WROOM-1-N16R8 octal PSRAM.
 pub const MODULE_PSRAM_BYTES: usize = 8 * 1024 * 1024;
 
+/// Packed 1-bit bytes of one bitmap that fills the reader content box.
+#[must_use]
+pub fn packed_bitmap_bytes(width: u32, height: u32) -> usize {
+    let stride = (width as usize).saturating_add(7) / 8;
+    stride.saturating_mul(height as usize)
+}
+
 /// Packed 1-bit bytes of the bitmaps already installed when the next image
 /// starts. One slot is the image being decoded, so at most seven are live.
+///
+/// Stored bitmaps are the upscaled content size, not the decoder edge.
 #[must_use]
 pub fn loaded_chapter_bitmap_bytes() -> usize {
-    let edge = (MAX_IMAGE_EDGE.max(MAX_JPEG_EDGE)) as usize;
-    let packed = edge.saturating_mul(edge).div_ceil(8);
-    packed.saturating_mul(MAX_CHAPTER_IMAGES.saturating_sub(1))
+    packed_bitmap_bytes(IMAGE_TARGET_WIDTH, IMAGE_TARGET_HEIGHT)
+        .saturating_mul(MAX_CHAPTER_IMAGES.saturating_sub(1))
 }
 
 /// Bytes already occupied when a chapter image is decoded.
@@ -199,10 +208,97 @@ pub fn jpeg_decoder_extra_bytes(
         .checked_add(rows)
 }
 
-/// `peak` fits in [`image_heap_room`], which already excludes the 512 KiB margin.
+/// Largest single infallible `Vec` inside `jpeg-decoder` for this scale.
+///
+/// Coefficient planes, MCU rows, component planes, and the interleaved frame
+/// are separate allocations. The check is the biggest one, not their sum.
 #[must_use]
-pub fn image_alloc_fits(peak: usize) -> bool {
-    peak <= image_heap_room()
+pub fn jpeg_largest_infallible(
+    src_w: u16,
+    src_h: u16,
+    out_w: u32,
+    out_h: u32,
+    components: usize,
+    progressive: bool,
+) -> Option<usize> {
+    let plane = (out_w as usize).checked_mul(out_h as usize)?;
+    let interleaved = plane.checked_mul(components.max(1))?;
+    let coeff = if progressive {
+        usize::from(src_w)
+            .div_ceil(8)
+            .checked_mul(usize::from(src_h).div_ceil(8))?
+            .checked_mul(64)?
+            .checked_mul(2)?
+    } else {
+        0
+    };
+    let mcu_row = usize::from(src_w)
+        .div_ceil(8)
+        .checked_mul(4)?
+        .checked_mul(64)?
+        .checked_mul(2)?;
+    Some(plane.max(interleaved).max(coeff).max(mcu_row))
+}
+
+/// Live PSRAM headroom. Host tests have no SPIRAM heap, so they report the
+/// static budget as unbounded and [`image_alloc_fits`] keeps the formula check.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpiramHeadroom {
+    pub free_bytes: usize,
+    pub largest_block_bytes: usize,
+}
+
+#[must_use]
+pub fn spiram_headroom() -> SpiramHeadroom {
+    #[cfg(target_os = "espidf")]
+    {
+        use esp_idf_svc::sys;
+        SpiramHeadroom {
+            free_bytes: unsafe { sys::heap_caps_get_free_size(sys::MALLOC_CAP_SPIRAM as u32) },
+            largest_block_bytes: unsafe {
+                sys::heap_caps_get_largest_free_block(sys::MALLOC_CAP_SPIRAM as u32)
+            },
+        }
+    }
+    #[cfg(not(target_os = "espidf"))]
+    {
+        SpiramHeadroom {
+            free_bytes: usize::MAX,
+            largest_block_bytes: usize::MAX,
+        }
+    }
+}
+
+/// `upcoming` is what decode will still allocate. `largest_infallible` is one
+/// contiguous buffer. Both must leave [`IMAGE_SAFETY_MARGIN_BYTES`] free.
+#[must_use]
+pub fn spiram_can_hold(
+    free_bytes: usize,
+    largest_block_bytes: usize,
+    upcoming: usize,
+    largest_infallible: usize,
+) -> bool {
+    free_bytes >= upcoming.saturating_add(IMAGE_SAFETY_MARGIN_BYTES)
+        && largest_block_bytes >= largest_infallible.saturating_add(IMAGE_SAFETY_MARGIN_BYTES)
+}
+
+/// Static room plus the live SPIRAM check.
+///
+/// `peak` includes the compressed file (already allocated). `upcoming` does
+/// not, so total free is not asked to hold the file twice. `largest_infallible`
+/// is the biggest `vec!` still ahead.
+#[must_use]
+pub fn image_alloc_fits(peak: usize, upcoming: usize, largest_infallible: usize) -> bool {
+    if peak > image_heap_room() {
+        return false;
+    }
+    let heap = spiram_headroom();
+    spiram_can_hold(
+        heap.free_bytes,
+        heap.largest_block_bytes,
+        upcoming,
+        largest_infallible,
+    )
 }
 
 pub const WEREAD_ROOT: &str = "/sdcard/RUSTMIX/WEREAD";
@@ -215,12 +311,13 @@ pub const SESSION_BAK: &str = "SESS.BAK";
 mod tests {
     use super::{
         image_alloc_fits, image_heap_room, image_resident_bytes, jpeg_decoder_extra_bytes,
-        jpeg_scaled_edge, loaded_chapter_bitmap_bytes, png_decode_peak, DOWNLOAD_CHUNK_BYTES,
+        jpeg_largest_infallible, jpeg_scaled_edge, loaded_chapter_bitmap_bytes,
+        packed_bitmap_bytes, png_decode_peak, spiram_can_hold, DOWNLOAD_CHUNK_BYTES,
         HTTP_CHAPTER_LIMIT_MS, HTTP_IDLE_LIMIT_MS, HTTP_IO_BUFFER_BYTES, HTTP_READ_TIMEOUT_MS,
-        HTTP_TIMEOUT_SECS, IMAGE_DECODE_STACK_BYTES, IMAGE_SAFETY_MARGIN_BYTES, MAX_CHAPTER_IMAGES,
-        MAX_CHAPTER_IMAGE_BYTES, MAX_CHAPTER_TEXT, MAX_DECODE_PIXELS, MAX_IMAGE_DECODE_BYTES,
-        MAX_IMAGE_EDGE, MAX_JPEG_EDGE, MAX_SHARD_BYTES, MODULE_PSRAM_BYTES, PNG_ZLIB_OUT_BYTES,
-        WEREAD_HTTP_WORKER_STACK_BYTES,
+        HTTP_TIMEOUT_SECS, IMAGE_DECODE_STACK_BYTES, IMAGE_SAFETY_MARGIN_BYTES,
+        IMAGE_TARGET_HEIGHT, IMAGE_TARGET_WIDTH, MAX_CHAPTER_IMAGES, MAX_CHAPTER_IMAGE_BYTES,
+        MAX_CHAPTER_TEXT, MAX_DECODE_PIXELS, MAX_IMAGE_DECODE_BYTES, MAX_IMAGE_EDGE, MAX_JPEG_EDGE,
+        MAX_SHARD_BYTES, MODULE_PSRAM_BYTES, PNG_ZLIB_OUT_BYTES, WEREAD_HTTP_WORKER_STACK_BYTES,
     };
     use crate::fonts::{
         GLYPH_CACHE_BUDGET_BYTES, MAX_SD_FONT_BYTES, SD_FONT_RESIDENT_BUDGET_BYTES,
@@ -274,23 +371,45 @@ mod tests {
         );
         let png_peak = png_decode_peak(MAX_CHAPTER_IMAGE_BYTES, MAX_IMAGE_EDGE, MAX_IMAGE_EDGE)
             .expect("png edge");
+        let png_upcoming = png_peak - MAX_CHAPTER_IMAGE_BYTES;
         assert!(
-            image_alloc_fits(png_peak),
+            image_alloc_fits(png_peak, png_upcoming, PNG_ZLIB_OUT_BYTES),
             "png square at the edge must fit, peak {png_peak} room {}",
             image_heap_room()
         );
         assert!(!image_alloc_fits(
-            png_decode_peak(MAX_CHAPTER_IMAGE_BYTES, 800, 800).unwrap_or(usize::MAX)
+            png_decode_peak(MAX_CHAPTER_IMAGE_BYTES, 800, 800).unwrap_or(usize::MAX),
+            0,
+            0
         ));
         // File is dropped before luma, so RGBA + luma is a later, smaller peak.
         let png_and_luma = MAX_DECODE_PIXELS as usize * 5;
         assert!(png_and_luma <= image_heap_room());
         let full_800 = jpeg_decoder_extra_bytes(800, 800, 800, 800, 3, false).unwrap();
-        assert!(!image_alloc_fits(MAX_CHAPTER_IMAGE_BYTES + full_800));
+        assert!(!image_alloc_fits(
+            MAX_CHAPTER_IMAGE_BYTES + full_800,
+            full_800,
+            0
+        ));
+        // Seven content-sized bitmaps leave no room for a 1/4-scale 800px JPEG.
         let quarter = jpeg_scaled_edge(800, 2);
-        assert!(quarter <= MAX_JPEG_EDGE);
         let quarter_800 = jpeg_decoder_extra_bytes(800, 800, quarter, quarter, 3, false).unwrap();
-        assert!(image_alloc_fits(MAX_CHAPTER_IMAGE_BYTES + quarter_800));
+        assert!(!image_alloc_fits(
+            MAX_CHAPTER_IMAGE_BYTES + quarter_800,
+            quarter_800,
+            0
+        ));
+        let eighth = jpeg_scaled_edge(800, 1);
+        assert!(eighth <= MAX_JPEG_EDGE);
+        let eighth_800 = jpeg_decoder_extra_bytes(800, 800, eighth, eighth, 3, false).unwrap();
+        let eighth_largest = jpeg_largest_infallible(800, 800, eighth, eighth, 3, false).unwrap();
+        assert!(image_alloc_fits(
+            MAX_CHAPTER_IMAGE_BYTES + eighth_800,
+            eighth_800,
+            eighth_largest
+        ));
+        // Full-frame 4-component output at the JPEG cap does not fit a 1 MiB file.
+        // Half of that cap does.
         let jpeg_edge = jpeg_decoder_extra_bytes(
             MAX_JPEG_EDGE as u16,
             MAX_JPEG_EDGE as u16,
@@ -300,22 +419,66 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(image_alloc_fits(MAX_CHAPTER_IMAGE_BYTES + jpeg_edge));
+        assert!(!image_alloc_fits(
+            MAX_CHAPTER_IMAGE_BYTES + jpeg_edge,
+            jpeg_edge,
+            0
+        ));
+        let half_edge = jpeg_scaled_edge(MAX_JPEG_EDGE as u16, 4);
+        let half = jpeg_decoder_extra_bytes(
+            MAX_JPEG_EDGE as u16,
+            MAX_JPEG_EDGE as u16,
+            half_edge,
+            half_edge,
+            4,
+            false,
+        )
+        .unwrap();
+        assert!(image_alloc_fits(MAX_CHAPTER_IMAGE_BYTES + half, half, half));
         // Progressive coefficients stay full-size and are added to the MCU-row copy.
         let wide = jpeg_decoder_extra_bytes(1600, 8, 8, 8, 3, true).unwrap();
         let coeff = 1600usize.div_ceil(8) * 8usize.div_ceil(8) * 64 * 2 * 3;
         let mcu = 1600usize.div_ceil(8) * 4 * 64 * 2 * 3;
         assert!(mcu >= 300 * 1024, "wide vertical-4 row is {mcu}");
         assert!(wide >= coeff + mcu);
+        let wide_largest = jpeg_largest_infallible(1600, 8, 8, 8, 3, true).unwrap();
+        assert!(wide_largest >= coeff / 3, "one coefficient plane");
         assert!(!image_alloc_fits(
             MAX_CHAPTER_IMAGE_BYTES
-                + jpeg_decoder_extra_bytes(800, 800, quarter, quarter, 3, true).unwrap()
+                + jpeg_decoder_extra_bytes(800, 800, quarter, quarter, 3, true).unwrap(),
+            0,
+            0
         ));
-        let edge = MAX_IMAGE_EDGE.max(MAX_JPEG_EDGE) as usize;
-        assert!(edge * edge * 3 <= image_heap_room());
+        let display = (IMAGE_TARGET_WIDTH as usize) * (IMAGE_TARGET_HEIGHT as usize);
+        assert!(
+            display.saturating_mul(3) <= image_heap_room(),
+            "upscale plus dither runs after the file is dropped"
+        );
+        assert!(
+            loaded_chapter_bitmap_bytes()
+                >= packed_bitmap_bytes(IMAGE_TARGET_WIDTH, IMAGE_TARGET_HEIGHT)
+        );
         assert!(image_heap_room() < MODULE_PSRAM_BYTES);
         assert_eq!(MAX_CHAPTER_IMAGE_BYTES, 1024 * 1024);
         assert!(MAX_CHAPTER_IMAGES <= 8);
         assert!(IMAGE_DECODE_STACK_BYTES >= 48 * 1024);
+        assert!(!spiram_can_hold(
+            2_000_000,
+            400_000,
+            PNG_ZLIB_OUT_BYTES,
+            PNG_ZLIB_OUT_BYTES
+        ));
+        assert!(spiram_can_hold(
+            4_000_000,
+            2_000_000,
+            PNG_ZLIB_OUT_BYTES,
+            PNG_ZLIB_OUT_BYTES
+        ));
+        assert!(!spiram_can_hold(
+            PNG_ZLIB_OUT_BYTES,
+            2_000_000,
+            PNG_ZLIB_OUT_BYTES,
+            PNG_ZLIB_OUT_BYTES
+        ));
     }
 }

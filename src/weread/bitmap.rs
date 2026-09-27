@@ -1,14 +1,14 @@
 //! Bounded JPEG/PNG decode into a 1-bit bitmap for the e-paper panel.
 //!
-//! JPEG goes through `jpeg-decoder` and PNG through `png`, not `image`'s
-//! `DynamicImage` path. That path allocates the output buffer before the
-//! decoder's own planes, so a baseline JPEG briefly holds the file, the
-//! component planes, and two full frames. Here the file is dropped as soon as
-//! those planes are gone, and scaling plus Floyd-Steinberg run on a luma
-//! plane only. Every buffer this module owns is reserved with
-//! [`Vec::try_reserve_exact`]; a failure becomes a placeholder instead of an
-//! abort. Decode itself runs on the `weread-img` PSRAM stack, not the 16 KiB
-//! main task.
+//! JPEG goes through the vendored `jpeg-decoder` (caller-thread IDCT only) and
+//! PNG through `png`. The decoder edge stays at
+//! [`MAX_IMAGE_EDGE`](crate::weread::limits::MAX_IMAGE_EDGE) /
+//! [`MAX_JPEG_EDGE`](crate::weread::limits::MAX_JPEG_EDGE). After `decode`
+//! returns, the file and coefficient buffers are gone and the luma is
+//! upscaled to the reader content box, then dithered. That upscale is
+//! fallible: a short contiguous SPIRAM block keeps the smaller luma. Every
+//! buffer this module owns is reserved with [`Vec::try_reserve_exact`]. Decode
+//! itself runs on the `weread-img` PSRAM stack, not the 16 KiB main task.
 //!
 //! The SSD1677 driver has no grayscale waveform
 //! ([`crate::panel_refresh::supports_grayscale_refresh`]), so the bitmap is
@@ -23,9 +23,9 @@ use crate::{
     panel_refresh::supports_grayscale_refresh,
     runtime_worker::NamedWorkerHandle,
     weread::limits::{
-        image_alloc_fits, jpeg_decoder_extra_bytes, jpeg_scaled_edge, png_decode_peak,
-        IMAGE_DECODE_STACK_BYTES, MAX_CHAPTER_IMAGE_BYTES, MAX_IMAGE_DECODE_BYTES, MAX_IMAGE_EDGE,
-        MAX_JPEG_EDGE, PNG_ZLIB_OUT_BYTES,
+        image_alloc_fits, jpeg_decoder_extra_bytes, jpeg_largest_infallible, jpeg_scaled_edge,
+        packed_bitmap_bytes, png_decode_peak, IMAGE_DECODE_STACK_BYTES, MAX_CHAPTER_IMAGE_BYTES,
+        MAX_IMAGE_DECODE_BYTES, MAX_IMAGE_EDGE, MAX_JPEG_EDGE, PNG_ZLIB_OUT_BYTES,
     },
 };
 
@@ -111,23 +111,77 @@ pub fn decode_mono(
         }
         None => return Err("image format is not png or jpeg"),
     };
-    let (target_w, target_h) = fitted_size(
-        width,
-        height,
-        max_width.max(1).min(MAX_IMAGE_EDGE),
-        max_height.max(1).min(MAX_IMAGE_EDGE),
-    );
-    let scaled = scale_luma(
-        &luma,
-        width,
-        height,
-        u32::from(target_w),
-        u32::from(target_h),
-    )?;
-    drop(luma);
     // 1-bit Floyd-Steinberg. A grayscale refresh is not available on this panel.
     let _ = supports_grayscale_refresh();
-    floyd_steinberg(&scaled, u32::from(target_w), u32::from(target_h))
+    present_luma(&luma, width, height, max_width.max(1), max_height.max(1))
+}
+
+/// Fit inside the content box, scaling up or down, keeping aspect.
+fn content_box(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    let max_w = max_w.max(1);
+    let max_h = max_h.max(1);
+    if src_w == 0 || src_h == 0 {
+        return (1, 1);
+    }
+    let mut w = max_w;
+    let mut h = ((u64::from(src_h) * u64::from(max_w)) / u64::from(src_w)) as u32;
+    if h == 0 || h > max_h {
+        h = max_h;
+        w = ((u64::from(src_w) * u64::from(max_h)) / u64::from(src_h)) as u32;
+    }
+    (w.max(1).min(max_w), h.max(1).min(max_h))
+}
+
+fn display_alloc_ok(src_len: usize, dst_w: u32, dst_h: u32) -> bool {
+    let count = (dst_w as usize).saturating_mul(dst_h as usize);
+    if count == 0 {
+        return false;
+    }
+    let i16_bytes = count.saturating_mul(2);
+    let during_scale = src_len.saturating_add(count);
+    let during_dither = count
+        .saturating_add(i16_bytes)
+        .saturating_add(packed_bitmap_bytes(dst_w, dst_h));
+    let peak = during_scale.max(during_dither);
+    image_alloc_fits(peak, peak, count.max(i16_bytes))
+}
+
+/// Upscale to the content box after decode. Fall back when the contiguous
+/// SPIRAM block or the reservation cannot hold the dither buffer.
+fn present_luma(
+    luma: &[u8],
+    src_w: u32,
+    src_h: u32,
+    max_w: u32,
+    max_h: u32,
+) -> Result<MonoBitmap, &'static str> {
+    let (full_w, full_h) = content_box(src_w, src_h, max_w, max_h);
+    let (mid_w, mid_h) = content_box(src_w, src_h, (max_w / 2).max(1), (max_h / 2).max(1));
+    let (native_w, native_h) = fitted_size(src_w, src_h, max_w, max_h);
+    let steps = [
+        (full_w, full_h),
+        (mid_w, mid_h),
+        (u32::from(native_w), u32::from(native_h)),
+    ];
+    let mut tried = [(0u32, 0u32); 3];
+    let mut n = 0usize;
+    for step in steps {
+        if tried[..n].contains(&step) {
+            continue;
+        }
+        tried[n] = step;
+        n += 1;
+        if !display_alloc_ok(luma.len(), step.0, step.1) {
+            continue;
+        }
+        let Ok(scaled) = scale_luma(luma, src_w, src_h, step.0, step.1) else {
+            continue;
+        };
+        if let Ok(bitmap) = floyd_steinberg(&scaled, step.0, step.1) {
+            return Ok(bitmap);
+        }
+    }
+    Err("image decode failed")
 }
 
 #[derive(Clone, Copy)]
@@ -212,9 +266,22 @@ fn decode_jpeg(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32, PixelFormat), &'stati
         progressive,
     )
     .ok_or("image is too large")?;
-    if !image_alloc_fits(bytes.len().saturating_add(extra)) {
+    let largest = jpeg_largest_infallible(
+        src_w,
+        src_h,
+        u32::from(got_w),
+        u32::from(got_h),
+        components,
+        progressive,
+    )
+    .ok_or("image is too large")?;
+    if !image_alloc_fits(bytes.len().saturating_add(extra), extra, largest) {
         return Err("image is too large");
     }
+    let output_bytes = (usize::from(got_w))
+        .saturating_mul(usize::from(got_h))
+        .saturating_mul(components);
+    decoder.set_max_decoding_buffer_size(output_bytes);
     let pixels = decoder.decode().map_err(|_| "image decode failed")?;
     let width = u32::from(got_w);
     let height = u32::from(got_h);
@@ -246,7 +313,12 @@ fn select_jpeg_scale(
         else {
             continue;
         };
-        if !image_alloc_fits(file_len.saturating_add(extra)) {
+        let Some(largest) =
+            jpeg_largest_infallible(src_w, src_h, out_w, out_h, components, progressive)
+        else {
+            continue;
+        };
+        if !image_alloc_fits(file_len.saturating_add(extra), extra, largest) {
             continue;
         }
         let out_w = u16::try_from(out_w).map_err(|_| "image is too large")?;
@@ -265,14 +337,27 @@ fn png_ihdr(bytes: &[u8]) -> Option<(u32, u32)> {
     Some((width, height))
 }
 
+fn png_is_interlaced(bytes: &[u8]) -> bool {
+    bytes.get(28).is_some_and(|method| *method != 0)
+}
+
 fn decode_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32, usize), &'static str> {
     let (width, height) = png_ihdr(bytes).ok_or("image header is unreadable")?;
+    // Adam7 grows `out_buffer` past the 256 KiB window (old and new blocks
+    // coexist while it doubles). Reject before `next_frame` allocates that.
+    if png_is_interlaced(bytes) {
+        return Err("interlaced png is not supported");
+    }
     let peak = png_decode_peak(bytes.len(), width, height).ok_or("image is too large")?;
+    let rgba = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(4);
+    let upcoming = rgba.saturating_add(PNG_ZLIB_OUT_BYTES);
     if width == 0
         || height == 0
         || width > MAX_IMAGE_EDGE
         || height > MAX_IMAGE_EDGE
-        || !image_alloc_fits(peak)
+        || !image_alloc_fits(peak, upcoming, PNG_ZLIB_OUT_BYTES.max(rgba))
     {
         return Err("image is too large");
     }
@@ -284,12 +369,12 @@ fn decode_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32, usize), &'static str> 
         .read_info()
         .map_err(|_| "image header is unreadable")?;
     let output = reader.output_buffer_size();
+    let upcoming = output.saturating_add(PNG_ZLIB_OUT_BYTES);
     if output > MAX_IMAGE_DECODE_BYTES
         || !image_alloc_fits(
-            bytes
-                .len()
-                .saturating_add(output)
-                .saturating_add(PNG_ZLIB_OUT_BYTES),
+            bytes.len().saturating_add(upcoming),
+            upcoming,
+            PNG_ZLIB_OUT_BYTES.max(output),
         )
     {
         return Err("image is too large");
@@ -499,6 +584,7 @@ pub fn allowed_asset_url(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{allowed_asset_url, decode_mono, fitted_size};
+    use crate::weread::limits::MAX_JPEG_EDGE;
     use image::{
         codecs::{jpeg::JpegEncoder, png::PngEncoder},
         GrayImage, ImageEncoder, Luma, RgbImage,
@@ -514,7 +600,7 @@ mod tests {
         PngEncoder::new(Cursor::new(&mut bytes))
             .write_image(image.as_raw(), 2, 1, image::ColorType::L8)
             .unwrap();
-        let bitmap = decode_mono(bytes, 48, 64).unwrap();
+        let bitmap = decode_mono(bytes, 2, 1).unwrap();
         assert!(bitmap.bit(0, 0));
         assert!(!bitmap.bit(1, 0));
         assert!(decode_mono(huge_png_header(), 48, 64).is_err());
@@ -538,19 +624,31 @@ mod tests {
         assert!(decode_mono(jpeg_sof(8_000, 8_000, false), 752, 594).is_err());
         let bitmap = decode_mono(tiny_jpeg(), 48, 64).unwrap();
         assert!(bitmap.width >= 1 && bitmap.height >= 1);
-        let bitmap = decode_mono(tiny_png(), 48, 64).unwrap();
+        let bitmap = decode_mono(tiny_png(), 2, 2).unwrap();
         assert_eq!((bitmap.width, bitmap.height), (2, 2));
+        let mut interlaced = tiny_png();
+        interlaced[28] = 1;
+        assert!(decode_mono(interlaced, 2, 2).is_err());
     }
 
     #[test]
     fn wide_baseline_jpeg_is_scaled_inside_the_decoder_budget() {
         let bitmap = decode_mono(solid_jpeg(800, 800), 752, 594).unwrap();
-        assert!(
-            (150..=256).contains(&bitmap.width) && (150..=256).contains(&bitmap.height),
-            "decoded {}x{}, full 800px planes would exceed PSRAM",
-            bitmap.width,
-            bitmap.height
+        assert_eq!(
+            (bitmap.width, bitmap.height),
+            (594, 594),
+            "decoder stays small, then luma is upscaled into the content box"
         );
+        assert!(u32::from(bitmap.width) > MAX_JPEG_EDGE);
+    }
+
+    #[test]
+    fn wide_jpeg_decodes_without_worker_threads() {
+        // Output wider than 128 would make stock jpeg-decoder spawn one
+        // thread per component. The vendored spawn path returns an error, so
+        // a successful decode means those threads were not started.
+        let bitmap = decode_mono(solid_jpeg(160, 160), 160, 160).unwrap();
+        assert!(bitmap.width >= 128, "decoded {}px", bitmap.width);
     }
 
     #[test]
@@ -567,7 +665,7 @@ mod tests {
         PngEncoder::new(Cursor::new(&mut bytes))
             .write_image(image.as_raw(), 4, 2, image::ColorType::L8)
             .unwrap();
-        let bitmap = decode_mono(bytes, 48, 64).unwrap();
+        let bitmap = decode_mono(bytes, 4, 2).unwrap();
         let mut black = 0;
         for y in 0..bitmap.height {
             for x in 0..bitmap.width {

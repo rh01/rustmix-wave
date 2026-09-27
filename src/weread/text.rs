@@ -63,7 +63,29 @@ pub fn flow_text_chars(item: &FlowItem) -> usize {
     }
 }
 
-/// Page whose text contains `offset`, counting only [`flow_text_chars`].
+/// Resume units for one page.
+///
+/// Text pages contribute their [`flow_text_chars`]. An image-only page has no
+/// characters, so it takes one unit of its own. Consecutive pictures then
+/// restore to different pages, and the following text still starts just after
+/// those units.
+#[must_use]
+pub fn page_resume_units(page: &[FlowItem]) -> u32 {
+    let chars = page
+        .iter()
+        .map(flow_text_chars)
+        .fold(0u32, |sum, chars| sum.saturating_add(chars as u32));
+    if chars == 0 {
+        1
+    } else {
+        chars
+    }
+}
+
+/// Page whose resume position contains `offset`.
+///
+/// Text is counted with [`flow_text_chars`]. Each image-only page consumes one
+/// extra unit so two pictures in a row do not share an offset.
 #[must_use]
 pub fn page_for_text_offset(pages: &[Vec<FlowItem>], offset: u32) -> usize {
     if pages.is_empty() {
@@ -71,20 +93,11 @@ pub fn page_for_text_offset(pages: &[Vec<FlowItem>], offset: u32) -> usize {
     }
     let mut seen = 0u32;
     for (index, page) in pages.iter().enumerate() {
-        let chars = page
-            .iter()
-            .map(flow_text_chars)
-            .fold(0u32, |sum, chars| sum.saturating_add(chars as u32));
-        // An image-only page has no characters, so the following text shares
-        // this offset. Stay on the picture instead of skipping to that text.
-        if chars == 0 {
-            if seen == offset {
-                return index;
-            }
-        } else if seen.saturating_add(chars) > offset {
+        let step = page_resume_units(page);
+        if seen.saturating_add(step) > offset {
             return index;
         }
-        seen = seen.saturating_add(chars);
+        seen = seen.saturating_add(step);
     }
     pages.len() - 1
 }
@@ -670,6 +683,32 @@ mod tests {
         assert_eq!(page_for_text_offset(&pages, 2), 1);
         assert_eq!(page_for_text_offset(&pages, 0), 0);
         assert_eq!(page_for_text_offset(&pages, 3), 2);
+    }
+
+    #[test]
+    fn consecutive_image_only_pages_keep_distinct_offsets() {
+        let line = |text: &str| {
+            FlowItem::Line(crate::reader::ReaderPageLine {
+                text: text.into(),
+                paragraph_end: true,
+            })
+        };
+        let image = |slot: u16| FlowItem::Image {
+            slot,
+            width: 8,
+            height: 8,
+        };
+        let pages = vec![
+            vec![line("Hi")],
+            vec![image(0)],
+            vec![image(1)],
+            vec![line("Yo")],
+        ];
+        assert_eq!(page_for_text_offset(&pages, 2), 1);
+        assert_eq!(page_for_text_offset(&pages, 3), 2);
+        assert_eq!(page_for_text_offset(&pages, 4), 3);
+        assert_eq!(super::page_resume_units(&pages[1]), 1);
+        assert_eq!(super::page_resume_units(&pages[2]), 1);
     }
 
     fn text_chars_before(pages: &[Vec<FlowItem>], needle: &str) -> u32 {

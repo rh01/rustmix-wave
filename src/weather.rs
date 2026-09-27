@@ -668,7 +668,7 @@ pub mod espidf {
     };
 
     use crate::{
-        runtime_worker::{run_named_worker, NamedWorkerError},
+        runtime_worker::{run_named_worker, NamedWorkerError, NamedWorkerHandle},
         weather::{
             parse_open_meteo_response, WeatherData, WeatherFetchError, MAX_WEATHER_RESPONSE_BYTES,
             WEATHER_HTTP_TIMEOUT_SECONDS,
@@ -681,10 +681,23 @@ pub mod espidf {
     /// deliberately small orchestration stack.
     pub const WEATHER_FETCH_WORKER_STACK_BYTES: usize = 64 * 1024;
 
-    /// Fetch one bounded HTTPS payload on a short-lived dedicated worker. The
-    /// main-loop retry policy remains synchronous and deterministic, while TLS
-    /// certificate validation, response reads and JSON parsing receive an
-    /// explicit stack budget independent from the firmware main task.
+    /// Start one fetch and return before it finishes. The main loop polls the handle
+    /// so buttons stay live for the HTTPS timeout.
+    pub fn spawn_open_meteo_fetch(
+        config: &WeatherConfig,
+    ) -> Result<NamedWorkerHandle<WeatherData, WeatherFetchError>, std::io::Error> {
+        let config = config.clone();
+        NamedWorkerHandle::spawn(
+            "weather-fetch",
+            WEATHER_FETCH_WORKER_STACK_BYTES,
+            move || fetch_open_meteo(&config),
+        )
+    }
+
+    /// Fetch one bounded HTTPS payload on a short-lived dedicated worker.
+    ///
+    /// This joins the worker. The firmware main loop uses [`spawn_open_meteo_fetch`]
+    /// instead so the UI is not blocked for the request timeout.
     pub fn fetch_open_meteo_on_worker(
         config: &WeatherConfig,
     ) -> Result<WeatherData, WeatherFetchError> {

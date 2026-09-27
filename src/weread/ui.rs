@@ -788,6 +788,9 @@ impl WereadUi {
     }
 
     /// Rebuild the open chapter after a shared reader layout change.
+    ///
+    /// The visible page is chosen by character offset, so a font or spacing
+    /// change does not jump to a different part of the chapter.
     pub fn repaginate(&mut self, layout: ReaderLayout) {
         if self.chapter_source.is_empty() {
             self.paginated_layout = None;
@@ -2702,6 +2705,29 @@ mod tests {
         large.font_size = BookFontSize::Px72;
         assert!(ui.sync_layout(large.layout()));
         assert!(ui.pages.len() > pages);
+    }
+
+    #[test]
+    fn repaginate_keeps_the_character_offset() {
+        let mut ui = signed_in();
+        let text = "abcd ".repeat(400);
+        ui.show_text(&text, ReaderPreferences::default().layout());
+        assert!(ui.pages.len() > 2);
+        ui.page_index = 2;
+        let anchor = ui.chapter_offset();
+        assert!(anchor > 0);
+        let mut large = ReaderPreferences::default();
+        large.font_size = BookFontSize::Px72;
+        ui.repaginate(large.layout());
+        let page_start = ui.chapter_offset();
+        assert!(page_start <= anchor);
+        let next_start = ui
+            .pages
+            .iter()
+            .take(ui.page_index + 1)
+            .map(|page| text::page_resume_units(page))
+            .sum::<u32>();
+        assert!(anchor < next_start || ui.page_index + 1 == ui.pages.len());
     }
 
     #[test]

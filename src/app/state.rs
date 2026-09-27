@@ -14,13 +14,15 @@ use crate::{
     imu_events::{ImuControlOutcome, ImuDetectedEvent, ImuEventBridge},
     lexicon::{ui::LexiconCommand, LexiconUiState, LEXICON_ROOT},
     lua_runtime::LuaRuntimeUiState,
-    network::NetworkSnapshot,
+    network::{NetworkSnapshot, WifiConnectionState},
     orientation::DisplayOrientation,
     power_key_menu::{PowerKeyMenuOutcome, PowerKeyMenuUiState},
     power_policy::{
         cycle_auto_deep_sleep_minutes, PowerDebugSnapshot, DEFAULT_AUTO_DEEP_SLEEP_MINUTES,
     },
-    reader::{ReaderOption, ReaderOrientation, ReaderTickOutcome, ReaderUiState},
+    reader::{
+        ReaderOption, ReaderOrientation, ReaderTickOutcome, ReaderUiState, ReadingPreference,
+    },
     regional::RegionalPreferences,
     storage::StorageSnapshot,
     unit_converter::UnitConverterUiState,
@@ -113,6 +115,16 @@ pub struct AppState {
     pub weread: WereadUi,
     /// Set while Reading Preferences was opened from a WeRead chapter.
     weread_preferences_return: Option<ScreenRoute>,
+    /// Highlighted row on the Wi-Fi prompt (0 = set up, 1 = skip or cancel).
+    wifi_prompt_selected: usize,
+    /// Screen BOOT returns to from the Wi-Fi prompt.
+    wifi_prompt_return: ScreenRoute,
+    /// Feature to open when the user continues or setup succeeds.
+    wifi_prompt_target: ScreenRoute,
+    /// Continue-offline is meaningful for this feature. Transfer can only cancel.
+    wifi_prompt_offline_ok: bool,
+    /// Where stopping setup returns when it was opened from the prompt.
+    wifi_setup_return: Option<ScreenRoute>,
     /// One-shot word clip. The main loop plays it in short I2S chunks.
     pronounce_request: Option<PronounceTarget>,
     /// Brief progress strip drawn over an immersive reading page.
@@ -165,6 +177,11 @@ impl Default for AppState {
             weather_refresh_requested: false,
             weread: WereadUi::default(),
             weread_preferences_return: None,
+            wifi_prompt_selected: 0,
+            wifi_prompt_return: ScreenRoute::Home,
+            wifi_prompt_target: ScreenRoute::Home,
+            wifi_prompt_offline_ok: true,
+            wifi_setup_return: None,
             pronounce_request: None,
             reading_status_overlay: false,
             status_overlay_token: 0,
@@ -332,6 +349,8 @@ impl AppState {
             self.apply_reader(event);
         } else if route.is_weread() {
             self.apply_weread(event);
+        } else if route == ScreenRoute::WifiPrompt {
+            self.apply_wifi_prompt(event);
         } else if route.is_placeholder() {
             // Placeholders are intentionally inert. Hierarchical navigation is
             // consistently handled by the dedicated GPIO0 BOOT long press.
@@ -380,6 +399,14 @@ impl AppState {
                 (ScreenRoute::Network, ButtonEvent::Select) => {
                     self.note_select_press();
                     if self.network_action_selected == 0 {
+                        if !self.wifi_transfer.is_active()
+                            && self.maybe_prompt_for_wifi(
+                                ScreenRoute::Network,
+                                ScreenRoute::WifiTransfer,
+                            )
+                        {
+                            return;
+                        }
                         self.wifi_transfer_request = Some(if self.wifi_transfer.is_active() {
                             WifiTransferUiRequest::Stop
                         } else {
@@ -388,6 +415,7 @@ impl AppState {
                         self.router.navigate_to(ScreenRoute::WifiTransfer);
                     } else if self.network_action_selected == 1 {
                         self.request_wifi_transfer_stop();
+                        self.wifi_setup_return = None;
                         self.wifi_setup_request = Some(WifiSetupUiRequest::Start);
                         self.router.navigate_to(ScreenRoute::WifiSetup);
                     } else {
@@ -402,7 +430,11 @@ impl AppState {
                 (ScreenRoute::WifiSetup, ButtonEvent::Select) => {
                     self.note_select_press();
                     self.wifi_setup_request = Some(WifiSetupUiRequest::Stop);
-                    self.router.navigate_to(ScreenRoute::Network);
+                    let return_route = self
+                        .wifi_setup_return
+                        .take()
+                        .unwrap_or(ScreenRoute::Network);
+                    self.router.navigate_to(return_route);
                 }
                 (ScreenRoute::DeviceInfo, ButtonEvent::Select) => {
                     self.note_select_press();
@@ -513,6 +545,9 @@ impl AppState {
                     self.vocab.load_default();
                     self.sync_vocab_clock();
                 }
+                if self.maybe_prompt_for_wifi(route, target) {
+                    return;
+                }
                 if target == ScreenRoute::WeRead {
                     self.weread.enter(self.storage.mounted);
                 }
@@ -523,6 +558,128 @@ impl AppState {
                 }
             }
         }
+    }
+
+    /// Ask for Wi-Fi before a network feature when no station is available.
+    ///
+    /// Local screens never call this. Skip opens the feature offline; Cancel
+    /// returns without starting SoftAP.
+    fn maybe_prompt_for_wifi(&mut self, return_route: ScreenRoute, target: ScreenRoute) -> bool {
+        let (prompt, offline_ok) = match target {
+            ScreenRoute::WeRead | ScreenRoute::Weather | ScreenRoute::Clock => (true, true),
+            ScreenRoute::WifiTransfer => (true, false),
+            _ => (false, false),
+        };
+        if !prompt || !self.network.needs_wifi_prompt() {
+            return false;
+        }
+        self.wifi_prompt_selected = 0;
+        self.wifi_prompt_return = return_route;
+        self.wifi_prompt_target = target;
+        self.wifi_prompt_offline_ok = offline_ok;
+        self.router.navigate_to(ScreenRoute::WifiPrompt);
+        true
+    }
+
+    fn apply_wifi_prompt(&mut self, event: ButtonEvent) {
+        match event {
+            ButtonEvent::Up => {
+                self.wifi_prompt_selected = self.wifi_prompt_selected.checked_sub(1).unwrap_or(1);
+            }
+            ButtonEvent::Down => {
+                self.wifi_prompt_selected = (self.wifi_prompt_selected + 1) % 2;
+            }
+            ButtonEvent::Select => {
+                self.note_select_press();
+                if self.wifi_prompt_selected == 0 {
+                    self.wifi_setup_return = Some(ScreenRoute::WifiPrompt);
+                    self.wifi_setup_request = Some(WifiSetupUiRequest::Start);
+                    self.router.navigate_to(ScreenRoute::WifiSetup);
+                } else if self.wifi_prompt_offline_ok {
+                    self.open_wifi_prompt_target();
+                } else {
+                    self.router.navigate_to(self.wifi_prompt_return);
+                }
+            }
+        }
+    }
+
+    fn open_wifi_prompt_target(&mut self) {
+        let target = self.wifi_prompt_target;
+        match target {
+            ScreenRoute::WeRead => self.weread.enter(self.storage.mounted),
+            ScreenRoute::Weather => self.weather_action_selected = 0,
+            ScreenRoute::WifiTransfer => {
+                self.wifi_transfer_request = Some(if self.wifi_transfer.is_active() {
+                    WifiTransferUiRequest::Stop
+                } else {
+                    WifiTransferUiRequest::Start
+                });
+            }
+            _ => {}
+        }
+        self.router.navigate_to(target);
+    }
+
+    /// After SoftAP saves credentials, open the feature that asked for Wi-Fi.
+    pub fn open_pending_wifi_feature(&mut self) -> bool {
+        if self.wifi_setup_return.take() != Some(ScreenRoute::WifiPrompt) {
+            return false;
+        }
+        if matches!(
+            self.network.wifi_state,
+            WifiConnectionState::Connected | WifiConnectionState::Connecting
+        ) {
+            self.open_wifi_prompt_target();
+        } else {
+            self.router.navigate_to(ScreenRoute::WifiPrompt);
+        }
+        true
+    }
+
+    #[must_use]
+    pub const fn wifi_prompt_selected(&self) -> usize {
+        self.wifi_prompt_selected
+    }
+
+    #[must_use]
+    pub const fn wifi_prompt_offline_ok(&self) -> bool {
+        self.wifi_prompt_offline_ok
+    }
+
+    #[must_use]
+    pub const fn wifi_prompt_target(&self) -> ScreenRoute {
+        self.wifi_prompt_target
+    }
+
+    #[must_use]
+    pub fn wifi_setup_opened_from_prompt(&self) -> bool {
+        self.wifi_setup_return == Some(ScreenRoute::WifiPrompt)
+    }
+
+    fn leave_reading_preferences(&mut self) {
+        let previous = self.router.current();
+        let return_route = self.weread_preferences_return.take();
+        let rebuild = if return_route.is_some() {
+            self.reader.finish_shared_preferences_edit();
+            false
+        } else {
+            self.reader.finish_preferences_edit()
+        };
+        let _ = self.weread.sync_layout(self.reader.preferences.layout());
+        if let Some(route) = return_route {
+            self.router.navigate_to(route);
+            self.weread.note_route(previous, route);
+            self.sync_reader_orientation_for_active_route();
+            return;
+        }
+        if rebuild {
+            self.router.navigate_to(ScreenRoute::ReaderLoading);
+        } else {
+            self.router.navigate_to(ScreenRoute::ReaderOptions);
+        }
+        self.weread.note_route(previous, self.router.current());
+        self.sync_reader_orientation_for_active_route();
     }
 
     fn apply_dictionary(&mut self, event: ButtonEvent) {
@@ -1038,16 +1195,12 @@ impl AppState {
                 ButtonEvent::Down => self.reader.cycle_preference_next(),
                 ButtonEvent::Select => {
                     self.note_select_press();
-                    let from_weread = self.weread_preferences_return.is_some();
-                    let rebuild = if from_weread {
+                    if self.reader.selected_preference() == ReadingPreference::Done {
+                        self.leave_reading_preferences();
+                    } else if self.weread_preferences_return.is_some() {
                         self.reader.activate_shared_preference();
-                        false
                     } else {
-                        self.reader.activate_selected_preference()
-                    };
-                    let _ = self.weread.sync_layout(self.reader.preferences.layout());
-                    if rebuild {
-                        self.router.navigate_to(ScreenRoute::ReaderLoading);
+                        let _ = self.reader.activate_selected_preference();
                     }
                 }
             },
@@ -1216,20 +1369,25 @@ impl AppState {
 
     pub fn back(&mut self) {
         let previous = self.router.current();
+        if self.router.current() == ScreenRoute::WifiPrompt {
+            self.router.navigate_to(self.wifi_prompt_return);
+            return;
+        }
+        if self.router.current() == ScreenRoute::WifiSetup {
+            if let Some(route) = self.wifi_setup_return.take() {
+                self.wifi_setup_request = Some(WifiSetupUiRequest::Stop);
+                self.router.navigate_to(route);
+                return;
+            }
+        }
         if self.router.current() == ScreenRoute::ReaderPreferences
             && self.reader.close_preference_submenu()
         {
             return;
         }
         if self.router.current() == ScreenRoute::ReaderPreferences {
-            if let Some(return_route) = self.weread_preferences_return.take() {
-                self.reader.finish_preferences_edit();
-                let _ = self.weread.sync_layout(self.reader.preferences.layout());
-                self.router.navigate_to(return_route);
-                self.weread.note_route(previous, return_route);
-                self.sync_reader_orientation_for_active_route();
-                return;
-            }
+            self.leave_reading_preferences();
+            return;
         }
         if self.router.current() == ScreenRoute::PowerKeyMenu {
             self.close_power_key_menu();
@@ -1268,15 +1426,7 @@ impl AppState {
         if self.router.current() == ScreenRoute::ReaderLoading {
             self.reader.cancel_loading();
         }
-        if self.router.current() == ScreenRoute::ReaderPreferences {
-            if self.reader.finish_preferences_edit() {
-                self.router.navigate_to(ScreenRoute::ReaderLoading);
-            } else {
-                self.router.navigate_to(ScreenRoute::ReaderOptions);
-            }
-        } else {
-            self.router.back();
-        }
+        self.router.back();
         self.weread.note_route(previous, self.router.current());
         self.sync_reader_orientation_for_active_route();
     }
@@ -1521,6 +1671,8 @@ mod tests {
     #[test]
     fn network_portal_is_explicitly_started_and_stopped_from_network_settings() {
         let mut state = AppState::default();
+        state.network.wifi_state = crate::network::WifiConnectionState::Connected;
+        state.network.ipv4_address = Some("192.168.1.2".into());
         state.router.navigate_to(ScreenRoute::Network);
         state.apply(ButtonEvent::Select);
         assert_eq!(state.active_route(), ScreenRoute::WifiTransfer);
@@ -1694,6 +1846,68 @@ mod tests {
     }
 
     #[test]
+    fn offline_boot_features_prompt_for_wifi_and_local_reading_does_not() {
+        let mut state = AppState::default();
+        assert!(state.network.needs_wifi_prompt());
+        state.router.navigate_to(ScreenRoute::Reader);
+        state.apply(ButtonEvent::Down);
+        state.apply(ButtonEvent::Select);
+        assert_eq!(state.active_route(), ScreenRoute::Library);
+
+        state.router.navigate_to(ScreenRoute::Reader);
+        state.apply(ButtonEvent::Down);
+        state.apply(ButtonEvent::Down);
+        state.apply(ButtonEvent::Select);
+        assert_eq!(state.active_route(), ScreenRoute::WifiPrompt);
+        assert_eq!(state.wifi_prompt_target(), ScreenRoute::WeRead);
+        state.apply(ButtonEvent::Down);
+        state.apply(ButtonEvent::Select);
+        assert_eq!(state.active_route(), ScreenRoute::WeRead);
+
+        state.network.wifi_state = crate::network::WifiConnectionState::Failed;
+        state.router.navigate_to(ScreenRoute::Settings);
+        for _ in 0..8 {
+            state.apply(ButtonEvent::Down);
+        }
+        state.apply(ButtonEvent::Select);
+        assert_eq!(state.active_route(), ScreenRoute::WifiPrompt);
+        assert_eq!(state.wifi_prompt_target(), ScreenRoute::Weather);
+        state.apply(ButtonEvent::Select);
+        assert_eq!(state.active_route(), ScreenRoute::WifiSetup);
+        assert_eq!(
+            state.take_wifi_setup_request(),
+            Some(crate::wifi_setup::WifiSetupUiRequest::Start)
+        );
+        state.back();
+        assert_eq!(state.active_route(), ScreenRoute::WifiPrompt);
+        assert_eq!(
+            state.take_wifi_setup_request(),
+            Some(crate::wifi_setup::WifiSetupUiRequest::Stop)
+        );
+        state.apply(ButtonEvent::Down);
+        state.apply(ButtonEvent::Select);
+        assert_eq!(state.active_route(), ScreenRoute::Weather);
+
+        state.network.wifi_state = crate::network::WifiConnectionState::Connected;
+        state.router.navigate_to(ScreenRoute::Reader);
+        state.apply(ButtonEvent::Select);
+        assert_eq!(state.active_route(), ScreenRoute::WeRead);
+    }
+
+    #[test]
+    fn wifi_transfer_without_a_station_can_cancel_back_to_network() {
+        let mut state = AppState::default();
+        state.router.navigate_to(ScreenRoute::Network);
+        state.apply(ButtonEvent::Select);
+        assert_eq!(state.active_route(), ScreenRoute::WifiPrompt);
+        assert!(!state.wifi_prompt_offline_ok());
+        state.apply(ButtonEvent::Down);
+        state.apply(ButtonEvent::Select);
+        assert_eq!(state.active_route(), ScreenRoute::Network);
+        assert!(state.take_wifi_transfer_request().is_none());
+    }
+
+    #[test]
     fn reader_preferences_use_settings_style_move_then_select_change() {
         use crate::reader::ReadingPreference;
 
@@ -1747,7 +1961,7 @@ mod tests {
         state.apply(ButtonEvent::Select);
         assert_eq!(state.reader.preferences.font_size, BookFontSize::Px32);
         assert_ne!(state.reader.preferences.font_size, size);
-        assert!(state.weread.pages.len() > before);
+        assert_eq!(state.weread.pages.len(), before);
         assert_eq!(state.active_route(), ScreenRoute::ReaderPreferences);
         state.apply(ButtonEvent::Down);
         state.apply(ButtonEvent::Select);
@@ -1755,8 +1969,10 @@ mod tests {
             state.reader.preferences.book_font,
             crate::reader::BookFont::Serif
         );
+        assert_eq!(state.weread.pages.len(), before);
         state.back();
         state.back();
+        assert!(state.weread.pages.len() > before);
         assert_eq!(state.active_route(), ScreenRoute::WeReadRead);
         state.back();
         assert_eq!(state.active_route(), ScreenRoute::WeReadBook);
@@ -1805,8 +2021,12 @@ mod tests {
         state.apply(ButtonEvent::Down);
         state.apply(ButtonEvent::Select);
         state.apply(ButtonEvent::Select);
-        assert!(state.weread.pages.len() > before);
+        assert_eq!(state.weread.pages.len(), before);
         assert_eq!(state.active_route(), ScreenRoute::ReaderPreferences);
+        state.back();
+        state.back();
+        assert!(state.weread.pages.len() > before);
+        assert_eq!(state.active_route(), ScreenRoute::ReaderOptions);
     }
     #[test]
     fn productivity_voice_notes_opens_recording_route_and_queues_start() {

@@ -1808,6 +1808,8 @@ pub struct PendingReaderOpen {
     pub epub_document: Option<EpubDocument>,
     pub resume: Option<ReaderLocation>,
     pub message: String,
+    /// Seek by byte offset instead of a page index from the previous layout.
+    pub anchor_by_offset: bool,
 }
 
 /// One wrapped Reader line. `paragraph_end` prevents Justified rendering from
@@ -2873,7 +2875,7 @@ pub enum PreferenceMenu {
 }
 
 /// Reading Preferences rows. UP/DOWN moves, SELECT changes a value or opens
-/// a submenu. Seven rows is the most that fits above the footer.
+/// a submenu. Layout changes stay on this menu until Done or BOOT.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadingPreference {
     Presets,
@@ -2907,10 +2909,11 @@ pub enum ReadingPreference {
     SwapPageKeys,
     LongPressChapter,
     AutoPageTurn,
+    Done,
 }
 
 impl ReadingPreference {
-    const ROOT: [Self; 7] = [
+    const ROOT: [Self; 8] = [
         Self::Presets,
         Self::TypographyMenu,
         Self::PageMenu,
@@ -2918,6 +2921,7 @@ impl ReadingPreference {
         Self::DisplayMenu,
         Self::StatusMenu,
         Self::ControlsMenu,
+        Self::Done,
     ];
     const TYPOGRAPHY: [Self; 7] = [
         Self::BookFontSize,
@@ -3012,6 +3016,7 @@ impl ReadingPreference {
             Self::SwapPageKeys => "Swap Page Keys",
             Self::LongPressChapter => "Chapter Jump",
             Self::AutoPageTurn => "Auto Page Turn",
+            Self::Done => "Done",
         }
     }
 }
@@ -3109,6 +3114,38 @@ impl Default for ReaderUiState {
             epub_index_bytes_limit: READER_EPUB_ANCHOR_INDEX_BYTES_LIMIT,
         }
     }
+}
+
+/// Page window that contains `offset`. A layout cache for the new metrics is
+/// searched by byte offset; a missing cache opens one page at that offset.
+fn page_window_for_offset(
+    cached: Option<&ReaderAnchorCache>,
+    offset: u64,
+) -> Option<(usize, Vec<u64>, usize, u64, bool)> {
+    let cache = cached?;
+    if !cache.complete && offset >= cache.indexed_through {
+        return None;
+    }
+    let index = cache.offsets.iter().rposition(|start| *start <= offset)?;
+    Some((
+        cache.base_page,
+        cache.offsets.clone(),
+        index,
+        cache.indexed_through,
+        cache.complete,
+    ))
+}
+
+/// Page number for a relayout that starts mid-book without a matching cache.
+///
+/// Uses the first rebuilt page's byte length so the status bar does not show
+/// page 1 while the new index is still empty.
+fn estimated_page_for_offset(offset: u64, first_page: &ReaderCachedPage) -> usize {
+    let page_bytes = first_page
+        .next_byte_offset
+        .saturating_sub(first_page.byte_offset)
+        .max(1);
+    usize::try_from(offset / page_bytes).unwrap_or(usize::MAX)
 }
 
 impl ReaderUiState {
@@ -3380,6 +3417,7 @@ impl ReaderUiState {
             epub_document: None,
             resume,
             message: "Preparing reader...".into(),
+            anchor_by_offset: false,
         });
     }
 
@@ -3415,6 +3453,7 @@ impl ReaderUiState {
             epub_document: session.epub_document.take(),
             resume: Some(resume),
             message: "Rebuilding the current page first...".into(),
+            anchor_by_offset: true,
         });
         log::info!(
             "rustmix-wave=reader-session-memory-release status=completed reason=layout-rebuild"
@@ -3537,9 +3576,12 @@ impl ReaderUiState {
                 ReaderLoadingStage::BuildingFirstPage => {
                     let encoding = loading.encoding.unwrap_or(TextEncoding::Utf8);
                     let session = match loading.book.format {
-                        BookFormat::Text => {
-                            self.open_txt_session(&loading.book, encoding, loading.resume.as_ref())
-                        }
+                        BookFormat::Text => self.open_txt_session(
+                            &loading.book,
+                            encoding,
+                            loading.resume.as_ref(),
+                            loading.anchor_by_offset,
+                        ),
                         BookFormat::Epub => loading
                             .epub_document
                             .take()
@@ -3936,7 +3978,6 @@ impl ReaderUiState {
     pub fn begin_preferences_edit(&mut self) {
         self.preferences_selected = 0;
         self.preference_menu = PreferenceMenu::Root;
-        self.preferences_layout_dirty = false;
     }
 
     /// Leave a submenu for the root list. Returns false when already at root.
@@ -3970,24 +4011,30 @@ impl ReaderUiState {
         rows[self.preferences_selected % rows.len()]
     }
 
-    /// Apply one Settings-style SELECT action to the highlighted preference.
-    /// Redraw-only settings persist immediately in place. Layout-sensitive
-    /// settings persist immediately and request a staged current-page rebuild.
+    /// Apply one Settings-style SELECT action without leaving the menu.
+    ///
+    /// Redraw-only settings persist immediately. Layout settings are stored and
+    /// marked dirty; the open page is rebuilt when the menu closes.
     #[must_use]
     pub fn activate_selected_preference(&mut self) -> bool {
-        self.apply_selected_preference(true)
+        self.apply_selected_preference();
+        false
     }
 
     /// Apply the highlighted preference without tearing down an open TXT/EPUB.
     ///
-    /// WeRead opens this same editor. Layout changes update `session.layout`
-    /// in place; the caller repaginates the open WeRead chapter.
+    /// WeRead shares this editor. Pagination waits until the menu closes.
     pub fn activate_shared_preference(&mut self) {
         self.refresh_font_catalog();
-        let _ = self.apply_selected_preference(false);
+        self.apply_selected_preference();
     }
 
-    fn apply_selected_preference(&mut self, rebuild_open_book: bool) -> bool {
+    #[must_use]
+    pub const fn layout_changes_pending(&self) -> bool {
+        self.preferences_layout_dirty
+    }
+
+    fn apply_selected_preference(&mut self) -> bool {
         let row = self.selected_preference();
         if let Some(menu) = row.submenu() {
             self.preference_menu = menu;
@@ -4214,9 +4261,33 @@ impl ReaderUiState {
             | ReadingPreference::PageMenu
             | ReadingPreference::DisplayMenu
             | ReadingPreference::StatusMenu
-            | ReadingPreference::ControlsMenu => false,
+            | ReadingPreference::ControlsMenu
+            | ReadingPreference::Done => false,
         };
         if !layout_sensitive {
+            return false;
+        }
+        self.preferences_layout_dirty = true;
+        false
+    }
+
+    /// Close the editor and rebuild an open TXT/EPUB at the current text offset.
+    ///
+    /// Returns true when a staged rebuild is now in progress.
+    pub fn finish_preferences_edit(&mut self) -> bool {
+        self.commit_deferred_layout(true)
+    }
+
+    /// Close the editor for WeRead. The local session keeps its pages; the
+    /// caller repaginates the open chapter from the saved character offset.
+    pub fn finish_shared_preferences_edit(&mut self) {
+        let _ = self.commit_deferred_layout(false);
+    }
+
+    fn commit_deferred_layout(&mut self, rebuild_open_book: bool) -> bool {
+        let dirty = self.preferences_layout_dirty;
+        self.preferences_layout_dirty = false;
+        if !dirty {
             return false;
         }
         if rebuild_open_book {
@@ -4225,13 +4296,6 @@ impl ReaderUiState {
             self.persist_shared_typography();
             false
         }
-    }
-
-    /// Finish the Settings-style editor. SELECT already persists changes and
-    /// launches any required staged rebuild, so BOOT simply returns to options.
-    pub fn finish_preferences_edit(&mut self) -> bool {
-        self.preferences_layout_dirty = false;
-        false
     }
 
     pub fn cycle_reading_theme(&mut self) {
@@ -4247,7 +4311,7 @@ impl ReaderUiState {
             "Orientation: {}",
             self.preferences.orientation.label()
         ));
-        self.request_layout_rebuild()
+        self.note_deferred_layout()
     }
 
     pub fn cycle_book_font_size(&mut self) -> bool {
@@ -4256,13 +4320,19 @@ impl ReaderUiState {
             "Book font size: {}",
             self.preferences.font_size.label()
         ));
-        self.request_layout_rebuild()
+        self.note_deferred_layout()
     }
 
     pub fn cycle_book_font(&mut self) -> bool {
         self.cycle_book_font_choice();
         self.last_message = Some(format!("Book font: {}", self.book_font_display_label()));
-        self.request_layout_rebuild()
+        self.note_deferred_layout()
+    }
+
+    /// PREFS.TXT and NVS are written once when the editor closes.
+    fn note_deferred_layout(&mut self) -> bool {
+        self.preferences_layout_dirty = true;
+        false
     }
 
     fn persist_shared_typography(&mut self) {
@@ -4414,6 +4484,7 @@ impl ReaderUiState {
         book: &ReaderBook,
         encoding: TextEncoding,
         requested: Option<&ReaderLocation>,
+        anchor_by_offset: bool,
     ) -> Result<ReaderSession, String> {
         let cached = match load_anchor_cache(
             &self.cache_path_for(book, self.preferences.layout()),
@@ -4426,8 +4497,18 @@ impl ReaderUiState {
                 None
             }
         };
-        let (page_number_base, page_offsets, current_page, indexed_through, index_complete) =
-            if let Some(cache) = cached {
+        let mut uncached_anchor = None;
+        let (mut page_number_base, page_offsets, current_page, indexed_through, index_complete) =
+            if anchor_by_offset {
+                let offset = requested
+                    .filter(|location| location.matches_book(book))
+                    .map(|location| location.byte_offset.min(book.size_bytes))
+                    .unwrap_or(0);
+                page_window_for_offset(cached.as_ref(), offset).unwrap_or_else(|| {
+                    uncached_anchor = Some(offset);
+                    (0, vec![offset], 0, offset, false)
+                })
+            } else if let Some(cache) = cached {
                 let saved = requested.filter(|location| location.matches_book(book));
                 if let Some(location) = saved {
                     if let Some(index) = location
@@ -4470,7 +4551,11 @@ impl ReaderUiState {
         let offset = page_offsets.get(current_page).copied().unwrap_or(0);
         let absolute_page = page_number_base.saturating_add(current_page);
         let layout = self.preferences.layout();
-        let page = read_txt_page(book, encoding, layout, offset, absolute_page)?;
+        let mut page = read_txt_page(book, encoding, layout, offset, absolute_page)?;
+        if let Some(anchor) = uncached_anchor {
+            page_number_base = estimated_page_for_offset(anchor, &page);
+            page.page_index = page_number_base.saturating_add(current_page);
+        }
         let indexed_through = indexed_through.max(page.next_byte_offset);
         let index_complete = index_complete || indexed_through >= book.size_bytes;
         Ok(ReaderSession {
@@ -6061,12 +6146,59 @@ mod tests {
         assert_eq!(reader.tick(), ReaderTickOutcome::LoadingStageChanged);
         assert_eq!(reader.tick(), ReaderTickOutcome::LoadingStageChanged);
         assert_eq!(reader.tick(), ReaderTickOutcome::FirstPageReady);
-        assert!(reader.cycle_book_font_size());
+        assert!(!reader.cycle_book_font_size());
+        assert!(reader.loading_stage().is_none());
+        assert!(reader.layout_changes_pending());
+        assert!(reader.finish_preferences_edit());
         assert_eq!(
             reader.loading_stage(),
             Some(ReaderLoadingStage::UpdatingLayout)
         );
         assert!(state.join(READER_PREFS_FILE).exists());
+    }
+
+    #[test]
+    fn layout_rebuild_keeps_the_text_offset_until_the_menu_closes() {
+        let root = temp_dir("offset-books");
+        let state = temp_dir("offset-state");
+        fs::write(root.join("Book.txt"), "hello world ".repeat(800)).unwrap();
+        let mut reader = ReaderUiState::with_roots(
+            root.to_string_lossy().into_owned(),
+            state.to_string_lossy().into_owned(),
+        );
+        reader.refresh_library();
+        reader.library_selected = 1;
+        assert!(reader.apply_library_button(ButtonEvent::Select));
+        assert_eq!(reader.tick(), ReaderTickOutcome::LoadingStageChanged);
+        assert_eq!(reader.tick(), ReaderTickOutcome::LoadingStageChanged);
+        assert_eq!(reader.tick(), ReaderTickOutcome::FirstPageReady);
+        reader.next_page();
+        let offset = reader
+            .session
+            .as_ref()
+            .unwrap()
+            .current_location()
+            .byte_offset;
+        assert!(offset > 0);
+        reader.begin_preferences_edit();
+        assert!(!reader.cycle_book_font_size());
+        assert!(reader.session.is_some());
+        assert_eq!(
+            reader
+                .session
+                .as_ref()
+                .unwrap()
+                .current_location()
+                .byte_offset,
+            offset
+        );
+        assert!(reader.finish_preferences_edit());
+        assert_eq!(reader.tick(), ReaderTickOutcome::LoadingStageChanged);
+        assert_eq!(reader.tick(), ReaderTickOutcome::FirstPageReady);
+        let session = reader.session.as_ref().unwrap();
+        assert_eq!(session.current_location().byte_offset, offset);
+        assert!(session.current_absolute_page() >= 1);
+        assert!(session.current_cached_page().is_some());
     }
 
     #[test]
@@ -6097,8 +6229,12 @@ mod tests {
             reader.selected_preference(),
             ReadingPreference::LetterSpacing
         );
-        assert!(reader.activate_selected_preference());
+        assert!(!reader.activate_selected_preference());
         assert_eq!(reader.preferences.letter_spacing, LetterSpacing::Px1);
+        assert!(reader.loading_stage().is_none());
+        let before = fs::read_to_string(state.join(READER_PREFS_FILE)).unwrap_or_default();
+        assert!(!before.contains("letter_spacing=1"));
+        assert!(reader.finish_preferences_edit());
         assert_eq!(
             reader.loading_stage(),
             Some(ReaderLoadingStage::UpdatingLayout)

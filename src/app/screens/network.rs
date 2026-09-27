@@ -133,6 +133,64 @@ pub fn render_wifi_transfer(
     Ok(())
 }
 
+pub fn render_wifi_prompt(
+    display: &mut OrientedFrameBuffer<'_>,
+    state: &AppState,
+) -> Result<(), Infallible> {
+    let heading = state.display.heading_style();
+    let body = state.display.body_style();
+    let feature = match state.wifi_prompt_target() {
+        crate::app::router::ScreenRoute::WeRead => "WeRead",
+        crate::app::router::ScreenRoute::Weather => "Weather",
+        crate::app::router::ScreenRoute::Clock => "Clock sync",
+        crate::app::router::ScreenRoute::WifiTransfer => "Wi-Fi transfer",
+        _ => "This feature",
+    };
+    let explanation = if state.wifi_prompt_offline_ok() {
+        "Set up Wi-Fi, or continue offline."
+    } else {
+        "Set up Wi-Fi, or go back."
+    };
+    let skip = if state.wifi_prompt_offline_ok() {
+        "Continue offline"
+    } else {
+        "Cancel"
+    };
+
+    draw_header(display, state.display, "WI-FI NEEDED", feature)?;
+    draw_status_row(
+        display,
+        state.display,
+        StatusRow {
+            left: state.network.wifi_state.label(),
+            middle: "OFFLINE OK",
+            right: "OPTIONAL",
+        },
+    )?;
+    Text::new(feature, Point::new(22, 180), heading).draw(display)?;
+    Text::new(explanation, Point::new(22, 230), body).draw(display)?;
+    Text::new(
+        "Join Rustmix-Setup, then open 192.168.4.1.",
+        Point::new(22, 280),
+        body,
+    )
+    .draw(display)?;
+    draw_action(
+        display,
+        420,
+        "Set up Wi-Fi",
+        state.wifi_prompt_selected() == 0,
+        body,
+    )?;
+    draw_action(display, 490, skip, state.wifi_prompt_selected() == 1, body)?;
+    draw_footer(
+        display,
+        state.display,
+        "UP/DOWN MOVE  SELECT CHOOSE  HOLD BOOT CANCEL",
+    )?;
+    Ok(())
+}
+
 pub fn render_wifi_setup(
     display: &mut OrientedFrameBuffer<'_>,
     state: &AppState,
@@ -160,9 +218,15 @@ pub fn render_wifi_setup(
     )?;
 
     Text::new("Join this network", Point::new(22, 164), heading).draw(display)?;
+    let password = if setup.ap_password.is_empty() {
+        "--"
+    } else {
+        setup.ap_password.as_str()
+    };
     line(display, 212, "AP SSID", setup.ap_ssid.as_str(), body)?;
-    line(display, 252, "Open", setup.url_label(), detail)?;
-    line(display, 292, "Scanned", &scanned, body)?;
+    line(display, 252, "Password", password, heading)?;
+    line(display, 292, "Open", setup.url_label(), detail)?;
+    line(display, 332, "Scanned", &scanned, body)?;
 
     if setup.state == WifiSetupState::TimedOut {
         Text::new("Setup network stopped", Point::new(22, 372), heading).draw(display)?;
@@ -172,7 +236,7 @@ pub fn render_wifi_setup(
         Text::new(WIFI_SETUP_RESTART_HINT, Point::new(22, 548), detail).draw(display)?;
     } else {
         Text::new("Phone steps", Point::new(22, 372), heading).draw(display)?;
-        Text::new("1. Join Rustmix-Setup", Point::new(22, 420), body).draw(display)?;
+        Text::new("1. Join with the password", Point::new(22, 420), body).draw(display)?;
         Text::new("2. Open http://192.168.4.1", Point::new(22, 460), body).draw(display)?;
         Text::new("3. Pick SSID, save password", Point::new(22, 500), body).draw(display)?;
         Text::new(&setup.last_action, Point::new(22, 548), detail).draw(display)?;
@@ -182,11 +246,12 @@ pub fn render_wifi_setup(
     }
 
     draw_action(display, 640, "Stop setup", true, body)?;
-    draw_footer(
-        display,
-        state.display,
-        "SELECT STOP  HOLD BOOT KEEP AP + BACK",
-    )?;
+    let footer = if state.wifi_setup_opened_from_prompt() {
+        "SELECT STOP  HOLD BOOT CANCEL"
+    } else {
+        "SELECT STOP  HOLD BOOT KEEP AP + BACK"
+    };
+    draw_footer(display, state.display, footer)?;
     Ok(())
 }
 

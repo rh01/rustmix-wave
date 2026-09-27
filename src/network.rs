@@ -31,6 +31,24 @@ impl WifiConnectionState {
     }
 }
 
+/// Wait before the next background station retry: 15 s, doubling to a 5 min cap.
+#[must_use]
+pub const fn station_retry_delay_secs(failed_attempts: u32) -> u64 {
+    const FIRST: u64 = 15;
+    const CAP: u64 = 5 * 60;
+    let shift = if failed_attempts > 5 {
+        5
+    } else {
+        failed_attempts
+    };
+    let delay = FIRST << shift;
+    if delay > CAP {
+        CAP
+    } else {
+        delay
+    }
+}
+
 /// Product-facing SNTP synchronization state.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum NtpSyncState {
@@ -147,6 +165,18 @@ impl NetworkSnapshot {
         self.ipv4_address.as_deref().unwrap_or("--")
     }
 
+    /// Missing credentials, a failed join, or a stopped radio. Connected,
+    /// connecting, and an open setup portal do not ask again.
+    #[must_use]
+    pub const fn needs_wifi_prompt(&self) -> bool {
+        matches!(
+            self.wifi_state,
+            WifiConnectionState::ConfigurationMissing
+                | WifiConnectionState::Failed
+                | WifiConnectionState::Disabled
+        )
+    }
+
     /// True only for a joined station. The SoftAP address is not a connection.
     #[must_use]
     pub fn is_station_associated(&self) -> bool {
@@ -193,11 +223,11 @@ impl NetworkSnapshot {
 
 #[cfg(target_os = "espidf")]
 pub mod espidf {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use anyhow::{Context, Result};
     use embedded_svc::wifi::{
-        AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration,
+        AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration, Wifi as WifiApi,
     };
     use esp_idf_svc::{
         eventloop::EspSystemEventLoop,
@@ -227,7 +257,16 @@ pub mod espidf {
         config_warning: Option<String>,
         /// True after a STA or SoftAP start, so teardown can stop a live radio.
         radio_started: bool,
+        /// Association kicked off without waiting for DHCP.
+        station_attempt: Option<StationAttempt>,
     }
+
+    struct StationAttempt {
+        config: NetworkConfig,
+        started: Instant,
+    }
+
+    const STATION_ASSOCIATE_TIMEOUT: Duration = Duration::from_secs(20);
 
     impl NetworkRuntime {
         #[must_use]
@@ -240,6 +279,7 @@ pub mod espidf {
                 suspended: false,
                 config_warning: None,
                 radio_started: false,
+                station_attempt: None,
             }
         }
 
@@ -261,6 +301,7 @@ pub mod espidf {
                 suspended: false,
                 config_warning: None,
                 radio_started: false,
+                station_attempt: None,
             }
         }
 
@@ -281,6 +322,7 @@ pub mod espidf {
                 suspended: false,
                 config_warning: None,
                 radio_started: false,
+                station_attempt: None,
             })
         }
 
@@ -294,8 +336,22 @@ pub mod espidf {
             Ok(runtime)
         }
 
-        /// Associate as a station. Stops SoftAP first so port 80 is free for transfer.
+        /// Start station association and return immediately.
+        ///
+        /// `poll_station_connect` finishes DHCP and SNTP. Callers must not wait
+        /// on this method; the UI loop keeps reading buttons while the radio joins.
         pub fn connect_station(&mut self, config: &NetworkConfig) -> Result<()> {
+            self.begin_station_connect(config)
+        }
+
+        /// Kick off STA association. Stops SoftAP first so port 80 is free later.
+        pub fn begin_station_connect(&mut self, config: &NetworkConfig) -> Result<()> {
+            if self.station_attempt.as_ref().is_some_and(|attempt| {
+                attempt.config.ssid == config.ssid && attempt.config.password == config.password
+            }) && self.snapshot.wifi_state == WifiConnectionState::Connecting
+            {
+                return Ok(());
+            }
             let wifi = self.wifi.as_mut().context("Wi-Fi runtime is unavailable")?;
             let _ = self.sntp.take();
             let _ = wifi.disconnect();
@@ -321,36 +377,130 @@ pub mod espidf {
             }))?;
             self.radio_started = true;
             wifi.start()?;
-            wifi.connect()?;
-            wifi.wait_netif_up()?;
-
-            let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
-            let mut conf = SntpConf::default();
-            conf.servers[0] = config.ntp_server.as_str();
-            self.sntp = Some(EspSntp::new(&conf)?);
+            // EspWifi::connect only requests association. BlockingWifi::connect
+            // would freeze the UI until the 15s timeout.
+            WifiApi::connect(wifi.wifi_mut())?;
             self.snapshot = NetworkSnapshot {
-                wifi_state: WifiConnectionState::Connected,
-                ntp_state: NtpSyncState::Synchronizing,
+                wifi_state: WifiConnectionState::Connecting,
+                ntp_state: NtpSyncState::WaitingForWifi,
                 ssid: Some(config.ssid.clone()),
-                ipv4_address: Some(format!("{}", ip_info.ip)),
-                rssi_dbm: read_rssi_dbm(),
+                ipv4_address: None,
+                rssi_dbm: None,
                 timezone_name: config.timezone.clone(),
                 ntp_server: config.ntp_server.clone(),
                 last_sync_utc: None,
                 error: None,
             };
+            self.station_attempt = Some(StationAttempt {
+                config: config.clone(),
+                started: Instant::now(),
+            });
             self.config_warning = None;
             self.ntp_reported = false;
             self.suspended = false;
             Ok(())
         }
 
+        #[must_use]
+        pub const fn station_connect_pending(&self) -> bool {
+            self.station_attempt.is_some()
+        }
+
+        /// Finish a background association. True when the snapshot changed.
+        pub fn poll_station_connect(&mut self) -> bool {
+            if self.station_attempt.is_none() {
+                return false;
+            }
+            let timed_out = self
+                .station_attempt
+                .as_ref()
+                .is_some_and(|attempt| attempt.started.elapsed() >= STATION_ASSOCIATE_TIMEOUT);
+            let Some(wifi) = self.wifi.as_mut() else {
+                self.fail_station_attempt("Wi-Fi runtime is unavailable");
+                return true;
+            };
+            let connected = WifiApi::is_connected(wifi.wifi()).unwrap_or(false);
+            let address = sta_ipv4(wifi.wifi());
+            if connected {
+                if let Some(ipv4) = address {
+                    let config = self
+                        .station_attempt
+                        .take()
+                        .map(|attempt| attempt.config)
+                        .expect("pending station attempt");
+                    let mut conf = SntpConf::default();
+                    conf.servers[0] = config.ntp_server.as_str();
+                    let ntp_error = match EspSntp::new(&conf) {
+                        Ok(sntp) => {
+                            self.sntp = Some(sntp);
+                            None
+                        }
+                        Err(error) => Some(format!("SNTP start failed: {error}")),
+                    };
+                    self.snapshot = NetworkSnapshot {
+                        wifi_state: WifiConnectionState::Connected,
+                        ntp_state: if ntp_error.is_none() {
+                            NtpSyncState::Synchronizing
+                        } else {
+                            NtpSyncState::Failed
+                        },
+                        ssid: Some(config.ssid),
+                        ipv4_address: Some(ipv4),
+                        rssi_dbm: read_rssi_dbm(),
+                        timezone_name: config.timezone,
+                        ntp_server: config.ntp_server,
+                        last_sync_utc: None,
+                        error: ntp_error,
+                    };
+                    self.ntp_reported = false;
+                    self.suspended = false;
+                    return true;
+                }
+            }
+            if timed_out {
+                self.fail_station_attempt("Wi-Fi association timed out");
+                return true;
+            }
+            false
+        }
+
+        fn fail_station_attempt(&mut self, error: &str) {
+            let ssid = self
+                .station_attempt
+                .take()
+                .map(|attempt| attempt.config.ssid)
+                .or_else(|| self.snapshot.ssid.clone());
+            let _ = self.sntp.take();
+            if let Some(wifi) = self.wifi.as_mut() {
+                let _ = wifi.disconnect();
+                let _ = wifi.stop();
+            }
+            self.radio_started = false;
+            self.snapshot.wifi_state = WifiConnectionState::Failed;
+            self.snapshot.ntp_state = NtpSyncState::Failed;
+            self.snapshot.ssid = ssid;
+            self.snapshot.ipv4_address = None;
+            self.snapshot.rssi_dbm = None;
+            self.snapshot.error = Some(error.to_string());
+            self.ntp_reported = false;
+            self.suspended = false;
+        }
+
         /// Open `Rustmix-Setup` in APSTA so phones can join and the STA radio can scan.
-        pub fn start_softap(&mut self) -> Result<()> {
+        ///
+        /// Returns without waiting for the AP start event or DHCP, so the main
+        /// loop keeps reading buttons. A pending station join is cancelled first.
+        pub fn start_softap(&mut self, password: &str) -> Result<()> {
+            if let Some(attempt) = self.station_attempt.take() {
+                log::info!(
+                    "rustmix-wave=wifi-connect status=cancelled ssid={} reason=softap-setup",
+                    attempt.config.ssid
+                );
+            }
             let wifi = self.wifi.as_mut().context("Wi-Fi runtime is unavailable")?;
             let _ = self.sntp.take();
-            let _ = wifi.disconnect();
-            let _ = wifi.stop();
+            let _ = WifiApi::disconnect(wifi.wifi_mut());
+            let _ = WifiApi::stop(wifi.wifi_mut());
             wifi.set_configuration(&Configuration::Mixed(
                 ClientConfiguration::default(),
                 AccessPointConfiguration {
@@ -359,21 +509,25 @@ pub mod espidf {
                         .context("setup SSID exceeds embedded Wi-Fi capacity")?,
                     ssid_hidden: false,
                     channel: 6,
-                    auth_method: AuthMethod::None,
+                    auth_method: AuthMethod::WPA2Personal,
+                    password: password
+                        .try_into()
+                        .context("setup password exceeds embedded Wi-Fi capacity")?,
                     max_connections: 4,
                     ..Default::default()
                 },
             ))?;
             self.radio_started = true;
-            wifi.start()?;
-            let mut ip = WIFI_SETUP_AP_IP.to_string();
-            for _ in 0..25 {
-                if let Ok(info) = wifi.wifi().ap_netif().get_ip_info() {
-                    ip = format!("{}", info.ip);
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
+            WifiApi::start(wifi.wifi_mut())?;
+            // The AP netif has a static address; it does not wait on DHCP.
+            let ip = wifi
+                .wifi()
+                .ap_netif()
+                .get_ip_info()
+                .ok()
+                .map(|info| info.ip.to_string())
+                .filter(|ip| ip != "0.0.0.0")
+                .unwrap_or_else(|| WIFI_SETUP_AP_IP.to_string());
             self.snapshot = NetworkSnapshot {
                 wifi_state: WifiConnectionState::Provisioning,
                 ntp_state: NtpSyncState::WaitingForWifi,
@@ -434,6 +588,7 @@ pub mod espidf {
 
         /// Stop STA and SoftAP. Idempotent when the driver was never started.
         pub fn stop_radio(&mut self) -> Result<()> {
+            self.station_attempt = None;
             let _ = self.sntp.take();
             let was_started = self.radio_started;
             if let Some(wifi) = self.wifi.as_mut() {
@@ -466,6 +621,7 @@ pub mod espidf {
         /// a later power-key or RTC-alarm wake can reconnect without rebuilding
         /// the complete application shell.
         pub fn suspend(&mut self) -> Result<()> {
+            self.station_attempt = None;
             let _ = self.sntp.take();
             if let Some(wifi) = self.wifi.as_mut() {
                 let _ = wifi.disconnect();
@@ -528,6 +684,16 @@ pub mod espidf {
         }
     }
 
+    fn sta_ipv4(wifi: &EspWifi<'_>) -> Option<String> {
+        let info = wifi.sta_netif().get_ip_info().ok()?;
+        let text = info.ip.to_string();
+        if text.is_empty() || text == "0.0.0.0" {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
     fn read_rssi_dbm() -> Option<i32> {
         let mut record = unsafe { core::mem::zeroed::<sys::wifi_ap_record_t>() };
         let status = unsafe { sys::esp_wifi_sta_get_ap_info(&mut record) };
@@ -538,6 +704,13 @@ pub mod espidf {
 #[cfg(test)]
 mod tests {
     use super::{NetworkSnapshot, NtpSyncState, WifiConnectionState};
+
+    #[test]
+    fn station_retry_backs_off_to_five_minutes() {
+        let delays: Vec<u64> = (0..8).map(super::station_retry_delay_secs).collect();
+        assert_eq!(delays, [15, 30, 60, 120, 240, 300, 300, 300]);
+        assert_eq!(super::station_retry_delay_secs(u32::MAX), 300);
+    }
 
     #[test]
     fn configuration_missing_snapshot_is_safe_for_home() {

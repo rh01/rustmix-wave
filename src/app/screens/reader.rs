@@ -631,6 +631,7 @@ pub fn render_preferences(
         crate::reader::PreferenceMenu::Controls => "CONTROLS",
     };
     draw_header(display, state.display, "READING PREFERENCES", subtitle)?;
+    draw_preference_preview(display, state)?;
     let font_label = state.reader.book_font_display_label();
     for (index, preference) in state.reader.preference_rows().iter().copied().enumerate() {
         let owned;
@@ -640,6 +641,7 @@ pub fn render_preferences(
             | ReadingPreference::DisplayMenu
             | ReadingPreference::StatusMenu
             | ReadingPreference::ControlsMenu => ">>>",
+            ReadingPreference::Done => "APPLY",
             ReadingPreference::Presets => {
                 owned = state
                     .reader
@@ -686,18 +688,46 @@ pub fn render_preferences(
         draw_row(
             display,
             state,
-            148 + index as i32 * 68,
+            PREFERENCE_ROWS_TOP + index as i32 * 68,
             state.reader.preferences_selected == index,
             preference.label(),
             badge,
             "",
         )?;
     }
-    draw_footer(
+    let footer = if state.reader.layout_changes_pending() {
+        "UP/DOWN MOVE  SELECT CHANGE  DONE APPLIES"
+    } else {
+        "UP/DOWN MOVE  SELECT CHANGE  HOLD BOOT BACK"
+    };
+    draw_footer(display, state.display, footer)
+}
+
+/// The 72px sample needs about 110px. Eight 68px rows from here end above the
+/// footer rule at 746.
+const PREFERENCE_ROWS_TOP: i32 = 212;
+const PREVIEW_SAMPLE_TOP: i32 = 100;
+
+fn draw_preference_preview(
+    display: &mut OrientedFrameBuffer<'_>,
+    state: &AppState,
+) -> Result<(), Infallible> {
+    let prefs = state.reader.preferences;
+    let sample = reader_body_style(prefs.book_font, prefs.font_size, prefs.theme)
+        .with_tracking(prefs.letter_spacing.pixels());
+    let caption = format!(
+        "PREVIEW  {}  {}",
+        prefs.font_size.label(),
+        prefs.letter_spacing.label()
+    );
+    Text::new(&caption, Point::new(24, 92), state.display.detail_style()).draw(display)?;
+    let baseline = (PREVIEW_SAMPLE_TOP + i32::from(sample.line_height()) * 4 / 5)
+        .min(PREFERENCE_ROWS_TOP - 12);
+    Text::new("Aa Bb Cc", Point::new(24, baseline), sample).draw_clipped(
         display,
-        state.display,
-        "UP/DOWN MOVE  SELECT CHANGE  HOLD BOOT BACK",
-    )
+        TextBounds::new(18, PREVIEW_SAMPLE_TOP - 4, 462, PREFERENCE_ROWS_TOP - 6),
+    )?;
+    Ok(())
 }
 
 fn on_off(value: bool) -> &'static str {
@@ -1151,6 +1181,7 @@ mod tests {
             epub_document: None,
             resume: None,
             message: "Preparing".into(),
+            anchor_by_offset: false,
         });
         render_loading(&mut display, &state).unwrap();
     }

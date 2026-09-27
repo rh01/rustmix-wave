@@ -52,13 +52,64 @@ pub struct StreamedPart {
     pub terminal_chunk: bool,
 }
 
-/// Mark a job cancelled and close the live HTTP client.
+/// One `esp_http_client_read` result, after a timeout has been separated from a hard error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyRead {
+    /// `read > 0`. The worker keeps those bytes.
+    Bytes,
+    /// `-ESP_ERR_HTTP_EAGAIN`. Cancel is still clear, so the worker reads again.
+    Timeout,
+    /// `read == 0`. The worker checks Content-Length and then drops the client.
+    Ended,
+}
+
+/// Main-task cancel. Sets the flag and does not close the HTTP client.
 ///
-/// The flag alone is checked between reads. Closing the client is what makes
-/// a blocked `esp_http_client_read` return instead of waiting out the timeout.
-pub fn signal_cancel(flag: &std::sync::atomic::AtomicBool, close_client: &mut dyn FnMut()) {
+/// `esp_http_client_close` destroys the TLS session. The worker may be inside
+/// `esp_tls_conn_read` on that session, so only the worker may close it.
+pub fn request_cancel(flag: &std::sync::atomic::AtomicBool) {
     flag.store(true, std::sync::atomic::Ordering::Relaxed);
-    close_client();
+}
+
+/// Between body reads. When the flag is set, `close_on_worker` runs on the
+/// worker thread and the read is not started.
+pub fn stop_if_cancelled(
+    cancelled: bool,
+    close_on_worker: &mut dyn FnMut(),
+) -> Result<(), &'static str> {
+    if cancelled {
+        close_on_worker();
+        Err("cancelled")
+    } else {
+        Ok(())
+    }
+}
+
+/// Classify one body read on the worker.
+///
+/// `eagain` is `ESP_ERR_HTTP_EAGAIN` (28679 in IDF 5.4.3). A timeout is not a
+/// failed chapter. When `cancelled` is set, including when it became set while
+/// the read was blocked, the worker closes the client on this thread.
+pub fn worker_read(
+    cancelled: bool,
+    read: i32,
+    eagain: i32,
+    close_on_worker: &mut dyn FnMut(),
+) -> Result<BodyRead, &'static str> {
+    if cancelled {
+        close_on_worker();
+        return Err("cancelled");
+    }
+    if read == -eagain {
+        return Ok(BodyRead::Timeout);
+    }
+    if read < 0 {
+        return Err("HTTP response read failed");
+    }
+    if read == 0 {
+        return Ok(BodyRead::Ended);
+    }
+    Ok(BodyRead::Bytes)
 }
 
 pub trait Transport {
@@ -1806,12 +1857,76 @@ mod tests {
     }
 
     #[test]
-    fn cancel_sets_the_flag_and_closes_the_client() {
-        let flag = std::sync::atomic::AtomicBool::new(false);
-        let mut closed = false;
-        super::signal_cancel(&flag, &mut || closed = true);
-        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
-        assert!(closed);
+    fn cancel_closes_the_client_on_the_worker_after_a_short_read() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // IDF 5.4.3 `ESP_ERR_HTTP_EAGAIN`. The device passes the binding;
+        // this value is what `esp_http_client_read` returns on timeout.
+        const EAGAIN: i32 = 28679;
+        assert!((2_000..=3_000).contains(&crate::weread::limits::HTTP_READ_TIMEOUT_MS));
+
+        struct Session {
+            closed_on_worker: bool,
+        }
+        impl Session {
+            fn close_on_worker(&mut self) {
+                self.closed_on_worker = true;
+            }
+        }
+
+        let mut session = Session {
+            closed_on_worker: false,
+        };
+        let flag = AtomicBool::new(false);
+
+        let step = super::worker_read(false, -EAGAIN, EAGAIN, &mut || session.close_on_worker())
+            .expect("timeout");
+        assert_eq!(step, super::BodyRead::Timeout);
+        assert!(!session.closed_on_worker);
+
+        super::request_cancel(&flag);
+        assert!(flag.load(Ordering::Relaxed));
+        assert!(
+            !session.closed_on_worker,
+            "the main task must not close the client"
+        );
+
+        let error = super::worker_read(flag.load(Ordering::Relaxed), -EAGAIN, EAGAIN, &mut || {
+            session.close_on_worker()
+        })
+        .expect_err("cancel");
+        assert_eq!(error, "cancelled");
+        assert!(
+            session.closed_on_worker,
+            "the worker closes after the timed-out read returns"
+        );
+
+        let mut session = Session {
+            closed_on_worker: false,
+        };
+        let error = super::stop_if_cancelled(true, &mut || session.close_on_worker())
+            .expect_err("between reads");
+        assert_eq!(error, "cancelled");
+        assert!(session.closed_on_worker);
+
+        let mut session = Session {
+            closed_on_worker: false,
+        };
+        assert!(super::stop_if_cancelled(false, &mut || session.close_on_worker()).is_ok());
+        assert!(!session.closed_on_worker);
+        assert_eq!(
+            super::worker_read(false, -1, EAGAIN, &mut || session.close_on_worker()),
+            Err("HTTP response read failed")
+        );
+        assert!(!session.closed_on_worker);
+        assert_eq!(
+            super::worker_read(false, 64, EAGAIN, &mut || session.close_on_worker()),
+            Ok(super::BodyRead::Bytes)
+        );
+        assert_eq!(
+            super::worker_read(false, 0, EAGAIN, &mut || session.close_on_worker()),
+            Ok(super::BodyRead::Ended)
+        );
     }
 
     #[test]

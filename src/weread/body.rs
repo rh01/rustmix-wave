@@ -68,8 +68,8 @@ pub fn body_transfer_error(
     None
 }
 
-/// Cancel closes the socket. A short read after that is a cancel, not a body
-/// that should be stored.
+/// A cancelled job is a cancel, not a short body that should be stored.
+/// The worker closes the HTTP client; this check only classifies the stop.
 #[must_use]
 pub fn stopped_transfer_error(
     cancelled: bool,

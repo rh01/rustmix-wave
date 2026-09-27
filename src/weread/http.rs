@@ -6,7 +6,11 @@
 //! disable the flash cache. Offline download therefore reads each response in
 //! small chunks on this worker and the main task (internal stack) writes them
 //! to a temp file. Interactive reads still buffer one chapter. The HTTP client
-//! is closed and cleaned up before the next job. Every `Set-Cookie` is kept;
+//! is closed and cleaned up on this worker before the next job. Cancel only
+//! sets a flag on the main task; this thread closes the client after the
+//! current body read returns. Body reads time out after
+//! `HTTP_READ_TIMEOUT_MS` so that flag is noticed without destroying the
+//! TLS session from the other task. Every `Set-Cookie` is kept;
 //! the ESP-IDF Rust client stores headers in a map and would drop all but the last.
 
 use std::{
@@ -29,7 +33,7 @@ use esp_idf_svc::sys::{
     esp_http_client_is_chunked_response, esp_http_client_is_complete_data_received,
     esp_http_client_method_t_HTTP_METHOD_GET, esp_http_client_method_t_HTTP_METHOD_POST,
     esp_http_client_open, esp_http_client_read, esp_http_client_set_header,
-    esp_http_client_set_method, esp_http_client_write, ESP_OK,
+    esp_http_client_set_method, esp_http_client_set_timeout_ms, esp_http_client_write, ESP_OK,
 };
 
 use crate::{
@@ -40,8 +44,8 @@ use crate::{
         body::{self, BoundedBody},
         client::{self, Job, JobError, Report, Request, Response, Transport, Work},
         limits::{
-            DOWNLOAD_CHUNK_BYTES, DOWNLOAD_CLASSIFY_BYTES, HTTP_IO_BUFFER_BYTES, HTTP_TIMEOUT_SECS,
-            MIN_REQUEST_GAP_MS,
+            DOWNLOAD_CHUNK_BYTES, DOWNLOAD_CLASSIFY_BYTES, HTTP_IO_BUFFER_BYTES,
+            HTTP_READ_TIMEOUT_MS, HTTP_TIMEOUT_SECS, MIN_REQUEST_GAP_MS,
         },
         offline::{self, DownloadEvent},
         session,
@@ -70,7 +74,6 @@ struct Inflight {
     write_error: Option<String>,
     chunks_closed: bool,
     cancel: Arc<AtomicBool>,
-    live: Arc<LiveClient>,
     generation: u64,
     job: Job,
     session: session::Session,
@@ -80,58 +83,8 @@ struct QueuedJob {
     work: Work,
     unix: Option<u64>,
     cancel: Arc<AtomicBool>,
-    live: Arc<LiveClient>,
     seed: u64,
     download_tx: Option<mpsc::SyncSender<DownloadEvent>>,
-}
-
-/// Raw ESP-IDF client pointer. Access is serialized by [`LiveClient`]'s mutex.
-struct ClientSlot(esp_http_client_handle_t);
-
-// SAFETY: the pointer is only used while `LiveClient`'s mutex is held. The
-// worker installs and clears it, and cancel closes it from the main task.
-unsafe impl Send for ClientSlot {}
-
-/// Client handle shared with the main task so cancel can close the socket.
-struct LiveClient {
-    handle: Mutex<ClientSlot>,
-}
-
-impl LiveClient {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            handle: Mutex::new(ClientSlot(core::ptr::null_mut())),
-        })
-    }
-
-    fn install(&self, handle: esp_http_client_handle_t) {
-        self.handle
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .0 = handle;
-    }
-
-    fn clear(&self, handle: esp_http_client_handle_t) {
-        let mut slot = self
-            .handle
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if slot.0 == handle {
-            slot.0 = core::ptr::null_mut();
-        }
-    }
-
-    fn close(&self) {
-        let slot = self
-            .handle
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if !slot.0.is_null() {
-            unsafe {
-                let _ = esp_http_client_close(slot.0);
-            }
-        }
-    }
 }
 
 struct WorkerSlot {
@@ -167,10 +120,7 @@ impl HttpJobs {
             mounted,
             spawn_work,
             poll_report,
-            |job| {
-                let live = Arc::clone(&job.live);
-                client::signal_cancel(&job.cancel, &mut move || live.close());
-            },
+            |job| client::request_cancel(&job.cancel),
         )
     }
 }
@@ -268,12 +218,10 @@ fn spawn_work(work: Work, unix: Option<u64>, cancel: Arc<AtomicBool>) -> Result<
         _ => (None, None, None),
     };
     let chunks_closed = chunks.is_none();
-    let live = LiveClient::new();
     let queued = QueuedJob {
         work,
         unix,
         cancel: Arc::clone(&cancel),
-        live: Arc::clone(&live),
         seed: random_seed(),
         download_tx,
     };
@@ -285,7 +233,6 @@ fn spawn_work(work: Work, unix: Option<u64>, cancel: Arc<AtomicBool>) -> Result<
             write_error: None,
             chunks_closed,
             cancel,
-            live,
             generation,
             job,
             session,
@@ -366,7 +313,6 @@ fn start_worker() -> Result<LongLivedWorker<QueuedJob, Report>, std::io::Error> 
                 let mut transport = EspTransport {
                     gap: true,
                     cancel: job.cancel,
-                    live: job.live,
                     download: job.download_tx,
                 };
                 let report =
@@ -437,7 +383,6 @@ fn random_seed() -> u64 {
 struct EspTransport {
     gap: bool,
     cancel: Arc<AtomicBool>,
-    live: Arc<LiveClient>,
     download: Option<mpsc::SyncSender<DownloadEvent>>,
 }
 
@@ -466,7 +411,7 @@ impl Transport for EspTransport {
         if self.cancelled() {
             return Err("cancelled".into());
         }
-        http_call(request, &self.cancel, &self.live)
+        http_call(request, &self.cancel)
     }
 
     fn streaming_download(&self) -> bool {
@@ -486,7 +431,7 @@ impl Transport for EspTransport {
             .download
             .as_ref()
             .ok_or("streaming download is not available")?;
-        http_call_stream(request, &self.cancel, &self.live, tx, part)
+        http_call_stream(request, &self.cancel, tx, part)
     }
 }
 
@@ -517,16 +462,24 @@ unsafe extern "C" fn on_http_event(event: *mut esp_http_client_event_t) -> sys::
 
 struct HttpClient {
     raw: esp_http_client_handle_t,
-    live: Arc<LiveClient>,
+    closed: bool,
 }
 
 impl HttpClient {
-    fn adopt(raw: esp_http_client_handle_t, live: &Arc<LiveClient>) -> Self {
-        live.install(raw);
-        Self {
-            raw,
-            live: Arc::clone(live),
+    fn from_raw(raw: esp_http_client_handle_t) -> Self {
+        Self { raw, closed: false }
+    }
+
+    /// `esp_http_client_close` on this thread. Drop still calls `cleanup`.
+    /// The main task never holds this handle.
+    fn close_on_worker(&mut self) {
+        if self.raw.is_null() || self.closed {
+            return;
         }
+        unsafe {
+            let _ = esp_http_client_close(self.raw);
+        }
+        self.closed = true;
     }
 }
 
@@ -535,20 +488,49 @@ impl Drop for HttpClient {
         if self.raw.is_null() {
             return;
         }
-        self.live.clear(self.raw);
+        if !self.closed {
+            unsafe {
+                let _ = esp_http_client_close(self.raw);
+            }
+        }
         unsafe {
-            let _ = esp_http_client_close(self.raw);
             let _ = esp_http_client_cleanup(self.raw);
         }
         self.raw = core::ptr::null_mut();
     }
 }
 
-fn http_call(
-    request: &Request,
+fn arm_body_timeout(raw: esp_http_client_handle_t) {
+    unsafe {
+        let _ = esp_http_client_set_timeout_ms(raw, HTTP_READ_TIMEOUT_MS);
+    }
+}
+
+fn read_body_chunk(
+    client: &mut HttpClient,
     cancel: &AtomicBool,
-    live: &Arc<LiveClient>,
-) -> Result<Response, String> {
+    buf: &mut [u8],
+) -> Result<(client::BodyRead, i32), String> {
+    client::stop_if_cancelled(cancel.load(Ordering::Relaxed), &mut || {
+        client.close_on_worker();
+    })?;
+    let read = unsafe {
+        esp_http_client_read(
+            client.raw,
+            buf.as_mut_ptr() as *mut core::ffi::c_char,
+            buf.len() as i32,
+        )
+    };
+    let step = client::worker_read(
+        cancel.load(Ordering::Relaxed),
+        read,
+        sys::ESP_ERR_HTTP_EAGAIN,
+        &mut || client.close_on_worker(),
+    )?;
+    Ok((step, read))
+}
+
+fn http_call(request: &Request, cancel: &AtomicBool) -> Result<Response, String> {
     let url = CString::new(request.url.as_str()).map_err(|_| "URL is not a C string")?;
     let mut cookies = CookieList {
         text: String::new(),
@@ -565,7 +547,7 @@ fn http_call(
     if raw.is_null() {
         return Err("HTTP connection init failed".into());
     }
-    let client = HttpClient::adopt(raw, live);
+    let mut client = HttpClient::from_raw(raw);
     let method = if request.method == "POST" {
         esp_http_client_method_t_HTTP_METHOD_POST
     } else {
@@ -593,9 +575,9 @@ fn http_call(
         return Err("HTTP request failed".into());
     }
     if let Some(body) = request.body.as_deref() {
-        if cancel.load(Ordering::Relaxed) {
-            return Err("cancelled".into());
-        }
+        client::stop_if_cancelled(cancel.load(Ordering::Relaxed), &mut || {
+            client.close_on_worker();
+        })?;
         let wrote = unsafe {
             esp_http_client_write(
                 client.raw,
@@ -623,28 +605,17 @@ fn http_call(
     }
     let mut body = BoundedBody::new(declared, request.max_bytes)?;
     let mut chunk = [0_u8; 2048];
+    arm_body_timeout(client.raw);
     loop {
-        if cancel.load(Ordering::Relaxed) {
-            return Err("cancelled".into());
-        }
-        let read = unsafe {
-            esp_http_client_read(
-                client.raw,
-                chunk.as_mut_ptr() as *mut core::ffi::c_char,
-                chunk.len() as i32,
-            )
-        };
-        if read < 0 {
-            if cancel.load(Ordering::Relaxed) {
-                return Err("cancelled".into());
+        let (step, read) = read_body_chunk(&mut client, cancel, &mut chunk)?;
+        match step {
+            client::BodyRead::Timeout => continue,
+            client::BodyRead::Ended => {
+                finish_read(&client, cancel, content_length, body.len())?;
+                break;
             }
-            return Err("HTTP response read failed".into());
+            client::BodyRead::Bytes => body.push(&chunk[..read as usize])?,
         }
-        if read == 0 {
-            finish_read(&client, cancel, content_length, body.len())?;
-            break;
-        }
-        body.push(&chunk[..read as usize])?;
     }
     log::info!(
         "rustmix-wave=weread-http method={} status={} bytes={} set-cookie-bytes={}",
@@ -664,7 +635,6 @@ fn http_call(
 fn http_call_stream(
     request: &Request,
     cancel: &AtomicBool,
-    live: &Arc<LiveClient>,
     tx: &mpsc::SyncSender<DownloadEvent>,
     part: &'static str,
 ) -> Result<client::StreamedPart, String> {
@@ -684,7 +654,7 @@ fn http_call_stream(
     if raw.is_null() {
         return Err("HTTP connection init failed".into());
     }
-    let client = HttpClient::adopt(raw, live);
+    let mut client = HttpClient::from_raw(raw);
     let method = if request.method == "POST" {
         esp_http_client_method_t_HTTP_METHOD_POST
     } else {
@@ -712,9 +682,9 @@ fn http_call_stream(
         return Err("HTTP request failed".into());
     }
     if let Some(body) = request.body.as_deref() {
-        if cancel.load(Ordering::Relaxed) {
-            return Err("cancelled".into());
-        }
+        client::stop_if_cancelled(cancel.load(Ordering::Relaxed), &mut || {
+            client.close_on_worker();
+        })?;
         let wrote = unsafe {
             esp_http_client_write(
                 client.raw,
@@ -741,37 +711,28 @@ fn http_call_stream(
     let mut prefix = Vec::new();
     let mut total = 0usize;
     emit_download(tx, DownloadEvent::BeginPart(part))?;
+    arm_body_timeout(client.raw);
     loop {
-        if cancel.load(Ordering::Relaxed) {
-            return Err("cancelled".into());
-        }
-        let read = unsafe {
-            esp_http_client_read(
-                client.raw,
-                chunk.as_mut_ptr() as *mut core::ffi::c_char,
-                chunk.len() as i32,
-            )
-        };
-        if read < 0 {
-            if cancel.load(Ordering::Relaxed) {
-                return Err("cancelled".into());
+        let (step, read) = read_body_chunk(&mut client, cancel, &mut chunk)?;
+        match step {
+            client::BodyRead::Timeout => continue,
+            client::BodyRead::Ended => {
+                finish_read(&client, cancel, content_length, total)?;
+                break;
             }
-            return Err("HTTP response read failed".into());
+            client::BodyRead::Bytes => {
+                let slice = &chunk[..read as usize];
+                if prefix.len() < DOWNLOAD_CLASSIFY_BYTES {
+                    let room = DOWNLOAD_CLASSIFY_BYTES - prefix.len();
+                    prefix.extend_from_slice(&slice[..slice.len().min(room)]);
+                }
+                total = total.saturating_add(slice.len());
+                if total > request.max_bytes {
+                    return Err("response exceeds size limit".into());
+                }
+                emit_download(tx, DownloadEvent::Chunk(slice.to_vec()))?;
+            }
         }
-        if read == 0 {
-            finish_read(&client, cancel, content_length, total)?;
-            break;
-        }
-        let slice = &chunk[..read as usize];
-        if prefix.len() < DOWNLOAD_CLASSIFY_BYTES {
-            let room = DOWNLOAD_CLASSIFY_BYTES - prefix.len();
-            prefix.extend_from_slice(&slice[..slice.len().min(room)]);
-        }
-        total = total.saturating_add(slice.len());
-        if total > request.max_bytes {
-            return Err("response exceeds size limit".into());
-        }
-        emit_download(tx, DownloadEvent::Chunk(slice.to_vec()))?;
     }
     let chunked = unsafe { esp_http_client_is_chunked_response(client.raw) };
     let terminal_chunk = unsafe { esp_http_client_is_complete_data_received(client.raw) };

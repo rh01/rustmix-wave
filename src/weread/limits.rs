@@ -41,6 +41,10 @@ pub const LOGIN_POLL_MS: u64 = 2_000;
 pub const LOGIN_TIMEOUT_MS: u64 = 180_000;
 pub const PROGRESS_DELAY_MS: u64 = 5_000;
 pub const HTTP_TIMEOUT_SECS: u64 = 20;
+/// Per-read timeout after the TLS handshake. Cancel is a flag on the main
+/// task; the worker notices it once `esp_http_client_read` returns, which is
+/// at most this long. The handshake still uses [`HTTP_TIMEOUT_SECS`].
+pub const HTTP_READ_TIMEOUT_MS: i32 = 3_000;
 /// First try plus two retries. A failed chapter does not cancel the book.
 pub const DOWNLOAD_ATTEMPTS: u8 = 3;
 pub const DOWNLOAD_RETRY_MS: u64 = 1_000;
@@ -66,8 +70,8 @@ pub const SESSION_BAK: &str = "SESS.BAK";
 #[cfg(test)]
 mod tests {
     use super::{
-        DOWNLOAD_CHUNK_BYTES, HTTP_IO_BUFFER_BYTES, MAX_CHAPTER_TEXT, MAX_SHARD_BYTES,
-        MODULE_PSRAM_BYTES, WEREAD_HTTP_WORKER_STACK_BYTES,
+        DOWNLOAD_CHUNK_BYTES, HTTP_IO_BUFFER_BYTES, HTTP_READ_TIMEOUT_MS, HTTP_TIMEOUT_SECS,
+        MAX_CHAPTER_TEXT, MAX_SHARD_BYTES, MODULE_PSRAM_BYTES, WEREAD_HTTP_WORKER_STACK_BYTES,
     };
     use crate::fonts::{
         GLYPH_CACHE_BUDGET_BYTES, MAX_SD_FONT_BYTES, SD_FONT_RESIDENT_BUDGET_BYTES,
@@ -100,5 +104,7 @@ mod tests {
         assert!((4 * 1024..=8 * 1024).contains(&DOWNLOAD_CHUNK_BYTES));
         assert!(DOWNLOAD_CHUNK_BYTES <= 16 * 1024);
         assert!(WEREAD_HTTP_WORKER_STACK_BYTES <= 32 * 1024);
+        assert!((2_000..=3_000).contains(&HTTP_READ_TIMEOUT_MS));
+        assert!(HTTP_READ_TIMEOUT_MS < (HTTP_TIMEOUT_SECS as i32) * 1_000);
     }
 }

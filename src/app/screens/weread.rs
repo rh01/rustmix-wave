@@ -228,6 +228,85 @@ pub fn render_toc(
     )
 }
 
+fn render_immersive_chapter(
+    display: &mut OrientedFrameBuffer<'_>,
+    state: &AppState,
+    weread: &crate::weread::WereadUi,
+    title: &str,
+    dark: bool,
+    layout: crate::reader::ReaderLayout,
+) -> Result<(), Infallible> {
+    let size = display.orientation().logical_size();
+    let width = size.width as i32;
+    let height = size.height as i32;
+    let body = reader_body_style(
+        state.reader.preferences.book_font,
+        state.reader.preferences.font_size,
+        state.reader.preferences.theme,
+    )
+    .with_tracking(state.reader.preferences.letter_spacing.pixels())
+    .with_color(if dark {
+        BinaryColor::Off
+    } else {
+        BinaryColor::On
+    });
+    let line_step = i32::from(body.line_height()) + 2 + i32::from(layout.line_spacing_px);
+    let left = i32::from(layout.margin_left_px);
+    let right = width - i32::from(layout.margin_right_px);
+    let top = i32::from(layout.margin_top_px);
+    let bottom = height - i32::from(layout.margin_bottom_px);
+    if let Some(page) = weread.pages.get(weread.page_index) {
+        for (index, line) in page.iter().enumerate() {
+            let baseline = top + i32::from(body.line_height()) + index as i32 * line_step;
+            if baseline > bottom {
+                break;
+            }
+            let indent = if line.first_line_indent {
+                layout.indent_px()
+            } else {
+                0
+            };
+            let shown = state.reader.preferences.display_line(&line.text);
+            let bounds = TextBounds::new(left + indent, top, right, bottom);
+            let (rendered, x) = super::reader::aligned_reader_line(
+                shown.as_str(),
+                line.paragraph_end,
+                state.reader.preferences.effective_alignment(),
+                body,
+                bounds,
+            );
+            Text::new(rendered.as_str(), Point::new(x, baseline), body).draw(display)?;
+        }
+    } else {
+        let ink = if dark {
+            state.display.text_style(UiTextRole::Body, BinaryColor::Off)
+        } else {
+            state.display.body_style()
+        };
+        Text::new(
+            &truncate(&weread.status, 40),
+            Point::new(left, top + 48),
+            ink,
+        )
+        .draw(display)?;
+    }
+    if state.reading_status_overlay {
+        let page_count = weread.pages.len().max(1);
+        let page = if weread.pages.is_empty() {
+            0
+        } else {
+            weread.page_index.min(page_count - 1) + 1
+        };
+        let label = format!(
+            "PAGE {page}/{page_count}  {title}  {}  {}  SELECT menu",
+            state.board.time_label(state.regional),
+            state.board.battery_label()
+        );
+        super::reader::draw_immersive_status(display, state, &label)?;
+    }
+    Ok(())
+}
+
 pub fn render_read(
     display: &mut OrientedFrameBuffer<'_>,
     state: &AppState,
@@ -251,6 +330,10 @@ pub fn render_read(
     } else {
         state.display.body_style()
     };
+    let layout = state.reader.preferences.layout();
+    if layout.immersive {
+        return render_immersive_chapter(display, state, weread, title, dark, layout);
+    }
     draw_header(display, state.display, "WEREAD", "CHAPTER")?;
     Text::new(
         &state.display.heading_style().truncate(title, 24, 420),
@@ -268,7 +351,6 @@ pub fn render_read(
             top += 168;
         }
     }
-    let layout = state.reader.preferences.layout();
     let body = reader_body_style(
         state.reader.preferences.book_font,
         state.reader.preferences.font_size,

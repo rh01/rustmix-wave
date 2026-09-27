@@ -816,6 +816,8 @@ mod firmware {
         let mut auto_turn_since = Instant::now();
         let mut auto_turn_paused = false;
         let mut auto_turn_reading = false;
+        let mut status_overlay_since = Instant::now();
+        let mut status_overlay_token = 0_u8;
         let mut last_status_refresh = Instant::now();
         let mut last_alarm_poll = Instant::now();
         let mut last_power_key_poll = Instant::now();
@@ -2237,6 +2239,35 @@ mod firmware {
                 last_activity = Instant::now();
                 last_status_refresh = Instant::now();
             }
+            let status_overlay_due_ms = if state.reading_status_overlay {
+                if state.reading_status_overlay_token() != status_overlay_token {
+                    status_overlay_token = state.reading_status_overlay_token();
+                    status_overlay_since = Instant::now();
+                }
+                let elapsed = status_overlay_since.elapsed().as_millis() as u64;
+                if waveshare_epd397_rust_app::reader::immersive_status_visible(elapsed) {
+                    Some(
+                        waveshare_epd397_rust_app::reader::IMMERSIVE_STATUS_MS
+                            .saturating_sub(elapsed)
+                            .max(1),
+                    )
+                } else {
+                    state.clear_reading_status_overlay();
+                    status_overlay_token = state.reading_status_overlay_token();
+                    refresh_screen(
+                        &mut panel,
+                        &mut frame,
+                        &mut state,
+                        &mut panel_refresh,
+                        &mut previous_panel_frame,
+                        RefreshRequest::Normal,
+                    )?;
+                    None
+                }
+            } else {
+                status_overlay_token = state.reading_status_overlay_token();
+                None
+            };
             let blocked = deep_sleep_blocked(
                 voice_busy,
                 weread_needs_radio,
@@ -2377,6 +2408,7 @@ mod firmware {
                 } else {
                     None
                 },
+                status_overlay_due_ms,
                 auto_turn_due_ms: if auto_keeps_awake {
                     state
                         .reader

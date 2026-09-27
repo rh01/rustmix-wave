@@ -115,6 +115,9 @@ pub struct AppState {
     weread_preferences_return: Option<ScreenRoute>,
     /// One-shot word clip. The main loop plays it in short I2S chunks.
     pronounce_request: Option<PronounceTarget>,
+    /// Brief progress strip drawn over an immersive reading page.
+    pub reading_status_overlay: bool,
+    status_overlay_token: u8,
 }
 
 impl Default for AppState {
@@ -163,6 +166,8 @@ impl Default for AppState {
             weread: WereadUi::default(),
             weread_preferences_return: None,
             pronounce_request: None,
+            reading_status_overlay: false,
+            status_overlay_token: 0,
         }
     }
 }
@@ -173,18 +178,51 @@ impl AppState {
     /// existing owners from main.rs.
     /// Hardware key release. Reading routes honor swap and long-press chapter jump.
     pub fn apply_hardware_key(&mut self, press: KeyPress) {
-        if self.jump_chapter_for_key(press) {
+        if self.arm_immersive_status(press) {
             return;
         }
         let reading = matches!(
             self.router.current(),
             ScreenRoute::ReaderPage | ScreenRoute::WeReadRead
         );
+        if reading {
+            self.reading_status_overlay = false;
+        }
+        if self.jump_chapter_for_key(press) {
+            return;
+        }
         let event = crate::reader::map_page_turn_event(
             press.event,
             reading && self.reader.preferences.swap_page_keys,
         );
         self.apply(event);
+    }
+
+    /// Long-press SELECT while immersive shows progress and leaves the page in place.
+    fn arm_immersive_status(&mut self, press: KeyPress) -> bool {
+        let reading = matches!(
+            self.router.current(),
+            ScreenRoute::ReaderPage | ScreenRoute::WeReadRead
+        );
+        if !crate::reader::show_immersive_status(
+            press.event,
+            press.held_ms,
+            reading && self.reader.preferences.immersive,
+        ) {
+            return false;
+        }
+        self.reading_status_overlay = true;
+        self.status_overlay_token = self.status_overlay_token.wrapping_add(1);
+        true
+    }
+
+    #[must_use]
+    pub fn reading_status_overlay_token(&self) -> u8 {
+        self.status_overlay_token
+    }
+
+    pub fn clear_reading_status_overlay(&mut self) {
+        self.reading_status_overlay = false;
     }
 
     fn jump_chapter_for_key(&mut self, press: KeyPress) -> bool {
@@ -1366,7 +1404,10 @@ fn compact_message(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::AppState;
-    use crate::{app::router::ScreenRoute, buttons::ButtonEvent};
+    use crate::{
+        app::router::ScreenRoute,
+        buttons::{ButtonEvent, KeyPress},
+    };
 
     #[test]
     fn motion_event_screen_cycles_thresholds_and_opens_sensor_details() {
@@ -1719,6 +1760,39 @@ mod tests {
         assert_eq!(state.active_route(), ScreenRoute::WeReadRead);
         state.back();
         assert_eq!(state.active_route(), ScreenRoute::WeReadBook);
+    }
+
+    #[test]
+    fn immersive_long_press_shows_status_and_short_select_keeps_menus() {
+        let mut state = AppState::default();
+        state.reader.preferences.immersive = true;
+        state.router.navigate_to(ScreenRoute::ReaderPage);
+        state.apply_hardware_key(KeyPress {
+            event: ButtonEvent::Select,
+            held_ms: 600,
+        });
+        assert!(state.reading_status_overlay);
+        assert_eq!(state.active_route(), ScreenRoute::ReaderPage);
+        state.apply_hardware_key(KeyPress {
+            event: ButtonEvent::Select,
+            held_ms: 80,
+        });
+        assert!(!state.reading_status_overlay);
+        assert_eq!(state.active_route(), ScreenRoute::ReaderOptions);
+
+        state.router.navigate_to(ScreenRoute::WeReadRead);
+        state.reader.preferences.immersive = true;
+        state.apply_hardware_key(KeyPress {
+            event: ButtonEvent::Select,
+            held_ms: 700,
+        });
+        assert!(state.reading_status_overlay);
+        assert_eq!(state.active_route(), ScreenRoute::WeReadRead);
+        state.apply_hardware_key(KeyPress {
+            event: ButtonEvent::Select,
+            held_ms: 40,
+        });
+        assert_eq!(state.active_route(), ScreenRoute::ReaderPreferences);
     }
 
     #[test]

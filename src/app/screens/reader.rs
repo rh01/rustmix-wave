@@ -355,11 +355,18 @@ pub fn render_page(
     let width = size.width as i32;
     let height = size.height as i32;
     let landscape = width > height;
+    let immersive = session.layout.immersive;
+    let (show_header, show_status, show_footer) =
+        reading_chrome(immersive, state.reading_status_overlay);
     let header_height = if landscape { 52 } else { 70 };
     let status_top = header_height + 10;
     let status_height = if landscape { 34 } else { 42 };
     let footer_line = height - 54;
-    let body = ReaderBodyGeometry::new(width, status_top, status_height, footer_line);
+    let mut body = if immersive {
+        ReaderBodyGeometry::edge_to_edge(width, height, session.layout)
+    } else {
+        ReaderBodyGeometry::new(width, status_top, status_height, footer_line)
+    };
     let body_style = reader_body_style(
         state.reader.preferences.book_font,
         state.reader.preferences.font_size,
@@ -376,53 +383,58 @@ pub fn render_page(
     };
     let heading = state.display.header_title_style();
 
-    Rectangle::new(
-        Point::new(0, 0),
-        Size::new(size.width, header_height as u32),
-    )
-    .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-    .draw(display)?;
-    Text::new(
-        &heading.truncate(
-            &session.book.title,
-            if landscape { 52 } else { 27 },
-            if landscape { 760 } else { 444 },
-        ),
-        Point::new(18, if landscape { 28 } else { 32 }),
-        state.display.header_title_style(),
-    )
-    .draw(display)?;
-    Text::new(
-        if session.book.format == BookFormat::Text {
-            "TXT READER"
-        } else {
-            "EPUB REFLOWABLE"
-        },
-        Point::new(18, if landscape { 48 } else { 60 }),
-        state.display.header_subtitle_style(),
-    )
-    .draw(display)?;
+    if show_header {
+        Rectangle::new(
+            Point::new(0, 0),
+            Size::new(size.width, header_height as u32),
+        )
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display)?;
+        Text::new(
+            &heading.truncate(
+                &session.book.title,
+                if landscape { 52 } else { 27 },
+                if landscape { 760 } else { 444 },
+            ),
+            Point::new(18, if landscape { 28 } else { 32 }),
+            state.display.header_title_style(),
+        )
+        .draw(display)?;
+        Text::new(
+            if session.book.format == BookFormat::Text {
+                "TXT READER"
+            } else {
+                "EPUB REFLOWABLE"
+            },
+            Point::new(18, if landscape { 48 } else { 60 }),
+            state.display.header_subtitle_style(),
+        )
+        .draw(display)?;
+    }
 
-    Rectangle::new(
-        Point::new(14, status_top),
-        Size::new((width - 28) as u32, status_height as u32),
-    )
-    .into_styled(PrimitiveStyle::with_stroke(ink, 1))
-    .draw(display)?;
-    let status_baseline = status_top + status_height - 10;
-    let status_label = reading_status_label(state, session);
-    Text::new(
-        &ui_ink.truncate(&status_label, if landscape { 70 } else { 36 }, width - 48),
-        Point::new(24, status_baseline),
-        ui_ink,
-    )
-    .draw(display)?;
+    if show_status && !immersive {
+        Rectangle::new(
+            Point::new(14, status_top),
+            Size::new((width - 28) as u32, status_height as u32),
+        )
+        .into_styled(PrimitiveStyle::with_stroke(ink, 1))
+        .draw(display)?;
+        let status_baseline = status_top + status_height - 10;
+        let status_label = reading_status_label(state, session);
+        Text::new(
+            &ui_ink.truncate(&status_label, if landscape { 70 } else { 36 }, width - 48),
+            Point::new(24, status_baseline),
+            ui_ink,
+        )
+        .draw(display)?;
+    }
 
-    let mut body = body;
-    body.text.left += i32::from(session.layout.margin_left_px);
-    body.text.right -= i32::from(session.layout.margin_right_px);
-    body.text.top += i32::from(session.layout.margin_top_px);
-    body.text.bottom -= i32::from(session.layout.margin_bottom_px);
+    if !immersive {
+        body.text.left += i32::from(session.layout.margin_left_px);
+        body.text.right -= i32::from(session.layout.margin_right_px);
+        body.text.top += i32::from(session.layout.margin_top_px);
+        body.text.bottom -= i32::from(session.layout.margin_bottom_px);
+    }
     if state.reader.preferences.theme == ReadingTheme::HighContrast {
         Rectangle::new(
             Point::new(body.frame.left, body.frame.top),
@@ -471,28 +483,43 @@ pub fn render_page(
         .draw_clipped(display, body.text)?;
     }
 
-    Rectangle::new(
-        Point::new(14, footer_line),
-        Size::new((width - 28) as u32, 1),
-    )
-    .into_styled(PrimitiveStyle::with_fill(ink))
-    .draw(display)?;
-    let footer_hint = page_turn_hint(landscape, state.reader.preferences.swap_page_keys);
-    let footer_style = if dark {
-        if landscape {
-            state
-                .display
-                .text_style(UiTextRole::Detail, BinaryColor::Off)
+    if show_footer {
+        Rectangle::new(
+            Point::new(14, footer_line),
+            Size::new((width - 28) as u32, 1),
+        )
+        .into_styled(PrimitiveStyle::with_fill(ink))
+        .draw(display)?;
+        let footer_hint = page_turn_hint(landscape, state.reader.preferences.swap_page_keys);
+        let footer_style = if dark {
+            if landscape {
+                state
+                    .display
+                    .text_style(UiTextRole::Detail, BinaryColor::Off)
+            } else {
+                ui_ink
+            }
+        } else if landscape {
+            ui_detail
         } else {
-            ui_ink
-        }
-    } else if landscape {
-        ui_detail
-    } else {
-        ui_body
-    };
-    Text::new(footer_hint, Point::new(18, height - 18), footer_style).draw(display)?;
+            ui_body
+        };
+        Text::new(footer_hint, Point::new(18, height - 18), footer_style).draw(display)?;
+    }
+    if show_status && immersive {
+        draw_immersive_status(display, state, &immersive_status_label(state, session))?;
+    }
     Ok(())
+}
+
+/// Header, persistent status, and footer visibility for a reading page.
+/// Immersive pages hide all three until a long-press asks for the status overlay.
+pub(crate) fn reading_chrome(immersive: bool, status_overlay: bool) -> (bool, bool, bool) {
+    if immersive {
+        (false, status_overlay, false)
+    } else {
+        (true, true, true)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -538,6 +565,24 @@ impl ReaderBodyGeometry {
             top: text.top - 8,
             right: text.right + 8,
             bottom: text.bottom + 8,
+        };
+        Self { text, frame }
+    }
+
+    /// Full-panel text box. Side insets come from the immersive layout; top and bottom are 0.
+    #[must_use]
+    fn edge_to_edge(width: i32, height: i32, layout: crate::reader::ReaderLayout) -> Self {
+        let text = TextBounds::new(
+            i32::from(layout.margin_left_px),
+            i32::from(layout.margin_top_px),
+            width - i32::from(layout.margin_right_px),
+            height - i32::from(layout.margin_bottom_px),
+        );
+        let frame = ReaderFrameBounds {
+            left: text.left,
+            top: text.top,
+            right: text.right,
+            bottom: text.bottom,
         };
         Self { text, frame }
     }
@@ -606,6 +651,7 @@ pub fn render_preferences(
             }
             ReadingPreference::ChineseScript => state.reader.preferences.chinese_script.label(),
             ReadingPreference::ReadingTheme => state.reader.preferences.theme.label(),
+            ReadingPreference::Immersive => on_off(state.reader.preferences.immersive),
             ReadingPreference::DarkMode => on_off(state.reader.preferences.dark_mode),
             ReadingPreference::FullRefresh => state.reader.preferences.full_refresh.label(),
             ReadingPreference::Orientation => state.reader.preferences.orientation.label(),
@@ -705,6 +751,55 @@ fn reading_status_label(state: &AppState, session: &crate::reader::ReaderSession
         );
     }
     parts.join("  ")
+}
+
+fn immersive_status_label(state: &AppState, session: &crate::reader::ReaderSession) -> String {
+    let mut parts = vec![format!("PAGE {}", session.page_label())];
+    if let Some(chapter) = session.current_epub_chapter_page_label() {
+        parts.push(format!(
+            "CH {} {}",
+            chapter.chapter_number,
+            chapter.page_text()
+        ));
+    } else {
+        parts.push(format!("{}%", session.progress_percent()));
+    }
+    parts.push(state.board.time_label(state.regional));
+    parts.push(state.board.battery_label());
+    if state.reader.current_page_is_bookmarked() {
+        parts.push("MARKED".into());
+    }
+    parts.push("SELECT menu".into());
+    parts.join("  ")
+}
+
+pub(crate) fn draw_immersive_status(
+    display: &mut OrientedFrameBuffer<'_>,
+    state: &AppState,
+    label: &str,
+) -> Result<(), Infallible> {
+    let size = display.orientation().logical_size();
+    let width = size.width as i32;
+    let height = size.height as i32;
+    let dark = state.reader.preferences.dark_mode;
+    let bar_fill = if dark {
+        BinaryColor::Off
+    } else {
+        BinaryColor::On
+    };
+    let bar_ink = if dark {
+        BinaryColor::On
+    } else {
+        BinaryColor::Off
+    };
+    let top = height - 44;
+    Rectangle::new(Point::new(0, top), Size::new(size.width, 44))
+        .into_styled(PrimitiveStyle::with_fill(bar_fill))
+        .draw(display)?;
+    let style = state.display.text_style(UiTextRole::Body, bar_ink);
+    let shown = style.truncate(label, if width > height { 72 } else { 34 }, width - 16);
+    Text::new(&shown, Point::new(8, height - 14), style).draw(display)?;
+    Ok(())
 }
 
 pub fn render_toc(
@@ -906,8 +1001,8 @@ fn truncate(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         aligned_reader_line, bookmark_entry_columns, library_entry_columns, library_status,
-        render_bookmarks, render_continue_reading, render_library, render_loading, render_options,
-        render_preferences, render_toc, ReaderBodyGeometry,
+        reading_chrome, render_bookmarks, render_continue_reading, render_library, render_loading,
+        render_options, render_preferences, render_toc, ReaderBodyGeometry,
     };
     use crate::{
         app::AppState,
@@ -928,6 +1023,21 @@ mod tests {
         assert!(body.frame.bottom > body.text.bottom);
         assert_eq!(body.text.left, 24);
         assert_eq!(body.text.right, 456);
+    }
+
+    #[test]
+    fn immersive_page_hides_chrome_until_the_status_overlay() {
+        assert_eq!(reading_chrome(false, false), (true, true, true));
+        assert_eq!(reading_chrome(false, true), (true, true, true));
+        assert_eq!(reading_chrome(true, false), (false, false, false));
+        assert_eq!(reading_chrome(true, true), (false, true, false));
+        let mut prefs = crate::reader::ReaderPreferences::default();
+        prefs.immersive = true;
+        let body = ReaderBodyGeometry::edge_to_edge(480, 800, prefs.layout());
+        assert_eq!(body.text.left, 8);
+        assert_eq!(body.text.right, 472);
+        assert_eq!(body.text.top, 0);
+        assert_eq!(body.text.bottom, 800);
     }
 
     #[test]

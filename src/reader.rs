@@ -87,9 +87,14 @@ pub const READER_EPUB_INDEX_YIELD_MILLIS: u64 = 1;
 const READER_PERSISTENCE_VERSION: &str = "1";
 /// Bumped when the cache fingerprint gains a layout preference. Version 3 is
 /// the chapter-on-demand baseline (path, size, mtime, line count, line width,
-/// font, orientation, alignment). Version 4 also covers letter spacing, line
-/// and paragraph spacing, margins, indent, justification, and Chinese script.
-const READER_CACHE_VERSION: &str = "4";
+/// font, orientation, alignment). Version 4 adds letter spacing, line and
+/// paragraph spacing, margins, indent, justification, and Chinese script.
+/// Version 5 adds immersive reading, which changes the content box.
+const READER_CACHE_VERSION: &str = "5";
+/// How long a long-press status overlay stays on an immersive page.
+pub const IMMERSIVE_STATUS_MS: u64 = 2_500;
+/// Left and right inset while immersive. Top and bottom stay at the panel edge.
+const IMMERSIVE_SIDE_PX: u8 = 8;
 const READER_PREFS_VERSION: &str = "2";
 const READER_PREFS_VERSION_V1: &str = "1";
 const CACHE_FNV_OFFSET: u64 = 0xcbf29ce484222325;
@@ -1114,6 +1119,7 @@ pub struct ReaderLayout {
     pub paragraph_spacing: ParagraphSpacing,
     pub paragraph_alignment: ParagraphAlignment,
     pub chinese_script: crate::reader_hanzi::ChineseScript,
+    pub immersive: bool,
 }
 
 impl ReaderLayout {
@@ -1168,6 +1174,7 @@ pub struct ReaderPreferences {
     pub swap_page_keys: bool,
     pub long_press_chapter: bool,
     pub auto_page_turn: AutoPageTurn,
+    pub immersive: bool,
     sd_cjk_file: [u8; 13],
 }
 
@@ -1199,6 +1206,7 @@ impl Default for ReaderPreferences {
             swap_page_keys: false,
             long_press_chapter: false,
             auto_page_turn: AutoPageTurn::Off,
+            immersive: false,
             sd_cjk_file: [0; 13],
         }
     }
@@ -1322,6 +1330,7 @@ impl ReaderPreferences {
                 prefs.first_line_indent = false;
                 prefs.justified = true;
                 prefs.paragraph_alignment = ParagraphAlignment::Justified;
+                prefs.immersive = true;
             }
             ReadingPreset::Comfortable => {
                 prefs.font_size = BookFontSize::Px24;
@@ -1388,14 +1397,33 @@ impl ReaderPreferences {
     #[must_use]
     pub fn layout(self) -> ReaderLayout {
         let px = self.font_size.pixels();
-        let (base_width, base_height) = match self.orientation {
-            ReaderOrientation::Portrait => (432, 594),
-            ReaderOrientation::Landscape => (752, 300),
+        let (
+            base_width,
+            base_height,
+            margin_left_px,
+            margin_right_px,
+            margin_top_px,
+            margin_bottom_px,
+        ) = if self.immersive {
+            let (width, height) = match self.orientation {
+                ReaderOrientation::Portrait => (480, 800),
+                ReaderOrientation::Landscape => (800, 480),
+            };
+            (width, height, IMMERSIVE_SIDE_PX, IMMERSIVE_SIDE_PX, 0, 0)
+        } else {
+            let (width, height) = match self.orientation {
+                ReaderOrientation::Portrait => (432, 594),
+                ReaderOrientation::Landscape => (752, 300),
+            };
+            (
+                width,
+                height,
+                self.margin_left.pixels(),
+                self.margin_right.pixels(),
+                self.margin_top.pixels(),
+                self.margin_bottom.pixels(),
+            )
         };
-        let margin_left_px = self.margin_left.pixels();
-        let margin_right_px = self.margin_right.pixels();
-        let margin_top_px = self.margin_top.pixels();
-        let margin_bottom_px = self.margin_bottom.pixels();
         let width_px =
             (base_width - i32::from(margin_left_px) - i32::from(margin_right_px)).max(80);
         let height_px =
@@ -1436,13 +1464,14 @@ impl ReaderPreferences {
             paragraph_spacing: self.paragraph_spacing,
             paragraph_alignment: self.paragraph_alignment,
             chinese_script: self.chinese_script,
+            immersive: self.immersive,
         }
     }
 
     #[must_use]
     pub fn serialized(self) -> String {
         format!(
-            "version={}\ntheme={}\norientation={}\nfont_size={}\nbook_font={}\nletter_spacing={}\nline_spacing={}\nparagraph_spacing={}\nmargin_top={}\nmargin_bottom={}\nmargin_left={}\nmargin_right={}\nfirst_line_indent={}\njustified={}\nparagraph_alignment={}\nchinese={}\ndark_mode={}\nfull_refresh={}\nshow_progress={}\nstatus_page={}\nstatus_chapter={}\nstatus_time={}\nstatus_battery={}\nswap_page_keys={}\nlong_press_chapter={}\nauto_page_turn={}\n",
+            "version={}\ntheme={}\norientation={}\nfont_size={}\nbook_font={}\nletter_spacing={}\nline_spacing={}\nparagraph_spacing={}\nmargin_top={}\nmargin_bottom={}\nmargin_left={}\nmargin_right={}\nfirst_line_indent={}\njustified={}\nparagraph_alignment={}\nchinese={}\nimmersive={}\ndark_mode={}\nfull_refresh={}\nshow_progress={}\nstatus_page={}\nstatus_chapter={}\nstatus_time={}\nstatus_battery={}\nswap_page_keys={}\nlong_press_chapter={}\nauto_page_turn={}\n",
             READER_PREFS_VERSION,
             self.theme.marker(),
             self.orientation.marker(),
@@ -1459,6 +1488,7 @@ impl ReaderPreferences {
             bool_marker(self.justified),
             self.paragraph_alignment.marker(),
             self.chinese_script.marker(),
+            bool_marker(self.immersive),
             bool_marker(self.dark_mode),
             self.full_refresh.marker(),
             bool_marker(self.status_page),
@@ -1515,6 +1545,7 @@ impl ReaderPreferences {
                 "chinese" => {
                     prefs.chinese_script = crate::reader_hanzi::ChineseScript::parse(value)?
                 }
+                "immersive" => prefs.immersive = parse_bool("immersive", value)?,
                 "dark_mode" => prefs.dark_mode = parse_bool("dark_mode", value)?,
                 "full_refresh" => prefs.full_refresh = FullRefreshEvery::parse(value)?,
                 "show_progress" => {
@@ -1571,6 +1602,18 @@ pub fn map_page_turn_event(event: ButtonEvent, swap: bool) -> ButtonEvent {
         ButtonEvent::Down => ButtonEvent::Up,
         other => other,
     }
+}
+
+/// Long-press SELECT on an immersive page reveals progress without opening a menu.
+#[must_use]
+pub fn show_immersive_status(event: ButtonEvent, held_ms: u32, immersive: bool) -> bool {
+    immersive && event == ButtonEvent::Select && held_ms >= crate::buttons::KEY_LONG_PRESS_MS
+}
+
+/// The status overlay is still on screen for this many milliseconds after it appeared.
+#[must_use]
+pub const fn immersive_status_visible(elapsed_ms: u64) -> bool {
+    elapsed_ms < IMMERSIVE_STATUS_MS
 }
 
 /// Long-press direction for a chapter jump. `Some(true)` moves forward.
@@ -2833,6 +2876,7 @@ pub enum ReadingPreference {
     Orientation,
     ParagraphAlignment,
     ReadingTheme,
+    Immersive,
     DarkMode,
     FullRefresh,
     StatusPage,
@@ -2871,7 +2915,12 @@ impl ReadingPreference {
         Self::Orientation,
         Self::ParagraphAlignment,
     ];
-    const DISPLAY: [Self; 3] = [Self::ReadingTheme, Self::DarkMode, Self::FullRefresh];
+    const DISPLAY: [Self; 4] = [
+        Self::Immersive,
+        Self::ReadingTheme,
+        Self::DarkMode,
+        Self::FullRefresh,
+    ];
     const STATUS: [Self; 4] = [
         Self::StatusPage,
         Self::StatusChapter,
@@ -2919,6 +2968,7 @@ impl ReadingPreference {
             Self::StatusMenu => "Status Bar",
             Self::ControlsMenu => "Controls",
             Self::ReadingTheme => "Reading Theme",
+            Self::Immersive => "Immersive",
             Self::Orientation => "Orientation",
             Self::BookFontSize => "Book Font Size",
             Self::BookFont => "Book Font",
@@ -3935,6 +3985,12 @@ impl ReaderUiState {
                     "Chinese: {}",
                     self.preferences.chinese_script.label()
                 ));
+                true
+            }
+            ReadingPreference::Immersive => {
+                self.preferences.immersive = !self.preferences.immersive;
+                self.last_message =
+                    Some(format!("Immersive: {}", on_off(self.preferences.immersive)));
                 true
             }
             ReadingPreference::ReadingTheme => {
@@ -5037,7 +5093,7 @@ fn feed_cache_bytes(hash: &mut u64, bytes: &[u8]) {
     }
 }
 
-/// Hash preferences that change line breaks or the displayed script.
+/// Hash preferences that change line breaks, the displayed script, or immersive chrome.
 ///
 /// EPUB chapter caches call [`book_fingerprint`] and then mix in the chapter
 /// range, so this helper is the only place those preferences are recorded.
@@ -5055,6 +5111,15 @@ fn feed_layout_preferences(hash: &mut u64, layout: &ReaderLayout) {
     feed_cache_bytes(hash, layout.line_spacing.marker().as_bytes());
     feed_cache_bytes(hash, layout.paragraph_spacing.marker().as_bytes());
     feed_cache_bytes(hash, layout.chinese_script.marker().as_bytes());
+    feed_cache_bytes(hash, &[u8::from(layout.immersive)]);
+    feed_cache_bytes(
+        hash,
+        if layout.immersive {
+            b"immersive"
+        } else {
+            b"chrome"
+        },
+    );
 }
 
 fn book_fingerprint(book: &ReaderBook, layout: ReaderLayout) -> u64 {
@@ -5539,9 +5604,10 @@ mod tests {
     use super::{
         atomic_replace_text, auto_page_turn_keeps_awake, book_format_from_path,
         chapter_cache_fingerprint, chapter_jump_forward, detect_txt_encoding,
-        is_fat83_safe_file_name, load_location_record, map_page_turn_event, normalize_decoded,
-        paginate_decoded, parse_anchor_cache, parse_location_fields, parse_location_record,
-        poll_auto_page_turn, scan_txt_library, serialize_location, serialize_location_fields,
+        immersive_status_visible, is_fat83_safe_file_name, load_location_record,
+        map_page_turn_event, normalize_decoded, paginate_decoded, parse_anchor_cache,
+        parse_location_fields, parse_location_record, poll_auto_page_turn, scan_txt_library,
+        serialize_location, serialize_location_fields, show_immersive_status,
         with_layout_button_poll, AutoPageTurn, AutoTurnClock, BookFont, BookFontSize, BookFormat,
         FullRefreshEvery, LetterSpacing, LineSpacing, PageMargin, ParagraphAlignment,
         ParagraphSpacing, ReaderBook, ReaderChapterPageLabel, ReaderLoadingStage, ReaderLocation,
@@ -6878,7 +6944,7 @@ mod tests {
             chapter_cache_fingerprint(&book, base.layout(), 1, 0, 40),
             chapter_cache_fingerprint(&book, tracked.layout(), 1, 0, 40)
         );
-        assert_eq!(READER_CACHE_VERSION, "4");
+        assert_eq!(READER_CACHE_VERSION, "5");
     }
 
     #[test]
@@ -6890,10 +6956,63 @@ mod tests {
             size_bytes: 40,
             modified_seconds: 1,
         };
-        let text = "version=3\nfingerprint=0000000000000001\nbase_page=0\nindexed_through=1\ncomplete=false\noffset=0\n";
-        let error =
-            parse_anchor_cache(text, &book, ReaderPreferences::default().layout()).unwrap_err();
-        assert_eq!(error, "unsupported cache version");
+        for version in ["3", "4"] {
+            let text = format!(
+                "version={version}\nfingerprint=0000000000000001\nbase_page=0\nindexed_through=1\ncomplete=false\noffset=0\n"
+            );
+            let error = parse_anchor_cache(&text, &book, ReaderPreferences::default().layout())
+                .unwrap_err();
+            assert_eq!(error, "unsupported cache version");
+        }
+    }
+
+    #[test]
+    fn immersive_reading_fills_the_panel_and_changes_cache_keys() {
+        let chrome = ReaderPreferences {
+            margin_top: PageMargin::Px24,
+            margin_bottom: PageMargin::Px24,
+            margin_left: PageMargin::Px16,
+            margin_right: PageMargin::Px16,
+            ..ReaderPreferences::default()
+        };
+        let mut full = chrome;
+        full.immersive = true;
+        let layout = full.layout();
+        assert!(layout.immersive);
+        assert!(layout.lines_per_page > chrome.layout().lines_per_page);
+        assert!(layout.max_line_width_px > chrome.layout().max_line_width_px);
+        assert_eq!(layout.margin_top_px, 0);
+        assert_eq!(layout.margin_bottom_px, 0);
+        assert_eq!(layout.margin_left_px, 8);
+        assert_eq!(layout.margin_right_px, 8);
+        assert_eq!(chrome.margin_top, PageMargin::Px24);
+        let book = ReaderBook {
+            path: "BOOK.TXT".into(),
+            title: "Book".into(),
+            format: BookFormat::Text,
+            size_bytes: 40,
+            modified_seconds: 1,
+        };
+        assert_ne!(
+            ReaderUiState::cache_file_name_for(&book, chrome.layout()),
+            ReaderUiState::cache_file_name_for(&book, layout)
+        );
+        assert_ne!(
+            chapter_cache_fingerprint(&book, chrome.layout(), 0, 0, 40),
+            chapter_cache_fingerprint(&book, layout, 0, 0, 40)
+        );
+        let landscape = ReaderPreferences {
+            immersive: true,
+            orientation: ReaderOrientation::Landscape,
+            ..ReaderPreferences::default()
+        };
+        assert!(landscape.layout().max_line_width_px > layout.max_line_width_px);
+        assert!(show_immersive_status(ButtonEvent::Select, 600, true));
+        assert!(!show_immersive_status(ButtonEvent::Select, 599, true));
+        assert!(!show_immersive_status(ButtonEvent::Select, 900, false));
+        assert!(!show_immersive_status(ButtonEvent::Down, 900, true));
+        assert!(immersive_status_visible(2_499));
+        assert!(!immersive_status_visible(2_500));
     }
 
     #[test]
@@ -6919,12 +7038,13 @@ mod tests {
             legacy.chinese_script,
             crate::reader_hanzi::ChineseScript::Original
         );
+        assert!(!legacy.immersive);
         let stored = legacy.serialized();
         assert!(stored.starts_with("version=2\n"));
         assert_eq!(ReaderPreferences::parse(&stored).unwrap(), legacy);
 
         let modern = ReaderPreferences::parse(
-            "version=2\ntheme=classic\norientation=portrait\nfont_size=24\nbook_font=serif\nletter_spacing=1\nline_spacing=8\nparagraph_spacing=2\nmargin_top=8\nmargin_bottom=16\nmargin_left=24\nmargin_right=0\nfirst_line_indent=true\njustified=false\nparagraph_alignment=center\nchinese=traditional\ndark_mode=true\nfull_refresh=10\nshow_progress=true\nstatus_page=true\nstatus_chapter=false\nstatus_time=true\nstatus_battery=true\nswap_page_keys=true\nlong_press_chapter=true\nauto_page_turn=60\n",
+            "version=2\ntheme=classic\norientation=portrait\nfont_size=24\nbook_font=serif\nletter_spacing=1\nline_spacing=8\nparagraph_spacing=2\nmargin_top=8\nmargin_bottom=16\nmargin_left=24\nmargin_right=0\nfirst_line_indent=true\njustified=false\nparagraph_alignment=center\nchinese=traditional\nimmersive=true\ndark_mode=true\nfull_refresh=10\nshow_progress=true\nstatus_page=true\nstatus_chapter=false\nstatus_time=true\nstatus_battery=true\nswap_page_keys=true\nlong_press_chapter=true\nauto_page_turn=60\n",
         )
         .unwrap();
         assert_eq!(modern.line_spacing, LineSpacing::Px8);
@@ -6934,6 +7054,7 @@ mod tests {
         assert!(modern.first_line_indent);
         assert!(!modern.justified);
         assert_eq!(modern.paragraph_alignment, ParagraphAlignment::Center);
+        assert!(modern.immersive);
         assert!(modern.dark_mode);
         assert!(modern.status_time);
         assert!(!modern.status_chapter);
@@ -6954,12 +7075,14 @@ mod tests {
         assert_eq!(prefs.matching_preset(), None);
         let applied = prefs.cycle_preset();
         assert_eq!(applied, ReadingPreset::Compact);
+        assert!(prefs.immersive);
         assert_eq!(prefs.font_size, BookFontSize::Px20);
         assert!(!prefs.first_line_indent);
         assert_eq!(prefs.letter_spacing, LetterSpacing::Px0);
         assert!(prefs.dark_mode);
         assert!(prefs.swap_page_keys);
         assert_eq!(prefs.cycle_preset(), ReadingPreset::Comfortable);
+        assert!(!prefs.immersive);
         assert_eq!(prefs.font_size, BookFontSize::Px24);
         assert_eq!(prefs.letter_spacing, LetterSpacing::Px1);
         assert_eq!(prefs.line_spacing, LineSpacing::Px4);
@@ -6968,6 +7091,7 @@ mod tests {
         assert!(prefs.first_line_indent);
         assert!(prefs.justified);
         assert_eq!(prefs.cycle_preset(), ReadingPreset::LargePrint);
+        assert!(!prefs.immersive);
         assert_eq!(prefs.font_size, BookFontSize::Px48);
         assert_eq!(prefs.letter_spacing, LetterSpacing::Px2);
         assert_eq!(prefs.line_spacing, LineSpacing::Px12);

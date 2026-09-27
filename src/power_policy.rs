@@ -381,6 +381,7 @@ pub struct WaitInput {
     pub status_due_ms: Option<u64>,
     pub weread_due_ms: Option<u64>,
     pub auto_turn_due_ms: Option<u64>,
+    pub status_overlay_due_ms: Option<u64>,
 }
 
 #[must_use]
@@ -413,6 +414,9 @@ pub fn next_block_ms(input: WaitInput) -> u64 {
         limit = limit.min(due.max(1));
     }
     if let Some(due) = input.auto_turn_due_ms {
+        limit = limit.min(due.max(1));
+    }
+    if let Some(due) = input.status_overlay_due_ms {
         limit = limit.min(due.max(1));
     }
     limit.clamp(1, MAX_BLOCK_MS)
@@ -980,6 +984,7 @@ mod tests {
             status_due_ms: Some(30_000),
             weread_due_ms: None,
             auto_turn_due_ms: None,
+            status_overlay_due_ms: None,
         };
         let turning = WaitInput {
             auto_turn_due_ms: Some(40),

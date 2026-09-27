@@ -1,4 +1,4 @@
-//! Optional NVS mirror of Reader font preferences.
+//! Optional NVS mirror of Reader font and letter-spacing preferences.
 //!
 //! SD `/RUSTMIX/READER/PREFS.TXT` remains authoritative. NVS is a fallback when
 //! the card is missing and a boot-time restore source after a prefs parse error.
@@ -8,7 +8,7 @@
 use crate::reader::ReaderPreferences;
 
 #[cfg(target_os = "espidf")]
-use crate::reader::{BookFont, BookFontSize};
+use crate::reader::{BookFont, BookFontSize, LetterSpacing};
 
 #[allow(dead_code)]
 const NVS_NAMESPACE: &str = "rw_read";
@@ -16,6 +16,8 @@ const NVS_NAMESPACE: &str = "rw_read";
 const KEY_FONT_SIZE: &str = "font_px";
 #[allow(dead_code)]
 const KEY_BOOK_FONT: &str = "font_face";
+#[allow(dead_code)]
+const KEY_LETTER_SPACING: &str = "letter_px";
 
 pub fn save_reader_preferences(prefs: &ReaderPreferences) {
     #[cfg(target_os = "espidf")]
@@ -57,6 +59,7 @@ fn save_espidf(prefs: &ReaderPreferences) {
         }
         let size_key = CString::new(KEY_FONT_SIZE).expect("nvs size key");
         let face_key = CString::new(KEY_BOOK_FONT).expect("nvs face key");
+        let spacing_key = CString::new(KEY_LETTER_SPACING).expect("nvs spacing key");
         let face = CString::new(prefs.nvs_face_marker())
             .unwrap_or_else(|_| CString::new("serif").unwrap());
         let _ = nvs_set_i32(
@@ -65,13 +68,19 @@ fn save_espidf(prefs: &ReaderPreferences) {
             i32::from(prefs.font_size.pixels()),
         );
         let _ = nvs_set_str(handle, face_key.as_ptr(), face.as_ptr());
+        let _ = nvs_set_i32(
+            handle,
+            spacing_key.as_ptr(),
+            i32::from(prefs.letter_spacing.pixels()),
+        );
         let _ = nvs_commit(handle);
         nvs_close(handle);
         let _ = CStr::from_ptr(ns.as_ptr());
         log::info!(
-            "rustmix-wave=reader-nvs status=saved font-size={} book-font={}",
+            "rustmix-wave=reader-nvs status=saved font-size={} book-font={} letter-spacing={}",
             prefs.font_size.marker(),
-            prefs.nvs_face_marker()
+            prefs.nvs_face_marker(),
+            prefs.letter_spacing.marker()
         );
     }
 }
@@ -100,6 +109,16 @@ fn load_espidf(prefs: &mut ReaderPreferences) -> bool {
             }
         }
         let face_key = CString::new(KEY_BOOK_FONT).expect("nvs face key");
+        let spacing_key = CString::new(KEY_LETTER_SPACING).expect("nvs spacing key");
+        let mut spacing: i32 = 0;
+        if nvs_get_i32(handle, spacing_key.as_ptr(), &mut spacing) == ESP_OK {
+            if (0..=4).contains(&spacing) {
+                if let Ok(step) = LetterSpacing::from_pixels(spacing as u8) {
+                    prefs.letter_spacing = step;
+                    changed = true;
+                }
+            }
+        }
         // ESP-IDF 5.4 bindings use unsigned `c_char` on Xtensa.
         let mut buf = [0u8; 40];
         let mut len = buf.len();

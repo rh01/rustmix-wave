@@ -353,7 +353,8 @@ pub fn render_page(
         state.reader.preferences.book_font,
         state.reader.preferences.font_size,
         state.reader.preferences.theme,
-    );
+    )
+    .with_tracking(session.layout.letter_spacing_px);
     let ui_body = state.display.body_style();
     let ui_detail = state.display.detail_style();
     let heading = state.display.header_title_style();
@@ -596,6 +597,7 @@ pub fn render_preferences(
             ReadingPreference::Orientation => state.reader.preferences.orientation.label(),
             ReadingPreference::BookFontSize => state.reader.preferences.font_size.label(),
             ReadingPreference::BookFont => font_label.as_str(),
+            ReadingPreference::LetterSpacing => state.reader.preferences.letter_spacing.label(),
             ReadingPreference::ParagraphAlignment => {
                 state.reader.preferences.paragraph_alignment.label()
             }
@@ -605,7 +607,7 @@ pub fn render_preferences(
         draw_row(
             display,
             state,
-            156 + index as i32 * 78,
+            148 + index as i32 * 68,
             state.reader.preferences_selected == index,
             preference.label(),
             badge,

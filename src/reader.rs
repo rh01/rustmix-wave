@@ -589,6 +589,99 @@ impl BookFont {
     }
 }
 
+/// Extra advance between glyphs, in e-paper pixels. Zero keeps the historical
+/// wrap. CJK and Latin both receive the same extra advance.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LetterSpacing {
+    #[default]
+    Px0,
+    Px1,
+    Px2,
+    Px3,
+    Px4,
+}
+
+impl LetterSpacing {
+    pub const ALL: [Self; 5] = [Self::Px0, Self::Px1, Self::Px2, Self::Px3, Self::Px4];
+
+    #[must_use]
+    pub const fn pixels(self) -> u8 {
+        match self {
+            Self::Px0 => 0,
+            Self::Px1 => 1,
+            Self::Px2 => 2,
+            Self::Px3 => 3,
+            Self::Px4 => 4,
+        }
+    }
+
+    pub fn from_pixels(px: u8) -> Result<Self, String> {
+        match px {
+            0 => Ok(Self::Px0),
+            1 => Ok(Self::Px1),
+            2 => Ok(Self::Px2),
+            3 => Ok(Self::Px3),
+            4 => Ok(Self::Px4),
+            other => Err(format!("unsupported letter_spacing value {other}")),
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Px0 => "0 px",
+            Self::Px1 => "1 px",
+            Self::Px2 => "2 px",
+            Self::Px3 => "3 px",
+            Self::Px4 => "4 px",
+        }
+    }
+
+    #[must_use]
+    pub const fn marker(self) -> &'static str {
+        match self {
+            Self::Px0 => "0",
+            Self::Px1 => "1",
+            Self::Px2 => "2",
+            Self::Px3 => "3",
+            Self::Px4 => "4",
+        }
+    }
+
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Px0 => Self::Px1,
+            Self::Px1 => Self::Px2,
+            Self::Px2 => Self::Px3,
+            Self::Px3 => Self::Px4,
+            Self::Px4 => Self::Px0,
+        }
+    }
+
+    #[must_use]
+    pub const fn previous(self) -> Self {
+        match self {
+            Self::Px0 => Self::Px4,
+            Self::Px1 => Self::Px0,
+            Self::Px2 => Self::Px1,
+            Self::Px3 => Self::Px2,
+            Self::Px4 => Self::Px3,
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "0" | "tight" => Ok(Self::Px0),
+            "1" | "normal" => Ok(Self::Px1),
+            "2" | "loose" => Ok(Self::Px2),
+            "3" => Ok(Self::Px3),
+            "4" | "extra" => Ok(Self::Px4),
+            other => Err(format!("unsupported letter_spacing value {other:?}")),
+        }
+    }
+}
+
 /// Reader paragraph alignment. Justified is the default e-book presentation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ParagraphAlignment {
@@ -659,10 +752,26 @@ pub struct ReaderLayout {
     pub max_line_width_px: i32,
     pub ascii_advance_px: i32,
     pub font_size_px: u8,
+    pub letter_spacing_px: u8,
     pub orientation: ReaderOrientation,
     pub font_size: BookFontSize,
     pub book_font: BookFont,
+    pub letter_spacing: LetterSpacing,
     pub paragraph_alignment: ParagraphAlignment,
+}
+
+impl ReaderLayout {
+    /// Glyph advance for TXT, EPUB, and WeRead pagination. Letter spacing is
+    /// added for every character, Latin and CJK alike.
+    #[must_use]
+    pub fn advance_px(self, character: char) -> i32 {
+        let base = if character.is_ascii() {
+            self.ascii_advance_px
+        } else {
+            crate::fonts::unicode_advance(character, self.font_size_px, self.ascii_advance_px as u8)
+        };
+        base.saturating_add(i32::from(self.letter_spacing_px))
+    }
 }
 
 /// Reader-owned preference file persisted as `/RUSTMIX/READER/PREFS.TXT`.
@@ -672,6 +781,7 @@ pub struct ReaderPreferences {
     pub orientation: ReaderOrientation,
     pub font_size: BookFontSize,
     pub book_font: BookFont,
+    pub letter_spacing: LetterSpacing,
     pub paragraph_alignment: ParagraphAlignment,
     pub show_progress: bool,
     sd_cjk_file: [u8; 13],
@@ -684,6 +794,7 @@ impl Default for ReaderPreferences {
             orientation: ReaderOrientation::Portrait,
             font_size: BookFontSize::Px24,
             book_font: BookFont::Serif,
+            letter_spacing: LetterSpacing::Px0,
             paragraph_alignment: ParagraphAlignment::Justified,
             show_progress: true,
             sd_cjk_file: [0; 13],
@@ -754,16 +865,22 @@ impl ReaderPreferences {
             BookFont::CjkUnifont | BookFont::SdCjk => (i32::from(px) / 2).max(6),
             _ => (i32::from(px) * 11 / 20).max(6),
         };
-        let chars_per_line = (width_px / ascii_advance_px).max(8) as usize;
+        let letter_spacing_px = self.letter_spacing.pixels();
+        let tracked_ascii = ascii_advance_px
+            .saturating_add(i32::from(letter_spacing_px))
+            .max(1);
+        let chars_per_line = (width_px / tracked_ascii).max(8) as usize;
         ReaderLayout {
             chars_per_line,
             lines_per_page,
             max_line_width_px: width_px,
             ascii_advance_px,
             font_size_px: px,
+            letter_spacing_px,
             orientation: self.orientation,
             font_size: self.font_size,
             book_font: self.book_font,
+            letter_spacing: self.letter_spacing,
             paragraph_alignment: self.paragraph_alignment,
         }
     }
@@ -772,12 +889,13 @@ impl ReaderPreferences {
     pub fn serialized(self) -> String {
         let show_progress = if self.show_progress { "true" } else { "false" };
         format!(
-            "version={}\ntheme={}\norientation={}\nfont_size={}\nbook_font={}\nparagraph_alignment={}\nshow_progress={}\n",
+            "version={}\ntheme={}\norientation={}\nfont_size={}\nbook_font={}\nletter_spacing={}\nparagraph_alignment={}\nshow_progress={}\n",
             READER_PREFS_VERSION,
             self.theme.marker(),
             self.orientation.marker(),
             self.font_size.marker(),
             self.nvs_face_marker(),
+            self.letter_spacing.marker(),
             self.paragraph_alignment.marker(),
             show_progress,
         )
@@ -803,6 +921,7 @@ impl ReaderPreferences {
                     let parsed = BookFont::parse(value)?;
                     prefs.apply_parsed_book_font(parsed, value);
                 }
+                "letter_spacing" => prefs.letter_spacing = LetterSpacing::parse(value)?,
                 "paragraph_alignment" => {
                     prefs.paragraph_alignment = ParagraphAlignment::parse(value)?
                 }
@@ -1935,14 +2054,16 @@ pub enum ReadingPreference {
     Orientation,
     BookFontSize,
     BookFont,
+    LetterSpacing,
     ParagraphAlignment,
     ShowProgress,
 }
 
 impl ReadingPreference {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::BookFontSize,
         Self::BookFont,
+        Self::LetterSpacing,
         Self::ReadingTheme,
         Self::Orientation,
         Self::ParagraphAlignment,
@@ -1956,6 +2077,7 @@ impl ReadingPreference {
             Self::Orientation => "Orientation",
             Self::BookFontSize => "Book Font Size",
             Self::BookFont => "Book Font",
+            Self::LetterSpacing => "Letter Spacing",
             Self::ParagraphAlignment => "Paragraph Alignment",
             Self::ShowProgress => "Show Progress",
         }
@@ -2851,6 +2973,14 @@ impl ReaderUiState {
                 self.last_message = Some(format!("Book font: {}", self.book_font_display_label()));
                 true
             }
+            ReadingPreference::LetterSpacing => {
+                self.preferences.letter_spacing = self.preferences.letter_spacing.next();
+                self.last_message = Some(format!(
+                    "Letter spacing: {}",
+                    self.preferences.letter_spacing.label()
+                ));
+                true
+            }
             ReadingPreference::ParagraphAlignment => {
                 self.preferences.paragraph_alignment = self.preferences.paragraph_alignment.next();
                 self.last_message = Some(format!(
@@ -3629,19 +3759,7 @@ fn paginate_decoded(decoded: &[(char, u64)], layout: ReaderLayout) -> (Vec<Reade
             value if value.is_control() => ' ',
             value => value,
         };
-        let advance = if character.is_ascii() {
-            if character == ' ' {
-                layout.ascii_advance_px
-            } else {
-                layout.ascii_advance_px
-            }
-        } else {
-            crate::fonts::unicode_advance(
-                character,
-                layout.font_size_px,
-                layout.ascii_advance_px as u8,
-            )
-        };
+        let advance = layout.advance_px(character);
         if !line.is_empty() && line_width + advance > layout.max_line_width_px {
             lines.push(ReaderPageLine {
                 text: core::mem::take(&mut line),
@@ -3765,9 +3883,11 @@ fn book_fingerprint(book: &ReaderBook, layout: ReaderLayout) -> u64 {
     feed(&mut hash, &layout.chars_per_line.to_le_bytes());
     feed(&mut hash, &layout.max_line_width_px.to_le_bytes());
     feed(&mut hash, &layout.font_size_px.to_le_bytes());
+    feed(&mut hash, &layout.letter_spacing_px.to_le_bytes());
     feed(&mut hash, layout.orientation.marker().as_bytes());
     feed(&mut hash, layout.font_size.marker().as_bytes());
     feed(&mut hash, layout.book_font.marker().as_bytes());
+    feed(&mut hash, layout.letter_spacing.marker().as_bytes());
     feed(&mut hash, layout.paragraph_alignment.marker().as_bytes());
     feed(&mut hash, READER_CACHE_VERSION.as_bytes());
     hash
@@ -4237,11 +4357,11 @@ mod tests {
         atomic_replace_text, book_format_from_path, detect_txt_encoding, is_fat83_safe_file_name,
         load_location_record, normalize_decoded, paginate_decoded, parse_location_fields,
         parse_location_record, scan_txt_library, serialize_location, serialize_location_fields,
-        with_layout_button_poll, BookFont, BookFontSize, BookFormat, ParagraphAlignment,
-        ReaderBook, ReaderChapterPageLabel, ReaderLoadingStage, ReaderLocation, ReaderOrientation,
-        ReaderPreferences, ReaderSession, ReaderTickOutcome, ReaderUiState, ReadingPreference,
-        ReadingTheme, TextEncoding, LEGACY_READER_POSITIONS_FILE, READER_BOOKMARKS_FILE,
-        READER_CACHE_OFFSET_LIMIT, READER_EPUB_ANCHOR_INDEX_BYTES_LIMIT,
+        with_layout_button_poll, BookFont, BookFontSize, BookFormat, LetterSpacing,
+        ParagraphAlignment, ReaderBook, ReaderChapterPageLabel, ReaderLoadingStage,
+        ReaderLocation, ReaderOrientation, ReaderPreferences, ReaderSession, ReaderTickOutcome,
+        ReaderUiState, ReadingPreference, ReadingTheme, TextEncoding, LEGACY_READER_POSITIONS_FILE,
+        READER_BOOKMARKS_FILE, READER_CACHE_OFFSET_LIMIT, READER_EPUB_ANCHOR_INDEX_BYTES_LIMIT,
         READER_EPUB_INDEX_YIELD_EVERY_PAGES, READER_EPUB_INDEX_YIELD_MILLIS,
         READER_EPUB_PAGE_ANCHOR_LIMIT, READER_POSITIONS_FILE, READER_PREFS_FILE,
         READER_RECENT_FILE, READER_STATE_FILE,
@@ -4568,10 +4688,88 @@ mod tests {
         assert_eq!(parsed.font_size, BookFontSize::Px48);
         assert_eq!(parsed.book_font, BookFont::Serif);
         assert_eq!(parsed.paragraph_alignment, ParagraphAlignment::Right);
+        assert_eq!(parsed.letter_spacing, LetterSpacing::Px0);
         assert!(!parsed.show_progress);
         assert!(parsed.serialized().contains("font_size=48"));
         assert!(parsed.serialized().contains("book_font=serif"));
+        assert!(parsed.serialized().contains("letter_spacing=0"));
         assert!(parsed.serialized().contains("paragraph_alignment=right"));
+    }
+
+    #[test]
+    fn letter_spacing_persists_changes_wrap_and_cache_keys() {
+        let parsed = ReaderPreferences::parse(
+            "version=1\ntheme=classic\norientation=portrait\nfont_size=24\nbook_font=cjk-unifont\nletter_spacing=extra\nparagraph_alignment=left\nshow_progress=true\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.letter_spacing, LetterSpacing::Px4);
+        assert_eq!(
+            ReaderPreferences::parse(&parsed.serialized())
+                .unwrap()
+                .letter_spacing,
+            LetterSpacing::Px4
+        );
+        assert_eq!(LetterSpacing::Px0.next(), LetterSpacing::Px1);
+        assert_eq!(LetterSpacing::Px4.next(), LetterSpacing::Px0);
+        assert_eq!(LetterSpacing::parse("tight").unwrap(), LetterSpacing::Px0);
+        assert_eq!(LetterSpacing::parse("loose").unwrap(), LetterSpacing::Px2);
+
+        let tight = ReaderPreferences {
+            book_font: BookFont::CjkUnifont,
+            letter_spacing: LetterSpacing::Px0,
+            ..ReaderPreferences::default()
+        };
+        let loose = ReaderPreferences {
+            letter_spacing: LetterSpacing::Px4,
+            ..tight
+        };
+        assert_ne!(tight.layout(), loose.layout());
+        assert_eq!(loose.layout().letter_spacing_px, 4);
+        assert_eq!(
+            loose.layout().advance_px('A') - tight.layout().advance_px('A'),
+            4
+        );
+        assert_eq!(
+            loose.layout().advance_px('中') - tight.layout().advance_px('中'),
+            4
+        );
+        let book = ReaderBook {
+            path: "BOOK.TXT".into(),
+            title: "Book".into(),
+            format: BookFormat::Text,
+            size_bytes: 100,
+            modified_seconds: 1,
+        };
+        assert_ne!(
+            ReaderUiState::cache_file_name_for(&book, tight.layout()),
+            ReaderUiState::cache_file_name_for(&book, loose.layout())
+        );
+
+        let latin: Vec<(char, u64)> = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd"
+            .chars()
+            .enumerate()
+            .map(|(index, value)| (value, index as u64 + 1))
+            .collect();
+        let (tight_latin, _) = paginate_decoded(&latin, tight.layout());
+        let (loose_latin, _) = paginate_decoded(&latin, loose.layout());
+        assert!(
+            loose_latin[0].text.chars().count() < tight_latin[0].text.chars().count(),
+            "latin extra advance should wrap sooner"
+        );
+
+        let cjk: Vec<(char, u64)> = "中"
+            .repeat(24)
+            .chars()
+            .enumerate()
+            .map(|(index, value)| (value, index as u64 + 1))
+            .collect();
+        let (tight_cjk, _) = paginate_decoded(&cjk, tight.layout());
+        let (loose_cjk, _) = paginate_decoded(&cjk, loose.layout());
+        assert!(tight_cjk[0].text.contains('中'));
+        assert!(
+            loose_cjk[0].text.chars().count() < tight_cjk[0].text.chars().count(),
+            "cjk extra advance should wrap sooner"
+        );
     }
 
     #[test]
@@ -4595,6 +4793,38 @@ mod tests {
             Some(ReaderLoadingStage::UpdatingLayout)
         );
         assert!(state.join(READER_PREFS_FILE).exists());
+    }
+
+    #[test]
+    fn letter_spacing_change_rebuilds_the_open_page() {
+        let root = temp_dir("spacing-books");
+        let state = temp_dir("spacing-state");
+        fs::write(root.join("Book.txt"), "hello world ".repeat(800)).unwrap();
+        let mut reader = ReaderUiState::with_roots(
+            root.to_string_lossy().into_owned(),
+            state.to_string_lossy().into_owned(),
+        );
+        reader.refresh_library();
+        reader.library_selected = 1;
+        assert!(reader.apply_library_button(ButtonEvent::Select));
+        assert_eq!(reader.tick(), ReaderTickOutcome::LoadingStageChanged);
+        assert_eq!(reader.tick(), ReaderTickOutcome::LoadingStageChanged);
+        assert_eq!(reader.tick(), ReaderTickOutcome::FirstPageReady);
+        reader.begin_preferences_edit();
+        reader.cycle_preference_next();
+        reader.cycle_preference_next();
+        assert_eq!(
+            reader.selected_preference(),
+            ReadingPreference::LetterSpacing
+        );
+        assert!(reader.activate_selected_preference());
+        assert_eq!(reader.preferences.letter_spacing, LetterSpacing::Px1);
+        assert_eq!(
+            reader.loading_stage(),
+            Some(ReaderLoadingStage::UpdatingLayout)
+        );
+        let prefs = fs::read_to_string(state.join(READER_PREFS_FILE)).unwrap();
+        assert!(prefs.contains("letter_spacing=1"));
     }
 
     #[test]

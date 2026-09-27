@@ -265,7 +265,8 @@ pub fn render_read(
         state.reader.preferences.book_font,
         state.reader.preferences.font_size,
         state.reader.preferences.theme,
-    );
+    )
+    .with_tracking(state.reader.preferences.letter_spacing.pixels());
     let line_step = i32::from(body.line_height()) + 2;
     if let Some(page) = weread.pages.get(weread.page_index) {
         for (index, line) in page.iter().enumerate() {

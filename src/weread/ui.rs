@@ -676,7 +676,7 @@ impl WereadUi {
         self.page_index = self.page_index.min(self.pages.len().saturating_sub(1));
     }
 
-    /// Rebuild the open chapter after the shared reader font or size changes.
+    /// Rebuild the open chapter after a shared reader layout change.
     pub fn repaginate(&mut self, layout: ReaderLayout) {
         if self.chapter_source.is_empty() {
             self.paginated_layout = None;
@@ -2056,6 +2056,21 @@ mod tests {
             ui.on_button(ScreenRoute::WeReadRead, ButtonEvent::Select, layout, false),
             Some(ScreenRoute::ReaderPreferences)
         );
+    }
+
+    #[test]
+    fn letter_spacing_repaginates_like_a_font_change() {
+        let mut ui = signed_in();
+        let text = "中".repeat(80) + &"abcd ".repeat(80);
+        let tight = ReaderPreferences::default();
+        ui.show_text(&text, tight.layout());
+        let tight_line = ui.pages[0][0].text.chars().count();
+        let mut loose = tight;
+        loose.letter_spacing = crate::reader::LetterSpacing::Px4;
+        assert!(ui.sync_layout(loose.layout()));
+        assert!(ui.pages[0][0].text.chars().count() < tight_line);
+        assert_eq!(ui.chapter_source, text);
+        assert!(!ui.sync_layout(loose.layout()));
     }
 
     #[test]

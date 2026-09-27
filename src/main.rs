@@ -758,13 +758,13 @@ mod firmware {
         info!("rustmix-wave=reader-loading-ui-ready stages=open,encoding,resume,first-page,cache cancel=boot-long-press refresh=coarse-stage-boundaries");
         info!("rustmix-wave=reader-options-shell-ready toc=none-for-txt,list-for-epub bookmarks=persistent clear-ghosting=manual-global-refresh");
         info!("rustmix-wave=reader-ux-repair-ready menu=continue,library,bookmarks-ready normalization=utf8-punctuation,latin1,underscore-emphasis byte-offsets=preserved");
-        info!("rustmix-wave=reader-preferences-ready path=/sdcard/RUSTMIX/READER/PREFS.TXT nvs=rw_read theme=classic,high-contrast orientation=portrait,landscape font-size=16,20,24,32,48,72 book-font=inter,atkinson-hyperlegible,serif,literata,cjk-unifont,sd-cjk paragraph-alignment=justified,left,center,right show-progress=on,off atomic-replace=tmp-primary-backup");
+        info!("rustmix-wave=reader-preferences-ready path=/sdcard/RUSTMIX/READER/PREFS.TXT nvs=rw_read theme=classic,high-contrast orientation=portrait,landscape font-size=16,20,24,32,48,72 book-font=inter,atkinson-hyperlegible,serif,literata,cjk-unifont,sd-cjk letter-spacing=0,1,2,3,4 paragraph-alignment=justified,left,center,right show-progress=on,off atomic-replace=tmp-primary-backup");
         info!("rustmix-wave=reader-high-contrast-layout-ready viewport=shared border=outside-text top-padding=true clip=right,bottom theme-change=redraw-only ghost-refresh=global-base");
         info!("rustmix-wave=reader-txt-emphasis-cleanup-ready multiline-gutenberg=true word-internal-underscores=preserved repeated-separators=preserved byte-offsets=preserved");
         info!("rustmix-wave=reader-per-book-resume-ready path=/sdcard/RUSTMIX/READER/POSITS.TXT records=64 fingerprint=path,size,modified,format atomic-replace=tmp-primary-backup routes=continue,books,files,bookmark");
         info!("rustmix-wave=reader-controls-alignment-ready navigation=up-down-move-select-activate preferences=up-down-move-select-change back=boot-long-press");
-        info!("rustmix-wave=reader-options-split-ready actions=bookmark,toc,preferences,clear-ghosting,library,home editor=theme,orientation,font-size,font,paragraph-alignment,show-progress");
-        info!("rustmix-wave=reader-preferences-settings-navigation-ready move=up-down change=select back=boot-long-press persistence=immediate rows=theme,orientation,font-size,font,paragraph-alignment,show-progress");
+        info!("rustmix-wave=reader-options-split-ready actions=bookmark,toc,preferences,clear-ghosting,library,home editor=theme,orientation,font-size,font,letter-spacing,paragraph-alignment,show-progress");
+        info!("rustmix-wave=reader-preferences-settings-navigation-ready move=up-down change=select back=boot-long-press persistence=immediate rows=theme,orientation,font-size,font,letter-spacing,paragraph-alignment,show-progress");
         info!("rustmix-wave=reader-fat83-persistence-ready positions=POSITS.TXT legacy-read=POSITIONS.TXT cache-basename=8hex extensions=CCH,TMP,BAK atomic-replace=true");
         info!("rustmix-wave=reader-fat83-runtime-ready positions-write=POSITS.TXT legacy-read=POSITIONS.TXT cache-write=8hex-no-prefix extensions=CCH,TMP,BAK duplicate-degraded-log=suppressed");
         info!("rustmix-wave=reader-bookmark-page-labels-ready anchor=byte-offset display=page-number layout-aware=true fallback=stored-page");

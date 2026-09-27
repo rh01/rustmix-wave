@@ -111,6 +111,8 @@ pub struct UiTextStyle {
     color: BinaryColor,
     pixel_scale: u8,
     cjk_px: u8,
+    /// Extra pixels added after every glyph. Zero leaves UI text unchanged.
+    tracking_px: u8,
 }
 
 impl UiTextStyle {
@@ -121,6 +123,7 @@ impl UiTextStyle {
             color,
             pixel_scale: 1,
             cjk_px: 0,
+            tracking_px: 0,
         }
     }
 
@@ -131,6 +134,7 @@ impl UiTextStyle {
             color: self.color,
             pixel_scale: if pixel_scale == 0 { 1 } else { pixel_scale },
             cjk_px: self.cjk_px,
+            tracking_px: self.tracking_px,
         }
     }
 
@@ -141,6 +145,20 @@ impl UiTextStyle {
             color: self.color,
             pixel_scale: self.pixel_scale,
             cjk_px,
+            tracking_px: self.tracking_px,
+        }
+    }
+
+    /// Extra advance after each Latin or CJK glyph. Reader body text uses this
+    /// for the letter-spacing preference; UI styles leave it at zero.
+    #[must_use]
+    pub const fn with_tracking(self, tracking_px: u8) -> Self {
+        Self {
+            font: self.font,
+            color: self.color,
+            pixel_scale: self.pixel_scale,
+            cjk_px: self.cjk_px,
+            tracking_px,
         }
     }
 
@@ -175,9 +193,14 @@ impl UiTextStyle {
     /// the Unifont/SD fallback cell.
     #[must_use]
     pub fn text_width(self, text: &str) -> i32 {
-        fonts::measure_mixed(text, self.cjk_px(), |character| {
+        let base = fonts::measure_mixed(text, self.cjk_px(), |character| {
             self.latin_advance(character)
-        })
+        });
+        if self.tracking_px == 0 {
+            return base;
+        }
+        let glyphs = text.chars().filter(|character| *character != '\n').count() as i32;
+        base.saturating_add(glyphs.saturating_mul(i32::from(self.tracking_px)))
     }
 
     #[must_use]
@@ -251,11 +274,12 @@ impl<'a> Text<'a> {
                 bounds.map(TextBounds::clip),
             )? {
                 cursor.x += i32::from(advance);
-                continue;
+            } else {
+                let glyph = self.style.font.glyph(character);
+                draw_glyph(display, cursor, glyph, self.style, bounds)?;
+                cursor.x += i32::from(self.style.latin_advance(character));
             }
-            let glyph = self.style.font.glyph(character);
-            draw_glyph(display, cursor, glyph, self.style, bounds)?;
-            cursor.x += i32::from(self.style.latin_advance(character));
+            cursor.x += i32::from(self.style.tracking_px);
         }
         Ok(cursor)
     }
@@ -420,6 +444,23 @@ mod tests {
             .draw_clipped(&mut display, TextBounds::new(0, 0, 10, 64))
             .unwrap();
         assert!(cursor.x > 10);
+    }
+
+    #[test]
+    fn tracking_adds_the_same_extra_advance_to_latin_and_cjk() {
+        let mut display = MockDisplay::<BinaryColor>::new();
+        display.set_allow_overdraw(true);
+        display.set_allow_out_of_bounds_drawing(true);
+        let style = DisplayPreferences::default().body_style().with_cjk_px(16);
+        let tracked = style.with_tracking(3);
+        assert_eq!(tracked.text_width("A中"), style.text_width("A中") + 6);
+        let plain = Text::new("A中", Point::new(0, 24), style)
+            .draw(&mut display)
+            .unwrap();
+        let spaced = Text::new("A中", Point::new(0, 40), tracked)
+            .draw(&mut display)
+            .unwrap();
+        assert_eq!(spaced.x, plain.x + 6);
     }
 
     #[test]

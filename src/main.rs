@@ -43,8 +43,8 @@ mod firmware {
             SAMPLE_LIVE_REFRESH_SECONDS, VOICE_RECORD_SCREEN_REFRESH_SECONDS,
         },
         audio::{
-            espidf::AudioRuntime, AudioSnapshot, AudioUiRequest, AUDIO_MCLK_HZ,
-            AUDIO_SAMPLE_RATE_HZ, DEFAULT_AUDIO_VOLUME_PERCENT,
+            espidf::AudioRuntime, pronounce::PronounceSession, AudioSnapshot, AudioUiRequest,
+            AUDIO_MCLK_HZ, AUDIO_SAMPLE_RATE_HZ, DEFAULT_AUDIO_VOLUME_PERCENT,
         },
         board_services::{BoardServices, BoardSnapshot},
         build_info::{FIRMWARE_VERSION, PRODUCT_SLUG, UI_SHELL_MILESTONE},
@@ -61,6 +61,7 @@ mod firmware {
         framebuffer::FrameBuffer,
         games::dirty_regions::MAX_DIRTY_REGIONS,
         imu_events::IMU_EVENT_SAMPLE_INTERVAL_MS,
+        lexicon::LEXICON_ROOT,
         lua_runtime::{catalog::LUA_APPS_DIRECTORY, loader::LUA_LOADER_WORKER_STACK_BYTES},
         network::{
             espidf::NetworkRuntime, NetworkLogFingerprint, NetworkSnapshot, WifiConnectionState,
@@ -506,6 +507,7 @@ mod firmware {
         state.update_wifi_transfer_snapshot(WifiTransferSnapshot::default());
         let mut voice_recording: Option<VoiceRecordingSession> = None;
         let mut voice_playback: Option<VoicePlaybackSession> = None;
+        let mut pronounce_playback: Option<PronounceSession> = None;
         let mut voice_stereo_buffer = vec![0_u8; VOICE_PCM_STEREO_CAPTURE_BYTES];
         let mut voice_mono_buffer = vec![0_u8; VOICE_PCM_MONO_CHUNK_BYTES];
         info!("rustmix-wave=open-meteo-weather-forecast-ready");
@@ -794,7 +796,29 @@ mod firmware {
                 }
             }
 
+            if (voice_recording.is_some() || voice_playback.is_some())
+                && pronounce_playback.is_some()
+            {
+                stop_pronounce(
+                    &mut pronounce_playback,
+                    &mut audio_runtime,
+                    &mut state,
+                    "voice-notes",
+                );
+            }
+
             if voice_recording.is_none() && voice_playback.is_none() {
+                pump_pronounce(
+                    &mut pronounce_playback,
+                    &mut audio_runtime,
+                    &mut state,
+                    &mut voice_mono_buffer,
+                    &mut voice_stereo_buffer,
+                );
+            }
+
+            if voice_recording.is_none() && voice_playback.is_none() && pronounce_playback.is_none()
+            {
                 if let Some(runtime) = audio_runtime.as_mut() {
                     match runtime.tick() {
                         Ok(changed) => {
@@ -915,6 +939,14 @@ mod firmware {
                             if voice_playback.is_some() {
                                 stop_voice_note_playback(
                                     &mut voice_playback,
+                                    &mut audio_runtime,
+                                    &mut state,
+                                    "alarm-trigger",
+                                );
+                            }
+                            if pronounce_playback.is_some() {
+                                stop_pronounce(
+                                    &mut pronounce_playback,
                                     &mut audio_runtime,
                                     &mut state,
                                     "alarm-trigger",
@@ -1487,7 +1519,17 @@ mod firmware {
                     } else {
                         state.apply_lua_game_boot_short_press()
                     };
-                    if calendar_agenda_context || keyboard_context || lua_game_context {
+                    let pronounce_context =
+                        if calendar_agenda_context || keyboard_context || lua_game_context {
+                            false
+                        } else {
+                            state.apply_pronounce_boot_short_press()
+                        };
+                    if calendar_agenda_context
+                        || keyboard_context
+                        || lua_game_context
+                        || pronounce_context
+                    {
                         if calendar_agenda_context {
                             info!("rustmix-wave=calendar-agenda route=selected-day outcome=opened");
                         }
@@ -2082,6 +2124,118 @@ mod firmware {
             state.alarms.hardware_programmed
         );
         outcome
+    }
+
+    fn pump_pronounce<'d, I2C>(
+        pronounce_playback: &mut Option<PronounceSession>,
+        audio_runtime: &mut Option<AudioRuntime<'d, I2C>>,
+        state: &mut AppState,
+        mono: &mut [u8],
+        stereo: &mut [u8],
+    ) where
+        I2C: embedded_hal::i2c::I2c,
+        I2C::Error: core::fmt::Debug,
+    {
+        if pronounce_playback.is_none() {
+            if let Some(target) = state.take_pronounce_request() {
+                match PronounceSession::open(
+                    std::path::Path::new(LEXICON_ROOT),
+                    &target.dict_id,
+                    target.entry_id,
+                ) {
+                    Ok(Some(session)) => {
+                        let started = match audio_runtime.as_mut() {
+                            Some(runtime) => match runtime.begin_pronounce() {
+                                Ok(()) => {
+                                    info!(
+                                        "rustmix-wave=pronounce status=start dict={} entry={}",
+                                        target.dict_id, target.entry_id
+                                    );
+                                    state.update_audio_snapshot(runtime.snapshot());
+                                    true
+                                }
+                                Err(error) => {
+                                    warn!("rustmix-wave=pronounce status=start-failed error={error:#}");
+                                    let _ = runtime.finish_pronounce();
+                                    state.update_audio_snapshot(runtime.snapshot());
+                                    false
+                                }
+                            },
+                            None => {
+                                info!("rustmix-wave=pronounce status=skipped reason=codec-unavailable");
+                                false
+                            }
+                        };
+                        if started {
+                            *pronounce_playback = Some(session);
+                        }
+                    }
+                    Ok(None) => {
+                        info!(
+                            "rustmix-wave=pronounce status=missing dict={} entry={}",
+                            target.dict_id, target.entry_id
+                        );
+                    }
+                    Err(error) => {
+                        warn!("rustmix-wave=pronounce status=unreadable error={error:#}");
+                    }
+                }
+            }
+        }
+
+        let mut finished = false;
+        let mut failed = None;
+        if let Some(session) = pronounce_playback.as_mut() {
+            let limit = 640.min(mono.len()) & !1;
+            match session.read_pcm16_mono(&mut mono[..limit]) {
+                Ok(0) => finished = true,
+                Ok(bytes) => {
+                    let write = audio_runtime.as_mut().ok_or_else(|| {
+                        anyhow::anyhow!("audio runtime unavailable during pronunciation")
+                    });
+                    let write = write.and_then(|runtime| {
+                        runtime.write_pronounce_pcm16_mono(&mono[..bytes], stereo)
+                    });
+                    if let Err(error) = write {
+                        failed = Some(format!("{error:#}"));
+                    }
+                }
+                Err(error) => failed = Some(format!("{error:#}")),
+            }
+        }
+        if finished || failed.is_some() {
+            let reason = if let Some(error) = failed {
+                warn!("rustmix-wave=pronounce status=failed error={error}");
+                "failed"
+            } else {
+                info!("rustmix-wave=pronounce status=completed");
+                "completed"
+            };
+            stop_pronounce(pronounce_playback, audio_runtime, state, reason);
+        }
+    }
+
+    fn stop_pronounce<'d, I2C>(
+        session: &mut Option<PronounceSession>,
+        audio_runtime: &mut Option<AudioRuntime<'d, I2C>>,
+        state: &mut AppState,
+        reason: &str,
+    ) where
+        I2C: embedded_hal::i2c::I2c,
+        I2C::Error: core::fmt::Debug,
+    {
+        if session.take().is_none() {
+            return;
+        }
+        if let Some(runtime) = audio_runtime.as_mut() {
+            if let Err(error) = runtime.finish_pronounce() {
+                warn!("rustmix-wave=pronounce status=stop-failed reason={reason} error={error:#}");
+                runtime.record_failure(format!("{error:#}"));
+            }
+            state.update_audio_snapshot(runtime.snapshot());
+            log_audio_snapshot(&state.audio);
+        }
+        info!("rustmix-wave=pronounce status=stopped reason={reason}");
     }
 
     fn apply_audio_request<'d, I2C>(

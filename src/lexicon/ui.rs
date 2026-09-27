@@ -40,6 +40,9 @@ pub const STATIC_CREDITS: &[&str] = &[
     "JLPT lists: Tanos / Jonathan Waller; jamsinclair/open-anki-jlpt-decks MIT",
     "KANJIDIC2: CC BY-SA 4.0, Electronic Dictionary Research and Development Group",
     "CC-CEDICT: CC BY-SA 4.0, MDBG",
+    "English speech: LJ Speech public domain, Piper en_US-ljspeech-medium",
+    "Japanese speech: MeloTTS JP, MIT, MyShell.ai",
+    "Chinese speech: MeloTTS ZH, MIT, MyShell.ai",
 ];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -117,6 +120,8 @@ pub struct LexiconUiState {
     pub source_index: usize,
     pub message: String,
     pub index: Option<LexiconIndex>,
+    /// True when the open entry has a clip. False shows no audio mark.
+    pub pronounce_ready: bool,
 }
 
 impl Default for LexiconUiState {
@@ -135,6 +140,7 @@ impl Default for LexiconUiState {
             source_index: 0,
             message: "No lexicon on SD".into(),
             index: None,
+            pronounce_ready: false,
         }
     }
 }

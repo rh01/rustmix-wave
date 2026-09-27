@@ -101,7 +101,10 @@ pub fn render_vocab_session(
     )?;
     let prompt = vocab
         .current_item()
-        .map(|item| format!("slot {} #{}", item.dict_slot, item.entry_id))
+        .map(|item| {
+            let mark = if vocab.pronounce_ready { " ♪" } else { "" };
+            format!("slot {} #{}{mark}", item.dict_slot, item.entry_id)
+        })
         .unwrap_or_else(|| "Session complete".into());
     Text::new(&truncate(&prompt, 24), Point::new(22, 180), large).draw(display)?;
     Text::new(&truncate(&vocab.message, 40), Point::new(22, 230), body).draw(display)?;
@@ -129,7 +132,7 @@ pub fn render_vocab_session(
     draw_footer(
         display,
         state.display,
-        "SELECT FLIP/RATE  UP/DOWN RATING  HOLD BACK",
+        "BOOT SAY  SELECT FLIP/RATE  UP/DOWN RATING",
     )?;
     Ok(())
 }

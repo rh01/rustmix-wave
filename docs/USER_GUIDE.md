@@ -251,6 +251,7 @@ Vocabulary reviews word lists from `/RUSTMIX/LEXICON/LISTS` plus My words. The d
 | --- | --- |
 | Rotary up / down | Choose a deck, or a rating after the card is flipped |
 | SELECT | Start the deck, flip the card, then confirm Again / Hard / Good / Easy |
+| BOOT short | Play the current card when its clip is on the SD card. Otherwise the screen does not add an audio mark |
 | BOOT long | Leave the session. Unsaved reviews are written to `PROGRESS.BIN` |
 
 Card redraws use the normal panel refresh. A global refresh still runs every 32 partial updates.
@@ -368,6 +369,7 @@ Lexicon is a second offline dictionary, separate from the X4 Dictionary pack. It
 | DICT | Cycle installed dictionaries |
 | SRC | Open licenses and credits, including when no SD pack is present |
 | SELECT on an entry | Save the headword to My words |
+| BOOT short on an entry | Play that word when `AUDIO.IDX` has a clip. A missing clip adds no mark |
 | BOOT long | Return to Tools, or from an entry back to search |
 
 ### Unit Converter

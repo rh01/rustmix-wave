@@ -65,6 +65,8 @@ pub struct VocabSettings {
     pub max_reviews: u32,
     pub retention_thousandths: u32,
     pub list: String,
+    /// Play the current card when it is shown, if a clip exists.
+    pub auto_pronounce: bool,
 }
 
 impl Default for VocabSettings {
@@ -75,6 +77,7 @@ impl Default for VocabSettings {
             max_reviews: 200,
             retention_thousandths: 900,
             list: "CET4".into(),
+            auto_pronounce: false,
         }
     }
 }
@@ -224,6 +227,12 @@ pub fn load_settings(dir: &Path) -> VocabSettings {
                 }
             }
             "list" => settings.list = value.trim().to_string(),
+            "auto_pronounce" => {
+                settings.auto_pronounce = matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "on" | "true" | "yes"
+                );
+            }
             _ => {}
         }
     }
@@ -355,8 +364,8 @@ pub fn temp_vocab_dir(name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_progress, encode_progress, load_progress, save_progress, temp_vocab_dir,
-        ProgressFile, StoredCard, PROGRESS_BAK, PROGRESS_BIN,
+        decode_progress, encode_progress, load_progress, load_settings, save_progress,
+        temp_vocab_dir, ProgressFile, StoredCard, PROGRESS_BAK, PROGRESS_BIN, SETTINGS_FILE,
     };
     use crate::vocab::scheduler::Algo;
     use std::fs;
@@ -419,5 +428,18 @@ mod tests {
         let last = bytes.len() - 1;
         bytes[last] ^= 0x5A;
         assert!(decode_progress(&bytes).is_err());
+    }
+
+    #[test]
+    fn auto_pronounce_setting_defaults_off() {
+        let dir = temp_vocab_dir("say");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        assert!(!load_settings(&dir).auto_pronounce);
+        fs::write(dir.join(SETTINGS_FILE), "auto_pronounce=on\nalgo=sm2\n").unwrap();
+        let settings = load_settings(&dir);
+        assert!(settings.auto_pronounce);
+        assert_eq!(settings.algo, Algo::Sm2);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

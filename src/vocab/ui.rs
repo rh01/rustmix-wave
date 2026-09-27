@@ -49,6 +49,8 @@ pub struct VocabUiState {
     pub completed_today: u32,
     pub root: String,
     pub show_stats: bool,
+    /// True when the current card has a clip. False shows no audio mark.
+    pub pronounce_ready: bool,
 }
 
 impl Default for VocabUiState {
@@ -67,6 +69,7 @@ impl Default for VocabUiState {
             completed_today: 0,
             root: VOCAB_ROOT.into(),
             show_stats: false,
+            pronounce_ready: false,
         }
     }
 }
@@ -262,6 +265,24 @@ impl VocabUiState {
     #[must_use]
     pub fn current_item(&self) -> Option<&QueueItem> {
         self.session.as_ref().and_then(StudySession::current)
+    }
+
+    /// Dictionary id and entry id for the card on screen.
+    #[must_use]
+    pub fn pronounce_target(&self) -> Option<(String, u32)> {
+        let item = self.current_item()?;
+        let deck = self.decks.get(self.deck_index)?;
+        let dict_id = if deck.mywords {
+            dict_slots(Path::new(&self.root))
+                .ok()?
+                .get(usize::from(item.dict_slot))?
+                .clone()
+        } else if deck.dict_id.is_empty() {
+            return None;
+        } else {
+            deck.dict_id.clone()
+        };
+        Some((dict_id, item.entry_id))
     }
 
     #[must_use]

@@ -187,11 +187,14 @@ The native engine enforces bounded query and shard sizes, validates relative sha
 /sdcard/RUSTMIX/LEXICON/<ID>/
   DICT.LEX
   META.TXT
+  AUDIO.IDX
+  AUDIO.PAK
+  AUDIO.TXT
 /sdcard/RUSTMIX/LEXICON/LISTS/
   *.WLS
 ```
 
-IDs are FAT 8.3 stems such as `ECDICT`, `JMDICT`, `CEDICT`, and `KANJI`. The sources screen shows `META.TXT` plus the static credits in `tools/lexicon/CREDITS.txt` even when the card is empty. Card flips and lookup redraws use the existing panel-refresh coordinator: partial updates, with a global refresh every 32 partials. No separate lexicon refresh path is required.
+IDs are FAT 8.3 stems such as `ECDICT`, `JMDICT`, `CEDICT`, and `KANJI`. The sources screen shows `META.TXT` plus the static credits in `tools/lexicon/CREDITS.txt` even when the card is empty, including the pronunciation voices. `AUDIO.IDX` is a sorted `RMXAUD1` entry-id index. `AUDIO.PAK` stores `RMXADP1` IMA ADPCM clips at 16 kHz. Lookup and decode are host-testable. The main loop feeds one PCM chunk per iteration through the existing ES8311 owner and drives the NS4150B enable low when the clip ends. A missing file is not an error. Card flips and lookup redraws use the existing panel-refresh coordinator: partial updates, with a global refresh every 32 partials. No separate lexicon refresh path is required.
 
 ## Vocabulary boundary
 
@@ -208,7 +211,7 @@ IDs are FAT 8.3 stems such as `ECDICT`, `JMDICT`, `CEDICT`, and `KANJI`. The sou
   MYWORDS.TXT
 ```
 
-Writes go to `PROGRESS.TMP`, then `PROGRESS.BIN` is renamed to `PROGRESS.BAK`, then `PROGRESS.TMP` becomes `PROGRESS.BIN`. A corrupt `PROGRESS.BIN` falls back to `PROGRESS.BAK`. If the RTC is missing or its clock integrity was lost, the trainer shows `时钟未设置` and does not schedule. `VOCAB/PROGRESS.TMP` and `VOCAB/PROGRESS.BAK` are protected from the Wi-Fi portal.
+Writes go to `PROGRESS.TMP`, then `PROGRESS.BIN` is renamed to `PROGRESS.BAK`, then `PROGRESS.TMP` becomes `PROGRESS.BIN`. A corrupt `PROGRESS.BIN` falls back to `PROGRESS.BAK`. If the RTC is missing or its clock integrity was lost, the trainer shows `时钟未设置` and does not schedule. `VOCAB/PROGRESS.TMP` and `VOCAB/PROGRESS.BAK` are protected from the Wi-Fi portal. `SETTINGS.TXT` may set `auto_pronounce=on`. The card then queues the same pronunciation clip as Lexicon when a review card is shown.
 
 ## Calendar boundary
 

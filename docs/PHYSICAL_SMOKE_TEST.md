@@ -48,6 +48,9 @@ These checks need a release build on the device. Host tests do not flash firmwar
 5. Open `Productivity > Vocabulary` with the RTC set, flip one card, rate it Good, and power off. Confirm `PROGRESS.BIN` still contains the review after boot.
 6. Clear or unset the RTC and confirm the trainer shows `时钟未设置` instead of scheduling.
 7. Flip several cards and confirm ghosting stays within the normal partial-refresh policy.
+8. With `AUDIO.IDX` installed, open an entry and press BOOT briefly. Confirm the word plays and the amplifier is quiet again after the clip. Confirm a word with no clip shows no audio mark and does not reset the device.
+9. Set `auto_pronounce=on` in `/RUSTMIX/VOCAB/SETTINGS.TXT`, show a card that has a clip, and confirm it plays without a button press.
+10. On the bench, confirm GPIO13, GPIO14, GPIO47, GPIO48, GPIO21, and GPIO39 still match the board, that volume 60 is intelligible on the 8 ohm speaker, and that an idle amplifier pin stays low with no hiss.
 
 ## Calendar
 

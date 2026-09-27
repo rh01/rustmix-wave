@@ -31,6 +31,9 @@ Use a FAT-formatted SD card. Rustmix Wave mounts it at `/sdcard` and expects the
     ECDICT/
       DICT.LEX
       META.TXT
+      AUDIO.IDX
+      AUDIO.PAK
+      AUDIO.TXT
     LISTS/
       *.WLS
   VOCAB/
@@ -223,6 +226,58 @@ python3 -B tools/lexicon/build_lexicon.py verify \
 ```
 
 Copy `build/lexicon-sd/RUSTMIX/LEXICON` to `/RUSTMIX/LEXICON` on the card, or upload that directory with the Wi-Fi transfer portal. Create `/RUSTMIX/VOCAB` on the device by opening Vocabulary; the trainer writes `PROGRESS.BIN` through `PROGRESS.TMP`. Licenses and attribution are in each `META.TXT` and in `tools/lexicon/CREDITS.txt`. The Lexicon sources screen shows the same credits on device. ECDICT is MIT. JMdict, KANJIDIC2, and CC-CEDICT are CC BY-SA 4.0 and require that attribution. JLPT deck CSVs from jamsinclair are MIT; the underlying JLPT lists are credited to Tanos / Jonathan Waller.
+
+## Pronunciation audio
+
+Optional per-dictionary clips live beside `DICT.LEX`:
+
+```text
+/RUSTMIX/LEXICON/<ID>/AUDIO.IDX
+/RUSTMIX/LEXICON/<ID>/AUDIO.PAK
+/RUSTMIX/LEXICON/<ID>/AUDIO.TXT
+```
+
+`AUDIO.IDX` is an `RMXAUD1` table sorted by entry id. `AUDIO.PAK` holds `RMXADP1` IMA ADPCM clips, mono, 16 kHz. The firmware binary-searches the index and decodes one short chunk at a time. A missing index, pack, or entry is silent: the card shows no audio mark and does not crash. Do not commit generated audio.
+
+IMA ADPCM is about 8 KB per second. PCM16 at the same rate is 32 KB per second, about four times larger. An MP3 at 32 kbps would be smaller, and the Waveshare C examples decode MP3, but this firmware has no MP3 decoder. Rough SD sizes, including clip headers and the index, for words that average under a second:
+
+```text
+5,000 English words at 0.9 s   about 36 MB
+JLPT N5, about 800 words       about 6 MB
+JLPT N1–N5, about 8,000 words  about 55 MB
+5,000 Chinese words at 0.8 s   about 34 MB
+```
+
+The word list's `dict_id` must match the lexicon directory (`ECDICT`, `JMDICT`, `CEDICT`). Voices with a non-commercial, research-only, or unknown dataset license are refused. Piper `en_US-lessac-*`, Piper `ja_JP-hi_fi_captain-medium` (CC BY-NC-SA 4.0), and Piper `zh_CN-huayan-medium` (unknown dataset license, Lessac finetune) are not used.
+
+English uses Piper and the public-domain LJ Speech voice, trained from scratch. Download the model and its `.onnx.json` once and keep them outside the repo:
+
+```bash
+python3 -B tools/lexicon/build_lexicon.py audio \
+  --wordlist build/lexicon-sd/RUSTMIX/LEXICON/LISTS/YOUR.WLS \
+  --lexicon build/lexicon-sd/RUSTMIX/LEXICON/ECDICT/DICT.LEX \
+  --voice en_US-ljspeech-medium \
+  --model "$HOME/voices/en_US-ljspeech-medium.onnx" \
+  --out build/lexicon-sd
+```
+
+Japanese and Chinese use MeloTTS (MIT). Install that package, then:
+
+```bash
+python3 -B tools/lexicon/build_lexicon.py audio \
+  --wordlist build/lexicon-sd/RUSTMIX/LEXICON/LISTS/JLPTN5.WLS \
+  --lexicon build/lexicon-sd/RUSTMIX/LEXICON/JMDICT/DICT.LEX \
+  --voice melo-jp \
+  --out build/lexicon-sd
+
+python3 -B tools/lexicon/build_lexicon.py audio \
+  --wordlist build/lexicon-sd/RUSTMIX/LEXICON/LISTS/YOUR.WLS \
+  --lexicon build/lexicon-sd/RUSTMIX/LEXICON/CEDICT/DICT.LEX \
+  --voice melo-zh \
+  --out build/lexicon-sd
+```
+
+`/RUSTMIX/VOCAB/SETTINGS.TXT` may set `auto_pronounce=on` to play a clip when a vocabulary card or lexicon entry is shown. The default is off. BOOT short on those screens plays the current word when a clip exists. Volume is the existing audio setting. The amplifier stays off while idle.
 
 Optional IPA glyphs and Japanese kana are not in the committed Unifont bitmap. See `docs/licenses/FONT_NOTICES.md`.
 

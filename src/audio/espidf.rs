@@ -198,6 +198,42 @@ where
         Ok(())
     }
 
+    /// Unmute and enable the NS4150B for one word clip. The caller feeds PCM
+    /// in short chunks and must call [`Self::finish_pronounce`] so the amp
+    /// returns low when the clip, or a missing file, ends.
+    pub fn begin_pronounce(&mut self) -> Result<()> {
+        if self.snapshot.playback_state == AudioPlaybackState::RecordingVoiceNote {
+            return Err(anyhow!("microphone capture owns the codec"));
+        }
+        self.chime.stop();
+        self.codec
+            .mute(&mut self.bus, false)
+            .map_err(|error| anyhow!("failed to unmute ES8311 for pronunciation: {error:?}"))?;
+        if let Err(error) = self.amplifier.set_high() {
+            let _ = self.codec.mute(&mut self.bus, true);
+            return Err(anyhow!("failed to enable audio amplifier: {error:?}"));
+        }
+        self.snapshot.amplifier_enabled = true;
+        self.snapshot.muted = false;
+        self.snapshot.playback_state = AudioPlaybackState::PlayingPronounce;
+        self.snapshot.error = None;
+        Ok(())
+    }
+
+    pub fn write_pronounce_pcm16_mono(&mut self, mono: &[u8], stereo: &mut [u8]) -> Result<()> {
+        if self.snapshot.playback_state != AudioPlaybackState::PlayingPronounce {
+            return Err(anyhow!("pronunciation playback is not active"));
+        }
+        let stereo_bytes = expand_pcm16_mono_to_stereo(mono, stereo)?;
+        self.tx
+            .write_all(&stereo[..stereo_bytes], BLOCK)
+            .map_err(|error| anyhow!("I2S pronunciation TX write failed: {error:?}"))
+    }
+
+    pub fn finish_pronounce(&mut self) -> Result<()> {
+        self.stop_playback()
+    }
+
     pub fn write_voice_pcm16_mono(&mut self, mono: &[u8], stereo: &mut [u8]) -> Result<()> {
         if self.snapshot.playback_state != AudioPlaybackState::PlayingVoiceNote {
             return Err(anyhow!("voice-note playback is not active"));
@@ -321,9 +357,11 @@ where
         self.codec
             .mute(&mut self.bus, muted)
             .map_err(|error| anyhow!("failed to change ES8311 mute state: {error:?}"))?;
-        let voice_note_playing =
-            self.snapshot.playback_state == AudioPlaybackState::PlayingVoiceNote;
-        if muted || (!self.chime.is_playing() && !voice_note_playing) {
+        let streamed = matches!(
+            self.snapshot.playback_state,
+            AudioPlaybackState::PlayingVoiceNote | AudioPlaybackState::PlayingPronounce
+        );
+        if muted || (!self.chime.is_playing() && !streamed) {
             self.amplifier
                 .set_low()
                 .map_err(|error| anyhow!("failed to disable audio amplifier: {error:?}"))?;
@@ -339,7 +377,9 @@ where
             AudioPlaybackState::PlayingAlarm
         } else if self.chime.mode() == ChimeMode::TestOnce {
             AudioPlaybackState::PlayingTestTone
-        } else if voice_note_playing {
+        } else if self.snapshot.playback_state == AudioPlaybackState::PlayingPronounce {
+            AudioPlaybackState::PlayingPronounce
+        } else if streamed {
             AudioPlaybackState::PlayingVoiceNote
         } else if muted {
             AudioPlaybackState::Muted

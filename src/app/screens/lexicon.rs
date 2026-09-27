@@ -101,7 +101,7 @@ pub fn render_lexicon_entry(
                 .map(|entry| entry.dict_id.as_str())
                 .unwrap_or("NONE"),
             middle: &format!("PAGE {}", lexicon.entry_page + 1),
-            right: "MYWORDS",
+            right: if lexicon.pronounce_ready { "♪" } else { "" },
         },
     )?;
 
@@ -130,7 +130,7 @@ pub fn render_lexicon_entry(
     draw_footer(
         display,
         state.display,
-        "UP/DOWN PAGE  SELECT SAVE  HOLD BOOT BACK",
+        "UP/DOWN PAGE  BOOT SAY  SELECT SAVE  HOLD BACK",
     )?;
     Ok(())
 }

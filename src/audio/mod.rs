@@ -1,10 +1,12 @@
 //! Native audio domain for the Waveshare ESP32-S3 e-Paper 3.97 board.
 //!
-//! Alarm/test-tone playback and Voice Notes microphone capture share one
-//! ES8311 / I2S0 owner. Compressed audio and SD-backed music playback remain
-//! out of scope. Host-testable state lives here; ESP-IDF wiring stays in
-//! [`espidf`].
+//! Alarm/test-tone playback, Voice Notes, and short SD pronunciation clips
+//! share one ES8311 / I2S0 owner. General music playback stays out of scope.
+//! Host-testable clip lookup and IMA ADPCM live in [`pronounce`] and [`adpcm`].
+//! ESP-IDF wiring stays in [`espidf`].
 
+pub mod adpcm;
+pub mod pronounce;
 pub mod tone;
 
 #[cfg(target_os = "espidf")]
@@ -31,15 +33,18 @@ pub const DEFAULT_AUDIO_VOLUME_PERCENT: u8 = 60;
 pub const MAX_AUDIO_VOLUME_PERCENT: u8 = 100;
 /// Volume adjustment step exposed by the diagnostics UI.
 pub const AUDIO_VOLUME_STEP_PERCENT: u8 = 5;
-/// I2S TX pin ownership inherited from the uploaded BSP.
+/// I2S pin map from Waveshare's ESP-IDF `03_Music` and `08_ESP32-S3_e-Paper-3.97`
+/// `components/es8311_bsp/es8311_bsp.h` (`I2S_MCLK_PIN` through `I2S_PA_PIN`).
+/// The same header sets 16 kHz and MCLK ×384. `pa_reverted` is false there, and
+/// `es8311_audio_shutdown_cleanup` drives `I2S_PA_PIN` low to turn the NS4150B off.
 pub const AUDIO_MCLK_GPIO: u8 = 13;
 pub const AUDIO_BCLK_GPIO: u8 = 14;
 pub const AUDIO_WS_GPIO: u8 = 47;
-/// ESP32-S3 TX data output to the ES8311 DAC. The uploaded BSP names this
-/// signal `I2S_DATA_POUT` and routes it to GPIO48.
+/// ESP32-S3 TX data output to the ES8311 DAC (`I2S_DATA_POUT`, GPIO48).
 pub const AUDIO_DOUT_GPIO: u8 = 48;
-/// ES8311 ADC data input back to the ESP32-S3 for Voice Notes capture.
+/// ES8311 ADC data input back to the ESP32-S3 (`I2S_DATA_PIN`, GPIO21).
 pub const AUDIO_DIN_GPIO: u8 = 21;
+/// NS4150B enable. High while PCM is streaming; low when idle.
 pub const AUDIO_AMP_ENABLE_GPIO: u8 = 39;
 
 /// Waveshare sample-app codec-profile values inherited from Espressif's
@@ -63,6 +68,7 @@ pub enum AudioPlaybackState {
     PlayingTestTone,
     PlayingAlarm,
     PlayingVoiceNote,
+    PlayingPronounce,
     RecordingVoiceNote,
     Error,
 }
@@ -77,6 +83,7 @@ impl AudioPlaybackState {
             Self::PlayingTestTone => "TEST TONE",
             Self::PlayingAlarm => "ALARM CHIME",
             Self::PlayingVoiceNote => "VOICE NOTE",
+            Self::PlayingPronounce => "WORD",
             Self::RecordingVoiceNote => "VOICE RECORD",
             Self::Error => "ERROR",
         }
@@ -128,6 +135,7 @@ impl AudioSnapshot {
             AudioPlaybackState::PlayingTestTone => "TEST",
             AudioPlaybackState::PlayingAlarm => "RING",
             AudioPlaybackState::PlayingVoiceNote => "NOTE",
+            AudioPlaybackState::PlayingPronounce => "SAY",
             AudioPlaybackState::RecordingVoiceNote => "REC",
             AudioPlaybackState::Error => "ERROR",
         }
@@ -138,6 +146,7 @@ impl AudioSnapshot {
         match self.playback_state {
             AudioPlaybackState::PlayingAlarm => "Audible alarm chime is active.",
             AudioPlaybackState::PlayingVoiceNote => "Saved voice-note playback owns the codec.",
+            AudioPlaybackState::PlayingPronounce => "Word pronunciation owns the codec.",
             AudioPlaybackState::RecordingVoiceNote => "Voice-note recording owns the codec.",
             AudioPlaybackState::Unavailable | AudioPlaybackState::Error => {
                 "Audio unavailable - visual alarm only."
@@ -168,7 +177,8 @@ pub enum AudioUiRequest {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioPlaybackState, AudioSnapshot, AUDIO_DIN_GPIO, AUDIO_DOUT_GPIO, BSP_ES8311_ADC_REG15,
+        AudioPlaybackState, AudioSnapshot, AUDIO_AMP_ENABLE_GPIO, AUDIO_BCLK_GPIO, AUDIO_DIN_GPIO,
+        AUDIO_DOUT_GPIO, AUDIO_MCLK_GPIO, AUDIO_WS_GPIO, BSP_ES8311_ADC_REG15,
         BSP_ES8311_ADC_REG17, BSP_ES8311_DAC_REFERENCE_REG44, BSP_ES8311_GP_REG45,
         BSP_ES8311_SYSTEM_REG14, DEFAULT_AUDIO_VOLUME_PERCENT, ES8311_I2C_ADDRESS_LOW,
         ES8311_WIRE_WRITE_ADDRESS_LOW,
@@ -181,9 +191,13 @@ mod tests {
     }
 
     #[test]
-    fn uploaded_bsp_data_route_keeps_tx_and_deferred_rx_explicit() {
+    fn waveshare_music_example_pins_match_es8311_bsp_header() {
+        assert_eq!(AUDIO_MCLK_GPIO, 13);
+        assert_eq!(AUDIO_BCLK_GPIO, 14);
+        assert_eq!(AUDIO_WS_GPIO, 47);
         assert_eq!(AUDIO_DOUT_GPIO, 48);
         assert_eq!(AUDIO_DIN_GPIO, 21);
+        assert_eq!(AUDIO_AMP_ENABLE_GPIO, 39);
     }
 
     #[test]

@@ -329,12 +329,15 @@ pub fn atomic_write(
     {
         let mut file = File::create(temporary).map_err(|error| error.to_string())?;
         file.write_all(bytes).map_err(|error| error.to_string())?;
-        file.sync_all().ok();
+        file.sync_all()
+            .map_err(|error| format!("sync {}: {error}", temporary.display()))?;
     }
     if path.exists() {
         let _ = fs::rename(path, backup);
     }
     fs::rename(temporary, path).map_err(|error| error.to_string())?;
+    // ESP-IDF FAT cannot open a directory as a file (`EACCES`). A failed
+    // directory fsync after a successful rename was reported as a failed save.
     Ok(())
 }
 

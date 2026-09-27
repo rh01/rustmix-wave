@@ -105,6 +105,8 @@ pub struct AudioSnapshot {
     pub codec_ready: bool,
     pub i2s_ready: bool,
     pub amplifier_enabled: bool,
+    /// False after the idle power-down sequence. Playback turns it back on.
+    pub codec_powered: bool,
     pub muted: bool,
     pub volume_percent: u8,
     pub playback_state: AudioPlaybackState,
@@ -126,6 +128,7 @@ impl AudioSnapshot {
             codec_ready: false,
             i2s_ready: false,
             amplifier_enabled: false,
+            codec_powered: false,
             muted: true,
             volume_percent: DEFAULT_AUDIO_VOLUME_PERCENT,
             playback_state: AudioPlaybackState::Unavailable,

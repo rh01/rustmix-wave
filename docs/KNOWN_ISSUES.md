@@ -6,7 +6,7 @@ Open-Meteo requests can fail transiently with transport, TLS, timeout, or HTTP s
 
 ## MCU deep sleep
 
-Sleep-image mode suspends network services, sleeps the e-paper panel, and disables the panel rail, but the MCU event loop remains active. This preserves validated AXP2101 Power-key polling and GPIO45 RTC-alarm handling. Full MCU deep sleep remains deferred.
+Auto sleep and the Power-key sleep image now stop Wi-Fi, power down the panel rail, and enter ESP32-S3 deep sleep. Wake is a button on GPIO0, GPIO4, GPIO5, or GPIO6 (`ext1`, active low). The sleep image prints those keys. The AXP2101 Power key is an I2C status bit and is not wired to an RTC GPIO, so it cannot wake the SoC. GPIO45 is not an RTC IO, so a programmed alarm uses a timer wake; deep sleep is refused when an alarm is pending and the RTC reading is missing. PSRAM contents do not survive deep sleep; the open TXT/EPUB offset and WeRead chapter are written to the SD card first, and the route is stored in NVS plus RTC noinit memory. Light sleep between page turns retains RAM and PSRAM, and the same buttons wake it through `gpio_wakeup_enable`. The panel rail stays powered during reading and sleeps after 60 seconds idle. Current figures in the power notes are estimates until they are measured on a board.
 
 ## EPUB scope
 

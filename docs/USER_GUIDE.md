@@ -11,7 +11,7 @@ This guide describes the Rustmix Wave v1.0.0 user interface as shown by the refe
 | BOOT short | Contextual secondary action. On grid keyboards it toggles `NAV H` / `NAV V`. In Calendar it opens the daily agenda or creates a personal event from the agenda. In Sudoku and Minesweeper it toggles the active movement axis or cancels an edit/action mode. |
 | BOOT long | Hierarchical Back. On editors it cancels and returns without saving. |
 | Power short | Open the display-maintenance menu. Select **Clear ghosting now** for a full e-paper base refresh, or select **Cancel**. |
-| Power long | Enter random sleep-image mode. After the wake guard quiet interval, press Power briefly to restore the previous screen. |
+| Power long | Show a sleep image, then deep-sleep the SoC. Press UP, SELECT, DOWN, or BOOT to wake and restore the previous screen. |
 
 The bottom footer on each screen repeats the controls that are valid in that context.
 
@@ -472,7 +472,7 @@ Display settings change the global UI font and UI size. Rotate to choose a row, 
 <tr><td><img src="../screenshots/device-info.jpg" width="260" alt="Device info firmware page"></td><td><img src="../screenshots/device-info1.jpg" width="260" alt="Device info board page"></td><td><img src="../screenshots/device-info2.jpg" width="260" alt="Device info runtime page"></td></tr>
 </table>
 
-Device Info is a three-page read-only diagnostic surface covering firmware, display, board services, SD storage, runtime services, network, weather, alarm state, display zone, and temperature units.
+Device Info is a four-page diagnostic surface covering firmware, display, board services, SD storage, runtime services, and a power page with CPU, radio, panel, audio, SD, and battery-ADC estimates. SELECT on the power page cycles the auto-sleep timeout.
 
 Navigation: SELECT advances to the next page; hold BOOT returns.
 
@@ -560,7 +560,7 @@ A long Power press enters sleep-image mode:
 
 <img src="../screenshots/sleep.jpg" width="360" alt="Sleep image mode">
 
-The firmware selects a random image from `/sdcard/RUSTMIX/SLEEP`, suspends network activity, sleeps the panel, retains the prior route, and uses a wake guard so the entry press is not mistaken for an immediate wake press.
+The firmware selects a random image from `/sdcard/RUSTMIX/SLEEP`, suspends network activity, puts the panel controller into deep sleep, and then deep-sleeps the ESP32-S3. The image is labeled with the wake keys: UP, SELECT, DOWN, and BOOT. The Power key cannot wake the SoC, because it is an AXP2101 status bit rather than an RTC GPIO. The open book position is saved first. The same deep sleep also runs after the auto-sleep timeout (10 minutes by default; Device Info → Power can select 5, 10, 30, or 60). Between page turns the panel rail stays on and the CPU uses tickless light sleep, so page turns stay partial refreshes and the chapter stays in memory. After 60 seconds with no input the controller sleeps; the next partial restores the previous frame into the old RAM plane. Device Info page 4 shows the estimated power state and the AXP2101 battery voltage.
 
 ## 8. Screenshot index
 

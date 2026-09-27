@@ -16,9 +16,8 @@ pub enum ButtonEvent {
     Down,
 }
 
-/// Small polling adapter. The first milestone deliberately avoids interrupt
-/// callbacks and global mutable state; the product UI can add an event queue
-/// behind this interface later.
+/// Debounced active-low key adapter. The firmware arms a falling-edge interrupt
+/// so the main loop can block; `poll` still confirms the press and release.
 pub struct Buttons<UP, SELECT, DOWN> {
     up: UP,
     select: SELECT,
@@ -68,6 +67,18 @@ where
             delay.delay_ms(10);
         }
         Ok(Some(event))
+    }
+
+    pub fn up_mut(&mut self) -> &mut UP {
+        &mut self.up
+    }
+
+    pub fn select_mut(&mut self) -> &mut SELECT {
+        &mut self.select
+    }
+
+    pub fn down_mut(&mut self) -> &mut DOWN {
+        &mut self.down
     }
 
     fn is_pressed(&mut self, event: ButtonEvent) -> Result<bool> {
@@ -135,6 +146,10 @@ where
             held_ms = held_ms.saturating_add(10);
         }
         Ok(Some(BootButtonEvent::ShortPress))
+    }
+
+    pub fn pin_mut(&mut self) -> &mut BACK {
+        &mut self.back
     }
 
     fn is_pressed(&mut self) -> Result<bool> {

@@ -205,6 +205,53 @@ pub fn save_progress(
     )
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LastOpen {
+    pub book_id: String,
+    pub chapter_pos: usize,
+    pub page_index: usize,
+}
+
+pub fn save_last_open(
+    root: &Path,
+    book_id: &str,
+    chapter_pos: usize,
+    page_index: usize,
+) -> Result<(), String> {
+    let dir = root.join("WEREAD");
+    let body = format!(
+        "WRLAST1\nbook_id={}\nchapter={chapter_pos}\npage={page_index}\n",
+        one_line(book_id)
+    );
+    atomic_write(
+        &dir.join("LAST.TXT"),
+        &dir.join("LAST.TMP"),
+        &dir.join("LAST.BAK"),
+        body.as_bytes(),
+    )
+}
+
+pub fn load_last_open(root: &Path) -> Option<LastOpen> {
+    let bytes = read_capped(&root.join("WEREAD").join("LAST.TXT"), 512).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    if !text
+        .lines()
+        .next()
+        .is_some_and(|line| line.trim() == "WRLAST1")
+    {
+        return None;
+    }
+    let book_id = field(&text, "book_id");
+    if book_id.is_empty() {
+        return None;
+    }
+    Some(LastOpen {
+        book_id,
+        chapter_pos: field(&text, "chapter").parse().unwrap_or(0),
+        page_index: field(&text, "page").parse().unwrap_or(0),
+    })
+}
+
 pub fn load_local_progress(root: &Path, book_id: &str) -> Option<(ReadingProgress, usize)> {
     let bytes = read_capped(&book_dir(root, book_id).join("PROG.TXT"), 1024).ok()?;
     let text = String::from_utf8_lossy(&bytes);
@@ -329,5 +376,18 @@ mod tests {
             assert_eq!(name.len(), 12);
         }
         assert_eq!(super::chapter_name(0x10), "00000010.TXT");
+    }
+
+    #[test]
+    fn last_open_round_trips_the_chapter_and_page() {
+        let dir = std::env::temp_dir().join(format!("weread-last-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        super::save_last_open(&dir, "43208843", 4, 12).unwrap();
+        let last = super::load_last_open(&dir).unwrap();
+        assert_eq!(last.book_id, "43208843");
+        assert_eq!(last.chapter_pos, 4);
+        assert_eq!(last.page_index, 12);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

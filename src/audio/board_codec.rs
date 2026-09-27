@@ -15,6 +15,12 @@ use super::{
     BSP_ES8311_GPIO_IDLE_REG44, BSP_ES8311_GP_REG45, BSP_ES8311_SYSTEM_REG14,
 };
 
+/// Clock-manager / chip-state register. `0x30` stops the analog and clock
+/// state machine; playback writes `0x3F` and reapplies the board profile.
+pub const ES8311_CLK_MANAGER_REG01: u8 = 0x01;
+pub const ES8311_POWER_DOWN: u8 = 0x30;
+pub const ES8311_POWER_UP: u8 = 0x3F;
+
 const SYSTEM_REG0B: u8 = 0x0B;
 const SYSTEM_REG0C: u8 = 0x0C;
 const SYSTEM_REG0D: u8 = 0x0D;
@@ -127,6 +133,27 @@ impl BoardEs8311 {
         self.codec
             .mute(i2c, muted)
             .map_err(|error| anyhow!("ES8311 mute update failed: {error:?}"))
+    }
+
+    /// Drop the codec's analog and clock state machine. The caller must also
+    /// hold the NS4150B enable low and stop I2S clocks.
+    pub fn power_down<I2C>(&self, i2c: &mut I2C) -> Result<()>
+    where
+        I2C: I2c,
+        I2C::Error: core::fmt::Debug,
+    {
+        let _ = self.mute(i2c, true);
+        self.write_reg(i2c, ES8311_CLK_MANAGER_REG01, ES8311_POWER_DOWN)
+    }
+
+    /// Bring the codec back and restore the Waveshare analogue profile.
+    pub fn power_up<I2C>(&self, i2c: &mut I2C) -> Result<()>
+    where
+        I2C: I2c,
+        I2C::Error: core::fmt::Debug,
+    {
+        self.write_reg(i2c, ES8311_CLK_MANAGER_REG01, ES8311_POWER_UP)?;
+        self.apply_waveshare_profile(i2c)
     }
 
     fn apply_waveshare_profile<I2C>(&self, i2c: &mut I2C) -> Result<()>

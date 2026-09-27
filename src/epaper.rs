@@ -21,6 +21,32 @@ use crate::{
 const BUSY_POLL_MS: u32 = 20;
 const BUSY_TIMEOUT_MS: u32 = 15_000;
 
+/// `sleep` failed. `controller_asleep` is set once command `0x10` was accepted.
+#[derive(Debug)]
+pub struct PanelSleepError {
+    source: anyhow::Error,
+    controller_asleep: bool,
+}
+
+impl PanelSleepError {
+    /// `true` after deep-sleep command `0x10` was accepted.
+    ///
+    /// Controller RAM is gone from that point, including when the later reset
+    /// or ALDO3 step is what failed.
+    #[must_use]
+    pub const fn controller_asleep(&self) -> bool {
+        self.controller_asleep
+    }
+}
+
+impl core::fmt::Display for PanelSleepError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(formatter, "{:#}", self.source)
+    }
+}
+
+impl std::error::Error for PanelSleepError {}
+
 /// Controller driver with explicit ownership of the panel bus and pins.
 pub struct Epaper397<SPI, DC, RST, CS, BUSY, DELAY, POWER> {
     spi: SPI,
@@ -150,11 +176,53 @@ where
         self.turn_on_display(0xFF)
     }
 
+    /// Partial update after the controller RAM was lost.
+    ///
+    /// `previous` is the frame still visible on the glass. It is written to the
+    /// old plane (`0x26`) before `next` is written to `0x24`, so the `0xFF`
+    /// waveform diffs against the real image instead of an empty buffer.
+    pub fn show_partial_restoring_old_plane(&mut self, previous: &[u8], next: &[u8]) -> Result<()> {
+        validate_frame(previous)?;
+        validate_frame(next)?;
+        info!("epd397: partial refresh restoring old plane");
+        self.hardware_reset_fast()?;
+        self.command_data(0x18, &[0x80])?;
+        self.command_data(0x3C, &[0x80])?;
+        self.command_data(0x44, &[0x00, 0x00, 0x18, 0x03])?;
+        self.command_data(0x45, &[0xDF, 0x01, 0x00, 0x00])?;
+        self.command_data(0x4E, &[0x00, 0x00])?;
+        self.command_data(0x4F, &[0x00, 0x00])?;
+        self.command(0x26)?;
+        self.data(previous)?;
+        self.command(0x24)?;
+        self.data(next)?;
+        self.turn_on_display(0xFF)
+    }
+
     /// Put the panel controller into deep sleep and disable its PMIC rail.
-    pub fn sleep(&mut self) -> Result<()> {
+    ///
+    /// Command `0x10` is sent before the pins and ALDO3 are touched. Once it
+    /// has been accepted, [`PanelSleepError::controller_asleep`] is set even
+    /// if a later step fails, because controller RAM is already gone.
+    pub fn sleep(&mut self) -> core::result::Result<(), PanelSleepError> {
         info!("epd397: deep sleep and disable ALDO3");
-        self.command_data(0x10, &[0x01])?;
+        if let Err(error) = self.command_data(0x10, &[0x01]) {
+            return Err(PanelSleepError {
+                source: error,
+                controller_asleep: false,
+            });
+        }
         self.delay.delay_ms(10);
+        if let Err(error) = self.cut_rail_after_deep_sleep() {
+            return Err(PanelSleepError {
+                source: error,
+                controller_asleep: true,
+            });
+        }
+        Ok(())
+    }
+
+    fn cut_rail_after_deep_sleep(&mut self) -> Result<()> {
         self.reset
             .set_low()
             .map_err(|error| anyhow!("EPD_RST low failed: {error:?}"))?;

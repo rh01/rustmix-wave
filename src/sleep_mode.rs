@@ -1,9 +1,8 @@
 //! Hardware-independent power-key sleep-image mode state.
 //!
-//! MCU deep sleep is intentionally out of scope. The ESP32-S3 event loop stays
-//! active so PMIC power-key polling and the proven GPIO45 RTC alarm route remain
-//! reliable. Optional Wi-Fi, SNTP and weather services pause while a static
-//! sleep image is visible and resume after the wake frame has rendered.
+//! The sleep image is still selected here. After the frame is visible, `main`
+//! enters MCU deep sleep. Wake is a button on GPIO0/4/5/6. Optional Wi-Fi,
+//! SNTP and weather services are stopped before that transition.
 
 use crate::app::ScreenRoute;
 

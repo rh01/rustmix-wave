@@ -168,6 +168,52 @@ impl WereadUi {
         self.busy || matches!(self.phase, Phase::Login | Phase::Download) || self.pending.is_some()
     }
 
+    /// True while a shelf, login, chapter, or progress upload still needs Wi-Fi.
+    #[must_use]
+    pub fn needs_radio(&self) -> bool {
+        self.holds_panel() || self.progress_arm
+    }
+
+    /// Save the open chapter before deep sleep. Offline text is already on the card.
+    pub fn persist_before_sleep(&mut self, mounted: bool) {
+        if !mounted || self.book_id.is_empty() {
+            return;
+        }
+        self.remember_local_progress(mounted);
+        let _ =
+            offline::save_last_open(&sd_root(), &self.book_id, self.chapter_pos, self.page_index);
+    }
+
+    /// Reopen the chapter that was on screen before deep sleep.
+    pub fn restore_after_deep_sleep(&mut self, mounted: bool, layout: ReaderLayout) -> bool {
+        if !mounted {
+            return false;
+        }
+        let Some(last) = offline::load_last_open(&sd_root()) else {
+            return false;
+        };
+        let root = sd_root();
+        let mut loaded = session::load_session(&root);
+        if !loaded.web_signed_in() {
+            nvs::overlay(&mut loaded);
+        }
+        self.session = loaded;
+        self.book_id = last.book_id;
+        self.chapters = offline::load_catalog(&root, &self.book_id).unwrap_or_default();
+        self.psvts = offline::load_psvts(&root, &self.book_id);
+        if let Some((progress, page)) = offline::load_local_progress(&root, &self.book_id) {
+            self.progress = Some(progress);
+            self.page_index = page;
+        } else {
+            self.page_index = last.page_index;
+        }
+        self.chapter_pos = last.chapter_pos;
+        self.phase = Phase::Read;
+        self.pending = None;
+        self.busy = false;
+        self.begin_read(layout, mounted)
+    }
+
     pub fn note_route(&mut self, previous: ScreenRoute, current: ScreenRoute) {
         if previous == ScreenRoute::WeReadLogin && current != ScreenRoute::WeReadLogin {
             self.clear_login_job();

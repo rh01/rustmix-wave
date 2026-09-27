@@ -101,6 +101,7 @@ pub fn render_active_screen(
         ScreenRoute::DeviceInfo => device_info::render_device_info(display, state),
         ScreenRoute::DeviceInfoBoard => device_info::render_device_info_board(display, state),
         ScreenRoute::DeviceInfoRuntime => device_info::render_device_info_runtime(display, state),
+        ScreenRoute::DeviceInfoPower => device_info::render_device_info_power(display, state),
         ScreenRoute::Reader
         | ScreenRoute::Productivity
         | ScreenRoute::Games

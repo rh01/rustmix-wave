@@ -758,13 +758,13 @@ mod firmware {
         info!("rustmix-wave=reader-loading-ui-ready stages=open,encoding,resume,first-page,cache cancel=boot-long-press refresh=coarse-stage-boundaries");
         info!("rustmix-wave=reader-options-shell-ready toc=none-for-txt,list-for-epub bookmarks=persistent clear-ghosting=manual-global-refresh");
         info!("rustmix-wave=reader-ux-repair-ready menu=continue,library,bookmarks-ready normalization=utf8-punctuation,latin1,underscore-emphasis byte-offsets=preserved");
-        info!("rustmix-wave=reader-preferences-ready path=/sdcard/RUSTMIX/READER/PREFS.TXT nvs=rw_read theme=classic,high-contrast orientation=portrait,landscape font-size=16,20,24,32,48,72 book-font=inter,atkinson-hyperlegible,serif,literata,cjk-unifont,sd-cjk paragraph-alignment=justified,left,center,right show-progress=on,off atomic-replace=tmp-primary-backup");
+        info!("rustmix-wave=reader-preferences-ready path=/sdcard/RUSTMIX/READER/PREFS.TXT nvs=rw_read theme=classic,high-contrast orientation=portrait,landscape font-size=16,20,24,32,48,72 book-font=inter,atkinson-hyperlegible,serif,literata,cjk-unifont,sd-cjk letter-spacing=0,1,2,3,4 paragraph-alignment=justified,left,center,right show-progress=on,off atomic-replace=tmp-primary-backup");
         info!("rustmix-wave=reader-high-contrast-layout-ready viewport=shared border=outside-text top-padding=true clip=right,bottom theme-change=redraw-only ghost-refresh=global-base");
         info!("rustmix-wave=reader-txt-emphasis-cleanup-ready multiline-gutenberg=true word-internal-underscores=preserved repeated-separators=preserved byte-offsets=preserved");
         info!("rustmix-wave=reader-per-book-resume-ready path=/sdcard/RUSTMIX/READER/POSITS.TXT records=64 fingerprint=path,size,modified,format atomic-replace=tmp-primary-backup routes=continue,books,files,bookmark");
         info!("rustmix-wave=reader-controls-alignment-ready navigation=up-down-move-select-activate preferences=up-down-move-select-change back=boot-long-press");
-        info!("rustmix-wave=reader-options-split-ready actions=bookmark,toc,preferences,clear-ghosting,library,home editor=theme,orientation,font-size,font,paragraph-alignment,show-progress");
-        info!("rustmix-wave=reader-preferences-settings-navigation-ready move=up-down change=select back=boot-long-press persistence=immediate rows=theme,orientation,font-size,font,paragraph-alignment,show-progress");
+        info!("rustmix-wave=reader-options-split-ready actions=bookmark,toc,preferences,clear-ghosting,library,home editor=theme,orientation,font-size,font,letter-spacing,paragraph-alignment,show-progress");
+        info!("rustmix-wave=reader-preferences-settings-navigation-ready move=up-down change=select back=boot-long-press persistence=immediate rows=theme,orientation,font-size,font,letter-spacing,paragraph-alignment,show-progress");
         info!("rustmix-wave=reader-fat83-persistence-ready positions=POSITS.TXT legacy-read=POSITIONS.TXT cache-basename=8hex extensions=CCH,TMP,BAK atomic-replace=true");
         info!("rustmix-wave=reader-fat83-runtime-ready positions-write=POSITS.TXT legacy-read=POSITIONS.TXT cache-write=8hex-no-prefix extensions=CCH,TMP,BAK duplicate-degraded-log=suppressed");
         info!("rustmix-wave=reader-bookmark-page-labels-ready anchor=byte-offset display=page-number layout-aware=true fallback=stored-page");
@@ -813,6 +813,11 @@ mod firmware {
         );
 
         let mut last_activity = Instant::now();
+        let mut auto_turn_since = Instant::now();
+        let mut auto_turn_paused = false;
+        let mut auto_turn_reading = false;
+        let mut status_overlay_since = Instant::now();
+        let mut status_overlay_token = 0_u8;
         let mut last_status_refresh = Instant::now();
         let mut last_alarm_poll = Instant::now();
         let mut last_power_key_poll = Instant::now();
@@ -896,6 +901,11 @@ mod firmware {
                 }
             }
             let reader_busy_now = state.reader.needs_background_tick();
+            let auto_page_turn = auto_turn_reading
+                && waveshare_epd397_rust_app::reader::auto_page_turn_keeps_awake(
+                    state.reader.preferences.auto_page_turn,
+                    auto_turn_paused,
+                );
             publish_power_snapshot(
                 &mut state,
                 &mut last_power_log,
@@ -909,6 +919,7 @@ mod firmware {
                 weread_needs_radio,
                 portal_open,
                 reader_busy_now,
+                auto_page_turn,
             );
             maintain_wifi_transfer_server(
                 &mut wifi_transfer_server,
@@ -2037,8 +2048,13 @@ mod firmware {
                 None => {}
             }
 
-            if let Some(event) = buttons.poll(&mut button_delay)? {
-                info!("rustmix-wave=button-event event={event:?}");
+            if let Some(press) = buttons.poll(&mut button_delay)? {
+                auto_turn_paused = true;
+                let event = press.event;
+                info!(
+                    "rustmix-wave=button-event event={event:?} held-ms={}",
+                    press.held_ms
+                );
                 if sleep_mode.is_sleeping() {
                     info!("rustmix-wave=sleep-mode-input-suppressed event={event:?}");
                     FreeRtos::delay_ms(20);
@@ -2092,7 +2108,7 @@ mod firmware {
                 } else {
                     waveshare_epd397_rust_app::reader::with_layout_button_poll(
                         &mut || buttons.any_pressed().unwrap_or(false),
-                        || state.apply(event),
+                        || state.apply_hardware_key(press),
                     );
                     log_lua_runtime_events(&mut state);
                     if state.active_route() == ScreenRoute::Files {
@@ -2180,12 +2196,85 @@ mod firmware {
                 || voice_playback.is_some()
                 || pronounce_playback.is_some();
             let reader_busy = state.reader.needs_background_tick();
+            if state.reader.take_auto_turn_rearm() {
+                auto_turn_paused = false;
+                auto_turn_since = Instant::now();
+            }
+            let reading_now = matches!(
+                state.active_route(),
+                ScreenRoute::ReaderPage | ScreenRoute::WeReadRead
+            );
+            if reading_now && !auto_turn_reading {
+                auto_turn_since = Instant::now();
+            }
+            auto_turn_reading = reading_now;
+            let auto_keeps_awake = reading_now
+                && waveshare_epd397_rust_app::reader::auto_page_turn_keeps_awake(
+                    state.reader.preferences.auto_page_turn,
+                    auto_turn_paused,
+                );
+            let turn_elapsed = auto_turn_since.elapsed().as_millis() as u64;
+            if waveshare_epd397_rust_app::reader::poll_auto_page_turn(
+                turn_elapsed,
+                0,
+                state.reader.preferences.auto_page_turn,
+                auto_turn_paused || !reading_now,
+            ) {
+                state.auto_turn_page();
+                auto_turn_since = Instant::now();
+                let reader_clear_ghost = state.take_reader_clear_ghost_request();
+                let request = if reader_clear_ghost {
+                    RefreshRequest::ForceGlobalManual
+                } else {
+                    RefreshRequest::Normal
+                };
+                refresh_screen(
+                    &mut panel,
+                    &mut frame,
+                    &mut state,
+                    &mut panel_refresh,
+                    &mut previous_panel_frame,
+                    request,
+                )?;
+                last_activity = Instant::now();
+                last_status_refresh = Instant::now();
+            }
+            let status_overlay_due_ms = if state.reading_status_overlay {
+                if state.reading_status_overlay_token() != status_overlay_token {
+                    status_overlay_token = state.reading_status_overlay_token();
+                    status_overlay_since = Instant::now();
+                }
+                let elapsed = status_overlay_since.elapsed().as_millis() as u64;
+                if waveshare_epd397_rust_app::reader::immersive_status_visible(elapsed) {
+                    Some(
+                        waveshare_epd397_rust_app::reader::IMMERSIVE_STATUS_MS
+                            .saturating_sub(elapsed)
+                            .max(1),
+                    )
+                } else {
+                    state.clear_reading_status_overlay();
+                    status_overlay_token = state.reading_status_overlay_token();
+                    refresh_screen(
+                        &mut panel,
+                        &mut frame,
+                        &mut state,
+                        &mut panel_refresh,
+                        &mut previous_panel_frame,
+                        RefreshRequest::Normal,
+                    )?;
+                    None
+                }
+            } else {
+                status_overlay_token = state.reading_status_overlay_token();
+                None
+            };
             let blocked = deep_sleep_blocked(
                 voice_busy,
                 weread_needs_radio,
                 portal_open,
                 state.alarms.active.is_some(),
                 reader_busy,
+                auto_keeps_awake,
             );
             let deep_after = Duration::from_secs(u64::from(state.auto_deep_sleep_minutes) * 60);
             if !sleep_mode.is_sleeping()
@@ -2269,6 +2358,7 @@ mod firmware {
             if state.panel_rail_on
                 && !sleep_mode.is_sleeping()
                 && !voice_busy
+                && !auto_keeps_awake
                 && last_activity.elapsed() >= Duration::from_secs(PANEL_IDLE_SLEEP_SECONDS)
             {
                 match sleep_panel(&mut panel, &mut state, &mut previous_panel_frame, "idle") {
@@ -2315,6 +2405,21 @@ mod firmware {
                 },
                 weread_due_ms: if weread_needs_radio {
                     Some(waveshare_epd397_rust_app::weread::limits::MIN_REQUEST_GAP_MS)
+                } else {
+                    None
+                },
+                status_overlay_due_ms,
+                auto_turn_due_ms: if auto_keeps_awake {
+                    state
+                        .reader
+                        .preferences
+                        .auto_page_turn
+                        .millis()
+                        .map(|period| {
+                            period
+                                .saturating_sub(auto_turn_since.elapsed().as_millis() as u64)
+                                .max(1)
+                        })
                 } else {
                     None
                 },
@@ -2510,6 +2615,7 @@ mod firmware {
         weread_busy: bool,
         portal_open: bool,
         reader_busy: bool,
+        auto_page_turn: bool,
     ) {
         let idle_ms = idle_for.as_millis() as u64;
         let deep_after_ms = u64::from(state.auto_deep_sleep_minutes).saturating_mul(60_000);
@@ -2519,6 +2625,7 @@ mod firmware {
             portal_open,
             state.alarms.active.is_some(),
             reader_busy,
+            auto_page_turn,
         );
         let reading_gap = matches!(
             state.active_route(),

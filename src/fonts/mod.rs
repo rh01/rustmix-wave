@@ -224,6 +224,12 @@ pub fn ui_cjk_px(line_height: u8) -> u8 {
     line_height.clamp(UI_CJK_MIN_PX, UI_CJK_MAX_PX)
 }
 
+/// True when the embedded Unifont GB2312 subset can draw `character`.
+#[must_use]
+pub fn gb2312_contains(character: char) -> bool {
+    unifont::contains(character)
+}
+
 #[must_use]
 pub fn unicode_advance(character: char, px: u8, latin_fallback: u8) -> i32 {
     if character == '\n' || character == '\r' {

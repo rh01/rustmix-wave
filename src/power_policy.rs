@@ -380,6 +380,8 @@ pub struct WaitInput {
     pub deep_sleep_due_ms: Option<u64>,
     pub status_due_ms: Option<u64>,
     pub weread_due_ms: Option<u64>,
+    pub auto_turn_due_ms: Option<u64>,
+    pub status_overlay_due_ms: Option<u64>,
 }
 
 #[must_use]
@@ -409,6 +411,12 @@ pub fn next_block_ms(input: WaitInput) -> u64 {
         limit = limit.min(due.max(1));
     }
     if let Some(due) = input.weread_due_ms {
+        limit = limit.min(due.max(1));
+    }
+    if let Some(due) = input.auto_turn_due_ms {
+        limit = limit.min(due.max(1));
+    }
+    if let Some(due) = input.status_overlay_due_ms {
         limit = limit.min(due.max(1));
     }
     limit.clamp(1, MAX_BLOCK_MS)
@@ -577,8 +585,9 @@ pub fn deep_sleep_blocked(
     portal: bool,
     alarm_ringing: bool,
     reader_busy: bool,
+    auto_page_turn: bool,
 ) -> bool {
-    voice || weread || portal || alarm_ringing || reader_busy
+    voice || weread || portal || alarm_ringing || reader_busy || auto_page_turn
 }
 
 /// Whole seconds from `now` until `later`, if `later` is strictly in the future.
@@ -941,14 +950,17 @@ mod tests {
             mcu_mode(600_000, 600_000, true, true),
             McuPowerMode::LightSleepEligible
         );
-        assert!(deep_sleep_blocked(false, true, false, false, false));
-        assert!(!deep_sleep_blocked(false, false, false, false, false));
+        assert!(deep_sleep_blocked(false, true, false, false, false, false));
+        assert!(!deep_sleep_blocked(
+            false, false, false, false, false, false
+        ));
+        assert!(deep_sleep_blocked(false, false, false, false, false, true));
     }
 
     #[test]
     fn weread_download_holds_the_radio_the_sd_clock_and_deep_sleep() {
         assert!(RadioJob::WeRead.holds_radio());
-        assert!(deep_sleep_blocked(false, true, false, false, false));
+        assert!(deep_sleep_blocked(false, true, false, false, false, false));
         assert!(!sd_host_can_idle(true, false, false, true));
         assert_eq!(sd_clock_khz(false), SD_ACTIVE_CLOCK_KHZ);
         assert!(sd_host_can_idle(true, false, false, false));
@@ -971,7 +983,14 @@ mod tests {
             deep_sleep_due_ms: Some(600_000),
             status_due_ms: Some(30_000),
             weread_due_ms: None,
+            auto_turn_due_ms: None,
+            status_overlay_due_ms: None,
         };
+        let turning = WaitInput {
+            auto_turn_due_ms: Some(40),
+            ..idle
+        };
+        assert_eq!(next_block_ms(turning), 40);
         assert_eq!(next_block_ms(idle), 1_000);
         let pumping = WaitInput {
             voice_pump: true,

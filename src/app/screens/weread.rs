@@ -12,7 +12,7 @@ use crate::{
     app::{
         reader_typography::reader_body_style,
         state::AppState,
-        typography::{Text, UiTextRole},
+        typography::{Text, TextBounds, UiTextRole},
         widgets::{footer::draw_footer, header::draw_header},
     },
     orientation::OrientedFrameBuffer,
@@ -76,7 +76,7 @@ pub fn render_shelf(
         )?;
         if weread.session.covers {
             if let Some(bitmap) = weread.covers.get(offset).and_then(Option::as_ref) {
-                draw_bitmap(display, bitmap, 360, 252 + row as i32 * 58, 48, 48)?;
+                draw_bitmap(display, bitmap, 360, 252 + row as i32 * 58, 48, 48, false)?;
             }
         }
     }
@@ -228,6 +228,88 @@ pub fn render_toc(
     )
 }
 
+fn render_immersive_chapter(
+    display: &mut OrientedFrameBuffer<'_>,
+    state: &AppState,
+    weread: &crate::weread::WereadUi,
+    _title: &str,
+    dark: bool,
+    layout: crate::reader::ReaderLayout,
+) -> Result<(), Infallible> {
+    let size = display.orientation().logical_size();
+    let width = size.width as i32;
+    let height = size.height as i32;
+    let body = reader_body_style(
+        state.reader.preferences.book_font,
+        state.reader.preferences.font_size,
+        state.reader.preferences.theme,
+    )
+    .with_tracking(state.reader.preferences.letter_spacing.pixels())
+    .with_color(if dark {
+        BinaryColor::Off
+    } else {
+        BinaryColor::On
+    });
+    let line_step = i32::from(body.line_height()) + 2 + i32::from(layout.line_spacing_px);
+    let left = i32::from(layout.margin_left_px);
+    let right = width - i32::from(layout.margin_right_px);
+    let top = i32::from(layout.margin_top_px);
+    let bottom = height - i32::from(layout.margin_bottom_px);
+    if let Some(page) = weread.pages.get(weread.page_index) {
+        for (index, line) in page.iter().enumerate() {
+            let baseline = top + i32::from(body.line_height()) + index as i32 * line_step;
+            if baseline > bottom {
+                break;
+            }
+            let indent = if line.first_line_indent {
+                layout.indent_px()
+            } else {
+                0
+            };
+            let shown = state.reader.preferences.display_line(&line.text);
+            let bounds = TextBounds::new(left + indent, top, right, bottom);
+            let (rendered, x) = super::reader::aligned_reader_line(
+                shown.as_str(),
+                line.paragraph_end,
+                state.reader.preferences.effective_alignment(),
+                body,
+                bounds,
+            );
+            Text::new(rendered.as_str(), Point::new(x, baseline), body).draw(display)?;
+        }
+    } else {
+        let ink = if dark {
+            state.display.text_style(UiTextRole::Body, BinaryColor::Off)
+        } else {
+            state.display.body_style()
+        };
+        Text::new(
+            &truncate(&weread.status, 40),
+            Point::new(left, top + 48),
+            ink,
+        )
+        .draw(display)?;
+    }
+    if state.reading_status_overlay {
+        let progress = weread_progress_label(
+            &state.reader.preferences,
+            weread.page_index,
+            weread.pages.len(),
+            weread.chapter_pos,
+            weread.chapters.len(),
+            &state.board.time_label(state.regional),
+            &state.board.battery_label(),
+        );
+        let label = if progress.is_empty() {
+            "SELECT menu".to_string()
+        } else {
+            format!("{progress}  SELECT menu")
+        };
+        super::reader::draw_immersive_status(display, state, &label)?;
+    }
+    Ok(())
+}
+
 pub fn render_read(
     display: &mut OrientedFrameBuffer<'_>,
     state: &AppState,
@@ -239,25 +321,46 @@ pub fn render_read(
         .map(|chapter| chapter.title.as_str())
         .or_else(|| weread.detail.as_ref().map(|detail| detail.title.as_str()))
         .unwrap_or("WeRead");
+    let dark = state.reader.preferences.dark_mode;
+    if dark {
+        let size = display.orientation().logical_size();
+        Rectangle::new(Point::new(0, 0), Size::new(size.width, size.height))
+            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+            .draw(display)?;
+    }
+    let chrome = if dark {
+        state.display.text_style(UiTextRole::Body, BinaryColor::Off)
+    } else {
+        state.display.body_style()
+    };
+    let layout = state.reader.preferences.layout();
+    if layout.immersive {
+        return render_immersive_chapter(display, state, weread, title, dark, layout);
+    }
     draw_header(display, state.display, "WEREAD", "CHAPTER")?;
     Text::new(
         &state.display.heading_style().truncate(title, 24, 420),
         Point::new(24, 128),
-        state.display.body_style(),
+        chrome,
     )
     .draw(display)?;
-    let page_count = weread.pages.len().max(1);
-    let page_label = format!("Page {} / {page_count}", weread.page_index + 1);
-    Text::new(
-        &page_label,
-        Point::new(300, 128),
-        state.display.detail_style(),
-    )
-    .draw(display)?;
+    let progress = weread_progress_label(
+        &state.reader.preferences,
+        weread.page_index,
+        weread.pages.len(),
+        weread.chapter_pos,
+        weread.chapters.len(),
+        &state.board.time_label(state.regional),
+        &state.board.battery_label(),
+    );
+    if !progress.is_empty() {
+        let shown = chrome.truncate(&progress, 22, 168);
+        Text::new(&shown, Point::new(300, 128), chrome).draw(display)?;
+    }
     let mut top = 160;
     if weread.page_index == 0 {
         if let Some(bitmap) = weread.images.iter().find_map(|image| image.bitmap.as_ref()) {
-            draw_bitmap(display, bitmap, 24, top, 432, 160)?;
+            draw_bitmap(display, bitmap, 24, top, 432, 160, dark)?;
             top += 168;
         }
     }
@@ -265,29 +368,57 @@ pub fn render_read(
         state.reader.preferences.book_font,
         state.reader.preferences.font_size,
         state.reader.preferences.theme,
-    );
-    let line_step = i32::from(body.line_height()) + 2;
+    )
+    .with_tracking(state.reader.preferences.letter_spacing.pixels())
+    .with_color(if dark {
+        BinaryColor::Off
+    } else {
+        BinaryColor::On
+    });
+    let line_step = i32::from(body.line_height()) + 2 + i32::from(layout.line_spacing_px);
+    let left = 24 + i32::from(layout.margin_left_px);
+    let right = 456 - i32::from(layout.margin_right_px);
+    top += i32::from(layout.margin_top_px);
     if let Some(page) = weread.pages.get(weread.page_index) {
         for (index, line) in page.iter().enumerate() {
             let baseline = top + i32::from(body.line_height()) + index as i32 * line_step;
-            if baseline > 700 {
+            if baseline > 700 - i32::from(layout.margin_bottom_px) {
                 break;
             }
-            Text::new(&line.text, Point::new(24, baseline), body).draw(display)?;
+            let indent = if line.first_line_indent {
+                layout.indent_px()
+            } else {
+                0
+            };
+            let shown = state.reader.preferences.display_line(&line.text);
+            let bounds = TextBounds::new(left + indent, top, right, 720);
+            let (rendered, x) = super::reader::aligned_reader_line(
+                shown.as_str(),
+                line.paragraph_end,
+                state.reader.preferences.effective_alignment(),
+                body,
+                bounds,
+            );
+            Text::new(rendered.as_str(), Point::new(x, baseline), body).draw(display)?;
         }
     } else {
+        Text::new(&truncate(&weread.status, 40), Point::new(24, 220), chrome).draw(display)?;
+    }
+    if dark {
         Text::new(
-            &truncate(&weread.status, 40),
-            Point::new(24, 220),
-            state.display.body_style(),
+            footer(weread.busy, "MOVE PAGE  SELECT PREFS  HOLD BOOT BOOK"),
+            Point::new(24, 760),
+            chrome,
         )
         .draw(display)?;
+        Ok(())
+    } else {
+        draw_footer(
+            display,
+            state.display,
+            footer(weread.busy, "MOVE PAGE  SELECT PREFS  HOLD BOOT BOOK"),
+        )
     }
-    draw_footer(
-        display,
-        state.display,
-        footer(weread.busy, "MOVE PAGE  SELECT PREFS  HOLD BOOT BOOK"),
-    )
 }
 
 pub fn render_notes(
@@ -422,6 +553,35 @@ fn draw_row(
     Ok(())
 }
 
+fn weread_progress_label(
+    prefs: &crate::reader::ReaderPreferences,
+    page_index: usize,
+    page_count: usize,
+    chapter_index: usize,
+    chapter_count: usize,
+    time: &str,
+    battery: &str,
+) -> String {
+    let mut parts = Vec::new();
+    if prefs.status_page && page_count > 0 {
+        let page = page_index.min(page_count - 1) + 1;
+        parts.push(format!("Page {page} / {page_count}"));
+    }
+    if prefs.status_chapter && chapter_count > 0 {
+        parts.push(format!(
+            "CH {}/{chapter_count}",
+            chapter_index.saturating_add(1)
+        ));
+    }
+    if prefs.status_time && !time.is_empty() {
+        parts.push(time.to_string());
+    }
+    if prefs.status_battery && !battery.is_empty() {
+        parts.push(battery.to_string());
+    }
+    parts.join("  ")
+}
+
 fn draw_bitmap(
     display: &mut OrientedFrameBuffer<'_>,
     bitmap: &crate::weread::bitmap::MonoBitmap,
@@ -429,9 +589,15 @@ fn draw_bitmap(
     top: i32,
     max_width: u32,
     max_height: u32,
+    dark: bool,
 ) -> Result<(), Infallible> {
     let width = u32::from(bitmap.width).min(max_width);
     let height = u32::from(bitmap.height).min(max_height);
+    if dark && width > 0 && height > 0 {
+        Rectangle::new(Point::new(left, top), Size::new(width, height))
+            .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
+            .draw(display)?;
+    }
     for y in 0..height {
         for x in 0..width {
             if bitmap.bit(x as u16, y as u16) {
@@ -455,12 +621,68 @@ fn truncate(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::window_start;
+    use super::{weread_progress_label, window_start};
 
     #[test]
     fn toc_window_keeps_the_cursor_visible() {
         assert_eq!(window_start(0, 20, 8), 0);
         assert_eq!(window_start(10, 20, 8), 3);
         assert_eq!(window_start(19, 20, 8), 12);
+    }
+
+    #[test]
+    fn weread_progress_honors_status_toggles() {
+        let mut prefs = crate::reader::ReaderPreferences::default();
+        let label = weread_progress_label(&prefs, 0, 4, 1, 9, "12:00", "80%");
+        assert_eq!(label, "Page 1 / 4  CH 2/9");
+        prefs.status_page = false;
+        prefs.status_chapter = false;
+        prefs.status_time = true;
+        prefs.status_battery = true;
+        assert_eq!(
+            weread_progress_label(&prefs, 2, 4, 1, 9, "12:00", "80%"),
+            "12:00  80%"
+        );
+        prefs.status_time = false;
+        prefs.status_battery = false;
+        assert!(weread_progress_label(&prefs, 2, 4, 1, 9, "12:00", "80%").is_empty());
+    }
+
+    #[test]
+    fn dark_mode_chapter_image_keeps_a_white_backing() {
+        use embedded_graphics::{
+            pixelcolor::BinaryColor,
+            prelude::{Drawable, OriginDimensions, Point, Primitive},
+            primitives::{PrimitiveStyle, Rectangle},
+        };
+        use image::{codecs::png::PngEncoder, GrayImage, ImageEncoder};
+
+        use crate::{
+            framebuffer::FrameBuffer,
+            orientation::{DisplayOrientation, OrientedFrameBuffer},
+        };
+
+        let gray = GrayImage::from_raw(8, 1, vec![0, 255, 255, 255, 255, 255, 255, 255])
+            .expect("gray image");
+        let mut png = Vec::new();
+        PngEncoder::new(std::io::Cursor::new(&mut png))
+            .write_image(gray.as_raw(), 8, 1, image::ColorType::L8)
+            .expect("png");
+        let bitmap = crate::weread::bitmap::decode_mono(&png, 8, 1).expect("bitmap");
+        assert!(bitmap.bit(0, 0));
+        assert!(!bitmap.bit(1, 0));
+
+        let mut frame = FrameBuffer::new_white();
+        {
+            let mut display = OrientedFrameBuffer::new(&mut frame, DisplayOrientation::Landscape);
+            Rectangle::new(Point::new(0, 0), display.size())
+                .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                .draw(&mut display)
+                .expect("fill");
+            super::draw_bitmap(&mut display, &bitmap, 0, 0, 8, 1, true).expect("bitmap");
+        }
+        let packed = frame.as_bytes()[0];
+        assert_eq!(packed & 0x80, 0, "ink pixel stays black");
+        assert_eq!(packed & 0x40, 0x40, "white backing shows the clear pixel");
     }
 }

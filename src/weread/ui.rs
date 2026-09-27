@@ -521,6 +521,26 @@ impl WereadUi {
         }
     }
 
+    /// Long-press chapter jump. A book with no further chapter stays put.
+    pub fn jump_chapter(&mut self, forward: bool, layout: ReaderLayout, mounted: bool) {
+        if self.chapters.is_empty() {
+            return;
+        }
+        if forward {
+            if self.chapter_pos + 1 >= self.chapters.len() {
+                return;
+            }
+            self.chapter_pos += 1;
+            self.page_index = 0;
+        } else if self.chapter_pos == 0 {
+            return;
+        } else {
+            self.chapter_pos -= 1;
+            self.page_index = 0;
+        }
+        self.begin_read(layout, mounted);
+    }
+
     fn on_notes(&mut self, event: ButtonEvent) -> Option<ScreenRoute> {
         let count = self.notes.len().max(1);
         match event {
@@ -676,7 +696,7 @@ impl WereadUi {
         self.page_index = self.page_index.min(self.pages.len().saturating_sub(1));
     }
 
-    /// Rebuild the open chapter after the shared reader font or size changes.
+    /// Rebuild the open chapter after a shared reader layout change.
     pub fn repaginate(&mut self, layout: ReaderLayout) {
         if self.chapter_source.is_empty() {
             self.paginated_layout = None;
@@ -1553,14 +1573,8 @@ mod tests {
             level: 1,
         }];
         ui.pages = vec![
-            vec![crate::reader::ReaderPageLine {
-                text: "one".into(),
-                paragraph_end: true,
-            }],
-            vec![crate::reader::ReaderPageLine {
-                text: "two".into(),
-                paragraph_end: true,
-            }],
+            vec![crate::reader::ReaderPageLine::new("one", true)],
+            vec![crate::reader::ReaderPageLine::new("two", true)],
         ];
         let layout = ReaderPreferences::default().layout();
         assert_eq!(
@@ -1934,10 +1948,7 @@ mod tests {
         ui.phase = super::Phase::Download;
         ui.chapters = vec![chapter("1", 1, "One")];
         ui.generation = 2;
-        ui.pages = vec![vec![crate::reader::ReaderPageLine {
-            text: "old".into(),
-            paragraph_end: true,
-        }]];
+        ui.pages = vec![vec![crate::reader::ReaderPageLine::new("old", true)]];
         ui.chapter_source = "old".into();
         ui.apply_report(
             Report {
@@ -1997,10 +2008,7 @@ mod tests {
         ui.chapters = vec![chapter("1", 1, "One")];
         ui.generation = 3;
         ui.chapter_source = "old".into();
-        ui.pages = vec![vec![crate::reader::ReaderPageLine {
-            text: "old".into(),
-            paragraph_end: true,
-        }]];
+        ui.pages = vec![vec![crate::reader::ReaderPageLine::new("old", true)]];
         ui.apply_report(
             Report {
                 generation: 3,
@@ -2056,6 +2064,21 @@ mod tests {
             ui.on_button(ScreenRoute::WeReadRead, ButtonEvent::Select, layout, false),
             Some(ScreenRoute::ReaderPreferences)
         );
+    }
+
+    #[test]
+    fn letter_spacing_repaginates_like_a_font_change() {
+        let mut ui = signed_in();
+        let text = "中".repeat(80) + &"abcd ".repeat(80);
+        let tight = ReaderPreferences::default();
+        ui.show_text(&text, tight.layout());
+        let tight_line = ui.pages[0][0].text.chars().count();
+        let mut loose = tight;
+        loose.letter_spacing = crate::reader::LetterSpacing::Px4;
+        assert!(ui.sync_layout(loose.layout()));
+        assert!(ui.pages[0][0].text.chars().count() < tight_line);
+        assert_eq!(ui.chapter_source, text);
+        assert!(!ui.sync_layout(loose.layout()));
     }
 
     #[test]

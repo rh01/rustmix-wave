@@ -366,7 +366,9 @@ pub(crate) struct PsramStackGuard {
 }
 
 impl PsramStackGuard {
-    fn enter(stack_bytes: usize, label: &'static CStr) -> Self {
+    /// Install the PSRAM stack. `Err` means `esp_pthread_set_cfg` failed and
+    /// the process config was left unchanged.
+    fn try_enter(stack_bytes: usize, label: &'static CStr) -> Result<Self, &'static str> {
         let name = label.to_str().unwrap_or("weread-worker");
         unsafe {
             let fallback = sys::esp_pthread_get_default_config();
@@ -379,24 +381,49 @@ impl PsramStackGuard {
             cfg.stack_alloc_caps = sys::MALLOC_CAP_SPIRAM | sys::MALLOC_CAP_8BIT;
             cfg.inherit_cfg = false;
             cfg.thread_name = label.as_ptr();
-            if sys::esp_pthread_set_cfg(&cfg) == ESP_OK {
-                log::info!(
-                    "rustmix-wave={name} status=psram-stack stack-bytes={stack_bytes} caps=spiram"
-                );
-            } else {
+            if sys::esp_pthread_set_cfg(&cfg) != ESP_OK {
                 log::warn!(
-                    "rustmix-wave={name} status=psram-stack-cfg-failed stack-bytes={stack_bytes} fallback=internal"
+                    "rustmix-wave={name} status=psram-stack-cfg-failed stack-bytes={stack_bytes}"
                 );
+                return Err("psram stack cfg failed");
             }
-            Self { restore }
+            log::info!(
+                "rustmix-wave={name} status=psram-stack stack-bytes={stack_bytes} caps=spiram"
+            );
+            Ok(Self { restore })
+        }
+    }
+
+    fn enter(stack_bytes: usize, label: &'static CStr) -> Self {
+        let fallback = unsafe { sys::esp_pthread_get_default_config() };
+        let mut restore = fallback;
+        unsafe {
+            if sys::esp_pthread_get_cfg(&mut restore) != ESP_OK {
+                restore = fallback;
+            }
+        }
+        match Self::try_enter(stack_bytes, label) {
+            Ok(guard) => guard,
+            Err(_) => {
+                log::warn!(
+                    "rustmix-wave={} status=psram-stack-cfg-failed stack-bytes={stack_bytes} fallback=internal",
+                    label.to_str().unwrap_or("weread-worker")
+                );
+                Self { restore }
+            }
         }
     }
 }
 
 /// PSRAM pthread stack for the next `std::thread` spawn. Drop restores the
 /// previous config so other workers stay on internal stacks.
-pub(crate) fn psram_stack(stack_bytes: usize, label: &'static CStr) -> PsramStackGuard {
-    PsramStackGuard::enter(stack_bytes, label)
+///
+/// `Err` when the config was not installed. Callers must not spawn.
+pub(crate) fn psram_stack(
+    stack_bytes: usize,
+    label: &'static CStr,
+) -> Result<PsramStackGuard, &'static str> {
+    PsramStackGuard::try_enter(stack_bytes, label)
 }
 
 impl Drop for PsramStackGuard {

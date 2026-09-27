@@ -973,7 +973,7 @@ fn fetch_inline_image(
         false,
     );
     let bitmap = fetched.ok().and_then(|response| {
-        bitmap::decode_mono(response.body, IMAGE_TARGET_WIDTH, IMAGE_TARGET_HEIGHT).ok()
+        bitmap::decode_on_image_thread(response.body, IMAGE_TARGET_WIDTH, IMAGE_TARGET_HEIGHT)
     });
     ChapterImage {
         alt: image.alt.clone(),

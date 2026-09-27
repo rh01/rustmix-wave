@@ -118,6 +118,22 @@ where
             }
         })
     }
+
+    /// Block until the worker finishes. The caller is not the 16 KiB main task.
+    pub fn join(mut self) -> Result<T, NamedWorkerError<E>> {
+        let Some(handle) = self.handle.take() else {
+            return Err(NamedWorkerError::Panicked);
+        };
+        let name = self.name;
+        crate::runtime_memory::log_runtime_memory(&format!("after-worker-{name}"));
+        match handle.join() {
+            Ok(result) => finish_worker(name, result),
+            Err(_) => {
+                log::warn!("rustmix-wave=worker-boundary name={name} status=panicked");
+                Err(NamedWorkerError::Panicked)
+            }
+        }
+    }
 }
 
 struct JobEnvelope<J, R> {

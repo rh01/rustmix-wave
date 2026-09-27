@@ -23,9 +23,9 @@ use crate::{
     panel_refresh::supports_grayscale_refresh,
     runtime_worker::NamedWorkerHandle,
     weread::limits::{
-        image_alloc_fits, jpeg_decoder_extra_bytes, jpeg_scaled_edge, IMAGE_DECODE_SCRATCH_BYTES,
+        image_alloc_fits, jpeg_decoder_extra_bytes, jpeg_scaled_edge, png_decode_peak,
         IMAGE_DECODE_STACK_BYTES, MAX_CHAPTER_IMAGE_BYTES, MAX_IMAGE_DECODE_BYTES, MAX_IMAGE_EDGE,
-        MAX_JPEG_EDGE,
+        MAX_JPEG_EDGE, PNG_ZLIB_OUT_BYTES,
     },
 };
 
@@ -147,16 +147,35 @@ fn sniff(bytes: &[u8]) -> Option<ImageKind> {
 }
 
 /// Decode on the `weread-img` thread. The main task only moves `bytes` in.
+///
+/// On device the PSRAM stack config has to stick before `pthread_create`.
+/// A failed `esp_pthread_set_cfg` returns an error and does not spawn, so the
+/// caller shows a placeholder instead of decoding on the 16 KiB main stack.
 pub(crate) fn spawn_image_decode(
     bytes: Vec<u8>,
     max_width: u32,
     max_height: u32,
 ) -> std::io::Result<NamedWorkerHandle<Option<MonoBitmap>, &'static str>> {
     #[cfg(target_os = "espidf")]
-    let _psram = crate::weread::http::psram_stack(IMAGE_DECODE_STACK_BYTES, c"weread-img");
+    let _psram = crate::weread::http::psram_stack(IMAGE_DECODE_STACK_BYTES, c"weread-img")
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
     NamedWorkerHandle::spawn("weread-img", IMAGE_DECODE_STACK_BYTES, move || {
         Ok(decode_mono(bytes, max_width, max_height).ok())
     })
+}
+
+/// Decode on `weread-img` and wait. Used by the HTTP worker so JPEG/PNG does
+/// not run on the 32 KiB `weread-http` stack.
+pub(crate) fn decode_on_image_thread(
+    bytes: Vec<u8>,
+    max_width: u32,
+    max_height: u32,
+) -> Option<MonoBitmap> {
+    spawn_image_decode(bytes, max_width, max_height)
+        .ok()?
+        .join()
+        .ok()
+        .flatten()
 }
 
 fn decode_jpeg(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32, PixelFormat), &'static str> {
@@ -193,16 +212,8 @@ fn decode_jpeg(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32, PixelFormat), &'stati
         progressive,
     )
     .ok_or("image is too large")?;
-    if !image_alloc_fits(bytes.len(), extra) {
+    if !image_alloc_fits(bytes.len().saturating_add(extra)) {
         return Err("image is too large");
-    }
-    // The decoder's planes are infallible allocations. Reserve their peak
-    // first so a shortfall becomes a placeholder, then free it before decode.
-    {
-        let mut probe = Vec::<u8>::new();
-        probe
-            .try_reserve_exact(extra.saturating_add(IMAGE_DECODE_SCRATCH_BYTES))
-            .map_err(|_| "image decode failed")?;
     }
     let pixels = decoder.decode().map_err(|_| "image decode failed")?;
     let width = u32::from(got_w);
@@ -235,7 +246,7 @@ fn select_jpeg_scale(
         else {
             continue;
         };
-        if !image_alloc_fits(file_len, extra) {
+        if !image_alloc_fits(file_len.saturating_add(extra)) {
             continue;
         }
         let out_w = u16::try_from(out_w).map_err(|_| "image is too large")?;
@@ -245,28 +256,42 @@ fn select_jpeg_scale(
     Err("image is too large")
 }
 
+fn png_ihdr(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    Some((width, height))
+}
+
 fn decode_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32, usize), &'static str> {
+    let (width, height) = png_ihdr(bytes).ok_or("image header is unreadable")?;
+    let peak = png_decode_peak(bytes.len(), width, height).ok_or("image is too large")?;
+    if width == 0
+        || height == 0
+        || width > MAX_IMAGE_EDGE
+        || height > MAX_IMAGE_EDGE
+        || !image_alloc_fits(peak)
+    {
+        return Err("image is too large");
+    }
     let mut limits = png::Limits::default();
-    limits.bytes = IMAGE_DECODE_SCRATCH_BYTES;
+    limits.bytes = PNG_ZLIB_OUT_BYTES;
     let mut decoder = PngDecoder::new_with_limits(Cursor::new(bytes), limits);
     decoder.set_transformations(Transformations::EXPAND | Transformations::STRIP_16);
     let mut reader = decoder
         .read_info()
         .map_err(|_| "image header is unreadable")?;
-    let (width, height) = reader.info().size();
-    if width == 0
-        || height == 0
-        || width > MAX_IMAGE_EDGE
-        || height > MAX_IMAGE_EDGE
+    let output = reader.output_buffer_size();
+    if output > MAX_IMAGE_DECODE_BYTES
         || !image_alloc_fits(
-            bytes.len(),
-            (width as usize).saturating_mul(height as usize) * 4,
+            bytes
+                .len()
+                .saturating_add(output)
+                .saturating_add(PNG_ZLIB_OUT_BYTES),
         )
     {
-        return Err("image is too large");
-    }
-    let output = reader.output_buffer_size();
-    if output > MAX_IMAGE_DECODE_BYTES || !image_alloc_fits(bytes.len(), output) {
         return Err("image is too large");
     }
     let mut pixels = Vec::new();
@@ -510,7 +535,7 @@ mod tests {
         let png = tiny_png();
         assert!(decode_mono(png[..png.len() / 2].to_vec(), 48, 64).is_err());
         assert!(decode_mono(huge_png_header(), 48, 64).is_err());
-        assert!(decode_mono(jpeg_sof(8_000, 8_000), 752, 594).is_err());
+        assert!(decode_mono(jpeg_sof(8_000, 8_000, false), 752, 594).is_err());
         let bitmap = decode_mono(tiny_jpeg(), 48, 64).unwrap();
         assert!(bitmap.width >= 1 && bitmap.height >= 1);
         let bitmap = decode_mono(tiny_png(), 48, 64).unwrap();
@@ -521,11 +546,18 @@ mod tests {
     fn wide_baseline_jpeg_is_scaled_inside_the_decoder_budget() {
         let bitmap = decode_mono(solid_jpeg(800, 800), 752, 594).unwrap();
         assert!(
-            (300..=592).contains(&bitmap.width) && (300..=592).contains(&bitmap.height),
+            (150..=256).contains(&bitmap.width) && (150..=256).contains(&bitmap.height),
             "decoded {}x{}, full 800px planes would exceed PSRAM",
             bitmap.width,
             bitmap.height
         );
+    }
+
+    #[test]
+    fn progressive_jpeg_decodes_when_it_fits_and_a_large_one_is_rejected() {
+        let bitmap = decode_mono(progressive_jpeg(), 752, 594).unwrap();
+        assert!(bitmap.width >= 1 && bitmap.height >= 1);
+        assert!(decode_mono(jpeg_sof(2_000, 2_000, true), 752, 594).is_err());
     }
 
     #[test]
@@ -576,10 +608,39 @@ mod tests {
         bytes
     }
 
+    /// 16×16 progressive JPEG (SOF2). Small enough that the coefficient planes fit.
+    fn progressive_jpeg() -> Vec<u8> {
+        vec![
+            255, 216, 255, 224, 0, 16, 74, 70, 73, 70, 0, 1, 1, 0, 0, 1, 0, 1, 0, 0, 255, 219, 0,
+            67, 0, 20, 14, 15, 18, 15, 13, 20, 18, 16, 18, 23, 21, 20, 24, 30, 50, 33, 30, 28, 28,
+            30, 61, 44, 46, 36, 50, 73, 64, 76, 75, 71, 64, 70, 69, 80, 90, 115, 98, 80, 85, 109,
+            86, 69, 70, 100, 136, 101, 109, 119, 123, 129, 130, 129, 78, 96, 141, 151, 140, 125,
+            150, 115, 126, 129, 124, 255, 219, 0, 67, 1, 21, 23, 23, 30, 26, 30, 59, 33, 33, 59,
+            124, 83, 70, 83, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124,
+            124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124,
+            124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124,
+            124, 124, 124, 124, 124, 255, 194, 0, 17, 8, 0, 16, 0, 16, 3, 1, 34, 0, 2, 17, 1, 3,
+            17, 1, 255, 196, 0, 21, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 255,
+            196, 0, 20, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 255, 218, 0, 12, 3,
+            1, 0, 2, 16, 3, 16, 0, 0, 1, 152, 16, 255, 196, 0, 20, 16, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 32, 255, 218, 0, 8, 1, 1, 0, 1, 5, 2, 31, 255, 196, 0, 20, 17, 1,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 218, 0, 8, 1, 3, 1, 1, 63, 1, 127,
+            255, 196, 0, 20, 17, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 218, 0, 8,
+            1, 2, 1, 1, 63, 1, 127, 255, 196, 0, 20, 16, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 32, 255, 218, 0, 8, 1, 1, 0, 6, 63, 2, 31, 255, 196, 0, 20, 16, 1, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 255, 218, 0, 8, 1, 1, 0, 1, 63, 33, 31, 255, 218, 0,
+            12, 3, 1, 0, 2, 0, 3, 0, 0, 0, 16, 255, 0, 255, 196, 0, 20, 17, 1, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 218, 0, 8, 1, 3, 1, 1, 63, 16, 127, 255, 196, 0, 20,
+            17, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 218, 0, 8, 1, 2, 1, 1, 63,
+            16, 127, 255, 196, 0, 20, 16, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 255,
+            218, 0, 8, 1, 1, 0, 1, 63, 16, 31, 255, 217,
+        ]
+    }
+
     /// SOF-only JPEG. `read_info` succeeds and the dimension check must reject
     /// it before `decode` allocates coefficient or plane buffers.
-    fn jpeg_sof(width: u16, height: u16) -> Vec<u8> {
-        let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xC0];
+    fn jpeg_sof(width: u16, height: u16, progressive: bool) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xD8, 0xFF, if progressive { 0xC2 } else { 0xC0 }];
         bytes.extend(17u16.to_be_bytes());
         bytes.push(8);
         bytes.extend(height.to_be_bytes());

@@ -75,7 +75,13 @@ pub fn page_for_text_offset(pages: &[Vec<FlowItem>], offset: u32) -> usize {
             .iter()
             .map(flow_text_chars)
             .fold(0u32, |sum, chars| sum.saturating_add(chars as u32));
-        if seen.saturating_add(chars) > offset {
+        // An image-only page has no characters, so the following text shares
+        // this offset. Stay on the picture instead of skipping to that text.
+        if chars == 0 {
+            if seen == offset {
+                return index;
+            }
+        } else if seen.saturating_add(chars) > offset {
             return index;
         }
         seen = seen.saturating_add(chars);
@@ -630,16 +636,40 @@ mod tests {
         let offset = text_chars_before(&tall, "After");
         assert_eq!(offset, text_chars_before(&missing, "After"));
         assert_ne!(offset, 0);
-        assert!(page_has(
-            &tall,
-            page_for_text_offset(&tall, offset),
-            "After"
-        ));
+        let tall_page = page_for_text_offset(&tall, offset);
+        assert!(
+            tall[tall_page]
+                .iter()
+                .any(|item| matches!(item, FlowItem::Image { .. })),
+            "a zero-character image page keeps the offset"
+        );
         assert!(page_has(
             &missing,
             page_for_text_offset(&missing, offset),
             "After"
         ));
+    }
+
+    #[test]
+    fn text_offset_stays_on_an_image_only_page() {
+        let line = |text: &str| {
+            FlowItem::Line(crate::reader::ReaderPageLine {
+                text: text.into(),
+                paragraph_end: true,
+            })
+        };
+        let pages = vec![
+            vec![line("Hi")],
+            vec![FlowItem::Image {
+                slot: 0,
+                width: 8,
+                height: 8,
+            }],
+            vec![line("Yo")],
+        ];
+        assert_eq!(page_for_text_offset(&pages, 2), 1);
+        assert_eq!(page_for_text_offset(&pages, 0), 0);
+        assert_eq!(page_for_text_offset(&pages, 3), 2);
     }
 
     fn text_chars_before(pages: &[Vec<FlowItem>], needle: &str) -> u32 {

@@ -70,7 +70,7 @@ pub struct HttpJobs {
 struct Inflight {
     reply: mpsc::Receiver<Report>,
     chunks: Option<mpsc::Receiver<DownloadEvent>>,
-    download: Option<offline::ChapterDownload>,
+    download: Option<offline::CardDownload>,
     write_error: Option<String>,
     chunks_closed: bool,
     cancel: Arc<AtomicBool>,
@@ -208,7 +208,32 @@ fn spawn_work(work: Work, unix: Option<u64>, cancel: Arc<AtomicBool>) -> Result<
             ) {
                 Ok(file) => {
                     let (tx, rx) = mpsc::sync_channel(2);
-                    (Some(file), Some(tx), Some(rx))
+                    (
+                        Some(offline::CardDownload::Chapter(file)),
+                        Some(tx),
+                        Some(rx),
+                    )
+                }
+                Err(error) => {
+                    return Err(error_report(generation, job, session, error));
+                }
+            }
+        }
+        Job::ChapterImage {
+            book_id,
+            chapter_idx,
+            image_index,
+            ..
+        } => {
+            match offline::ImageDownload::begin(
+                Path::new("/sdcard/RUSTMIX"),
+                book_id,
+                *chapter_idx,
+                *image_index,
+            ) {
+                Ok(file) => {
+                    let (tx, rx) = mpsc::sync_channel(2);
+                    (Some(offline::CardDownload::Image(file)), Some(tx), Some(rx))
                 }
                 Err(error) => {
                     return Err(error_report(generation, job, session, error));

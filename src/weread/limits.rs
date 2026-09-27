@@ -10,10 +10,26 @@ pub const MAX_SHARD_BYTES: usize = 768 * 1024;
 pub const MAX_CHAPTER_TEXT: usize = 512 * 1024;
 /// `META.TXT` book record. The portal can upload 64 MiB, so this read is capped.
 pub const MAX_META_BYTES: usize = 8 * 1024;
-/// Cover or inline image download.
-pub const MAX_IMAGE_BYTES: usize = 96 * 1024;
-/// Decoded image edge before downscale.
-pub const MAX_IMAGE_EDGE: u32 = 800;
+/// Cover thumbnail download. Shelf covers stay small.
+pub const MAX_COVER_BYTES: usize = 96 * 1024;
+/// Historical name for the cover cap.
+pub const MAX_IMAGE_BYTES: usize = MAX_COVER_BYTES;
+/// One chapter image, compressed. Larger responses are skipped with a placeholder.
+///
+/// On device this buffer is a heap `Vec`. Allocations above
+/// `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` (16 KiB) land in PSRAM.
+pub const MAX_CHAPTER_IMAGE_BYTES: usize = 1024 * 1024;
+/// Source edge accepted before decode. Larger headers are skipped.
+pub const MAX_IMAGE_EDGE: u32 = 1_600;
+/// Pixel count accepted before decode. RGBA at this size stays near 2 MiB.
+pub const MAX_DECODE_PIXELS: u32 = 800 * 800;
+/// Decode allocation cap passed to the image crate, beside one compressed image.
+pub const MAX_IMAGE_DECODE_BYTES: usize = 2 * 1024 * 1024;
+/// Widest reader measure. Bitmaps are decoded to this and scaled again to the
+/// open layout when the chapter is drawn.
+pub const IMAGE_TARGET_WIDTH: u32 = 752;
+/// Tallest reader page the bitmap is scaled into before pagination.
+pub const IMAGE_TARGET_HEIGHT: u32 = 594;
 /// Shelf rows kept in RAM.
 pub const MAX_SHELF_BOOKS: usize = 128;
 /// Catalog entries kept for one book.
@@ -23,8 +39,10 @@ pub const MAX_CHAPTERS: usize = 1024;
 pub const MAX_CHAPTER_OBJECT_BYTES: usize = 16 * 1024;
 /// Highlight and note rows.
 pub const MAX_NOTES: usize = 64;
-/// Inline images fetched for one chapter.
-pub const MAX_CHAPTER_IMAGES: usize = 4;
+/// Inline images kept for one chapter. Each compressed body is fetched and
+/// released before the next, so the cap bounds decoded bitmaps, not a pile of
+/// 1 MiB files in RAM.
+pub const MAX_CHAPTER_IMAGES: usize = 8;
 /// Pages produced from one chapter.
 pub const MAX_PAGES: usize = 2_048;
 pub const MAX_TITLE_CHARS: usize = 80;
@@ -79,8 +97,9 @@ pub const SESSION_BAK: &str = "SESS.BAK";
 mod tests {
     use super::{
         DOWNLOAD_CHUNK_BYTES, HTTP_CHAPTER_LIMIT_MS, HTTP_IDLE_LIMIT_MS, HTTP_IO_BUFFER_BYTES,
-        HTTP_READ_TIMEOUT_MS, HTTP_TIMEOUT_SECS, MAX_CHAPTER_TEXT, MAX_SHARD_BYTES,
-        MODULE_PSRAM_BYTES, WEREAD_HTTP_WORKER_STACK_BYTES,
+        HTTP_READ_TIMEOUT_MS, HTTP_TIMEOUT_SECS, MAX_CHAPTER_IMAGES, MAX_CHAPTER_IMAGE_BYTES,
+        MAX_CHAPTER_TEXT, MAX_IMAGE_DECODE_BYTES, MAX_SHARD_BYTES, MODULE_PSRAM_BYTES,
+        WEREAD_HTTP_WORKER_STACK_BYTES,
     };
     use crate::fonts::{
         GLYPH_CACHE_BUDGET_BYTES, MAX_SD_FONT_BYTES, SD_FONT_RESIDENT_BUDGET_BYTES,
@@ -119,5 +138,18 @@ mod tests {
         assert_eq!(HTTP_CHAPTER_LIMIT_MS, 120_000);
         assert!(HTTP_CHAPTER_LIMIT_MS > HTTP_IDLE_LIMIT_MS);
         assert!(HTTP_IDLE_LIMIT_MS > HTTP_READ_TIMEOUT_MS as u64);
+        // One compressed chapter image plus its decode buffer, not every image at once.
+        let image = MAX_CHAPTER_IMAGE_BYTES + MAX_IMAGE_DECODE_BYTES;
+        let with_image = SD_FONT_RESIDENT_BUDGET_BYTES
+            + WEREAD_HTTP_WORKER_STACK_BYTES
+            + image
+            + GLYPH_CACHE_BUDGET_BYTES;
+        assert!(
+            with_image < MODULE_PSRAM_BYTES,
+            "image decode psram budget {with_image} exceeds {MODULE_PSRAM_BYTES}"
+        );
+        assert_eq!(MAX_CHAPTER_IMAGE_BYTES, 1024 * 1024);
+        assert!(MAX_CHAPTER_IMAGES <= 8);
+        assert!(MAX_IMAGE_DECODE_BYTES <= 2 * 1024 * 1024);
     }
 }

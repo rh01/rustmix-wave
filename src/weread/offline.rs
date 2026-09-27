@@ -11,14 +11,15 @@ use std::{
 };
 
 use crate::weread::{
+    bitmap::{self, MonoBitmap},
     decode,
     limits::{
-        DOWNLOAD_CHUNK_BYTES, MAX_CHAPTERS, MAX_CHAPTER_TEXT, MAX_META_BYTES, MAX_SHARD_BYTES,
-        MAX_TITLE_CHARS,
+        DOWNLOAD_CHUNK_BYTES, MAX_CHAPTERS, MAX_CHAPTER_IMAGES, MAX_CHAPTER_IMAGE_BYTES,
+        MAX_CHAPTER_TEXT, MAX_META_BYTES, MAX_SHARD_BYTES, MAX_TITLE_CHARS,
     },
     parse::{ChapterMeta, ReadingProgress},
     session::atomic_write,
-    text,
+    text::{self, Block, ImageRef},
 };
 
 /// One piece of a chapter response, handed from the PSRAM worker to the main task.
@@ -291,6 +292,16 @@ impl ChapterDownload {
     }
 }
 
+impl DownloadFile for ChapterDownload {
+    fn commit(self) -> Result<(), String> {
+        ChapterDownload::commit(self)
+    }
+
+    fn abort(self) {
+        ChapterDownload::abort(self);
+    }
+}
+
 impl Drop for ChapterDownload {
     fn drop(&mut self) {
         self.file.take();
@@ -300,9 +311,163 @@ impl Drop for ChapterDownload {
     }
 }
 
-/// Commit a finished download, or delete the temp file when the chapter failed.
+/// One chapter image streamed beside the chapter text.
+///
+/// The temp file is removed unless [`ImageDownload::commit`] runs. A failure
+/// here does not touch the chapter text file.
+pub struct ImageDownload {
+    file: Option<File>,
+    temp_path: PathBuf,
+    final_path: PathBuf,
+    len: usize,
+    part_open: bool,
+    committed: bool,
+}
+
+impl ImageDownload {
+    pub fn begin(
+        root: &Path,
+        book_id: &str,
+        chapter_index: u32,
+        slot: u16,
+    ) -> Result<Self, String> {
+        let dir = book_dir(root, book_id);
+        fs::create_dir_all(&dir).map_err(|error| explain_storage_error(&error.to_string()))?;
+        let temp_path = dir.join("IMG.TMP");
+        let file =
+            File::create(&temp_path).map_err(|error| explain_storage_error(&error.to_string()))?;
+        Ok(Self {
+            file: Some(file),
+            temp_path,
+            final_path: dir.join(image_name(chapter_index, slot)),
+            len: 0,
+            part_open: false,
+            committed: false,
+        })
+    }
+
+    pub fn apply(&mut self, event: DownloadEvent) -> Result<(), String> {
+        match event {
+            DownloadEvent::BeginPart(_) => {
+                if self.part_open {
+                    return Err("image download part already open".into());
+                }
+                self.part_open = true;
+                Ok(())
+            }
+            DownloadEvent::Chunk(bytes) => self.write_chunk(&bytes),
+            DownloadEvent::EndPart => {
+                if !self.part_open {
+                    return Err("image download part is not open".into());
+                }
+                self.part_open = false;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn commit(mut self) -> Result<(), String> {
+        if self.part_open {
+            return Err("image download incomplete".into());
+        }
+        if let Some(file) = self.file.as_mut() {
+            file.sync_all()
+                .map_err(|error| explain_storage_error(&error.to_string()))?;
+        }
+        self.file.take();
+        fs::rename(&self.temp_path, &self.final_path)
+            .map_err(|error| explain_storage_error(&error.to_string()))?;
+        self.committed = true;
+        Ok(())
+    }
+
+    pub fn abort(self) {}
+
+    fn write_chunk(&mut self, bytes: &[u8]) -> Result<(), String> {
+        if !self.part_open {
+            return Err("image download chunk has no open part".into());
+        }
+        if bytes.len() > DOWNLOAD_CHUNK_BYTES {
+            return Err("image download chunk exceeds the size limit".into());
+        }
+        if self.len.saturating_add(bytes.len()) > MAX_CHAPTER_IMAGE_BYTES {
+            return Err("response exceeds size limit".into());
+        }
+        let file = self.file.as_mut().ok_or("image download file is closed")?;
+        file.write_all(bytes)
+            .map_err(|error| explain_storage_error(&error.to_string()))?;
+        self.len += bytes.len();
+        Ok(())
+    }
+}
+
+impl DownloadFile for ImageDownload {
+    fn commit(self) -> Result<(), String> {
+        ImageDownload::commit(self)
+    }
+
+    fn abort(self) {
+        ImageDownload::abort(self);
+    }
+}
+
+impl Drop for ImageDownload {
+    fn drop(&mut self) {
+        self.file.take();
+        if !self.committed {
+            let _ = fs::remove_file(&self.temp_path);
+        }
+    }
+}
+
+/// A chapter shard or one chapter image being written by the main task.
+pub enum CardDownload {
+    Chapter(ChapterDownload),
+    Image(ImageDownload),
+}
+
+impl From<ChapterDownload> for CardDownload {
+    fn from(download: ChapterDownload) -> Self {
+        Self::Chapter(download)
+    }
+}
+
+impl From<ImageDownload> for CardDownload {
+    fn from(download: ImageDownload) -> Self {
+        Self::Image(download)
+    }
+}
+
+impl CardDownload {
+    pub fn apply(&mut self, event: DownloadEvent) -> Result<(), String> {
+        match self {
+            Self::Chapter(download) => download.apply(event),
+            Self::Image(download) => download.apply(event),
+        }
+    }
+
+    pub fn abort(self) {
+        match self {
+            Self::Chapter(download) => download.abort(),
+            Self::Image(download) => download.abort(),
+        }
+    }
+}
+
+/// Commit a finished download, or delete the temp file when it failed.
 pub fn complete_download(
-    download: ChapterDownload,
+    download: impl Into<CardDownload>,
+    succeeded: bool,
+    write_error: Option<String>,
+) -> Result<(), String> {
+    match download.into() {
+        CardDownload::Chapter(download) => finish_download(download, succeeded, write_error),
+        CardDownload::Image(download) => finish_download(download, succeeded, write_error),
+    }
+}
+
+fn finish_download<D: DownloadFile>(
+    download: D,
     succeeded: bool,
     write_error: Option<String>,
 ) -> Result<(), String> {
@@ -315,6 +480,11 @@ pub fn complete_download(
         return Err("chapter download failed".into());
     }
     download.commit()
+}
+
+trait DownloadFile {
+    fn commit(self) -> Result<(), String>;
+    fn abort(self);
 }
 
 pub fn save_chapter(root: &Path, book_id: &str, chapter: &CachedChapter) -> Result<(), String> {
@@ -373,13 +543,41 @@ pub fn explain_storage_error(error: &str) -> String {
 }
 
 /// Chapters that failed their retries. A reboot must not fetch them again.
+///
+/// Image skip lines already in `SKIP.TXT` are kept.
 pub fn save_download_skip(root: &Path, book_id: &str, indexes: &[u32]) -> Result<(), String> {
+    write_skip_file(root, book_id, indexes, &load_image_skips(root, book_id))
+}
+
+/// One image that failed its retries. The chapter text stays on the card.
+pub fn record_image_skip(
+    root: &Path,
+    book_id: &str,
+    chapter_index: u32,
+    slot: u16,
+) -> Result<(), String> {
+    let mut images = load_image_skips(root, book_id);
+    if !images.contains(&(chapter_index, slot)) {
+        images.push((chapter_index, slot));
+    }
+    write_skip_file(root, book_id, &load_download_skip(root, book_id), &images)
+}
+
+fn write_skip_file(
+    root: &Path,
+    book_id: &str,
+    indexes: &[u32],
+    images: &[(u32, u16)],
+) -> Result<(), String> {
     let dir = book_dir(root, book_id);
     fs::create_dir_all(&dir).map_err(|error| explain_storage_error(&error.to_string()))?;
     let mut body = String::from("WRSKIP1\n");
     for index in indexes.iter().take(MAX_CHAPTERS) {
         body.push_str(&index.to_string());
         body.push('\n');
+    }
+    for (chapter, slot) in images.iter().take(MAX_CHAPTERS) {
+        body.push_str(&format!("I {chapter} {slot}\n"));
     }
     atomic_write(
         &dir.join("SKIP.TXT"),
@@ -415,6 +613,124 @@ pub fn load_download_skip(root: &Path, book_id: &str) -> Vec<u32> {
         }
     }
     indexes
+}
+
+/// Image slots recorded in `SKIP.TXT`. Chapter index lines are ignored here.
+#[must_use]
+pub fn load_image_skips(root: &Path, book_id: &str) -> Vec<(u32, u16)> {
+    let Ok(bytes) = read_capped(&book_dir(root, book_id).join("SKIP.TXT"), 16 * 1024) else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    if !text
+        .lines()
+        .next()
+        .is_some_and(|line| line.trim() == "WRSKIP1")
+    {
+        return Vec::new();
+    }
+    let mut images = Vec::new();
+    for line in text.lines().skip(1) {
+        if images.len() >= MAX_CHAPTERS {
+            break;
+        }
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some("I") {
+            continue;
+        }
+        let Some(chapter) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(slot) = parts.next().and_then(|value| value.parse::<u16>().ok()) else {
+            continue;
+        };
+        if !images.contains(&(chapter, slot)) {
+            images.push((chapter, slot));
+        }
+    }
+    images
+}
+
+/// `{chapter:08X}.I{slot:02X}`. Stem and extension both stay inside FAT 8.3.
+#[must_use]
+pub fn image_name(chapter_index: u32, slot: u16) -> String {
+    format!("{chapter_index:08X}.I{slot:02X}")
+}
+
+#[must_use]
+pub fn image_cached(root: &Path, book_id: &str, chapter_index: u32, slot: u16) -> bool {
+    book_dir(root, book_id)
+        .join(image_name(chapter_index, slot))
+        .is_file()
+}
+
+/// Written after the image pass for a chapter, including when every image was skipped.
+pub fn mark_images_settled(root: &Path, book_id: &str, chapter_index: u32) -> Result<(), String> {
+    let dir = book_dir(root, book_id);
+    fs::create_dir_all(&dir).map_err(|error| explain_storage_error(&error.to_string()))?;
+    atomic_write(
+        &dir.join(settled_name(chapter_index)),
+        &dir.join("RDY.TMP"),
+        &dir.join("RDY.BAK"),
+        b"WRRDY1\n",
+    )
+    .map_err(|error| explain_storage_error(&error))
+}
+
+#[must_use]
+pub fn images_settled(root: &Path, book_id: &str, chapter_index: u32) -> bool {
+    book_dir(root, book_id)
+        .join(settled_name(chapter_index))
+        .is_file()
+}
+
+fn settled_name(chapter_index: u32) -> String {
+    format!("{chapter_index:08X}.RDY")
+}
+
+/// Image URLs from a raw chapter file. Plain `WRCH1` text has already dropped them.
+pub fn chapter_image_refs(root: &Path, book_id: &str, index: u32) -> Vec<ImageRef> {
+    let path = book_dir(root, book_id).join(chapter_name(index));
+    let Some(parts) = read_raw_parts(&path) else {
+        return Vec::new();
+    };
+    let Ok(blocks) = blocks_from_parts(&parts) else {
+        return Vec::new();
+    };
+    blocks
+        .into_iter()
+        .filter_map(|block| match block {
+            Block::Image(image) => Some(image),
+            Block::Text(_) => None,
+        })
+        .take(MAX_CHAPTER_IMAGES)
+        .collect()
+}
+
+/// Decode chapter images saved beside the text. Missing or hostile files are `None`.
+pub fn load_chapter_bitmaps(
+    root: &Path,
+    book_id: &str,
+    index: u32,
+    max_width: u32,
+    max_height: u32,
+) -> Vec<Option<MonoBitmap>> {
+    let mut out = Vec::new();
+    for slot in 0..MAX_CHAPTER_IMAGES {
+        let path = book_dir(root, book_id).join(image_name(index, slot as u16));
+        if !path.is_file() {
+            out.push(None);
+            continue;
+        }
+        let bitmap = read_capped(&path, MAX_CHAPTER_IMAGE_BYTES)
+            .ok()
+            .and_then(|bytes| bitmap::decode_mono(&bytes, max_width, max_height).ok());
+        out.push(bitmap);
+    }
+    while out.last().is_some_and(Option::is_none) {
+        out.pop();
+    }
+    out
 }
 
 pub fn load_chapter(root: &Path, book_id: &str, index: u32) -> Option<CachedChapter> {
@@ -470,6 +786,25 @@ fn load_plain_chapter(path: &Path, index: u32) -> Option<CachedChapter> {
 /// The shard is assembled only here, when the chapter is opened. A successful
 /// decode is rewritten as plain `WRCH1` text so the next open skips the shard.
 fn load_raw_chapter(root: &Path, book_id: &str, index: u32, path: &Path) -> Option<CachedChapter> {
+    let (header, parts) = read_raw_file(path)?;
+    let uid = field(&header, "uid");
+    let idx = field(&header, "idx").parse().unwrap_or(index);
+    let text = materialize_parts(&parts).ok()?;
+    let cached = CachedChapter {
+        uid: uid.chars().take(16).collect(),
+        index: idx,
+        title: String::new(),
+        text: text.chars().take(MAX_CHAPTER_TEXT).collect(),
+    };
+    let _ = save_chapter(root, book_id, &cached);
+    Some(cached)
+}
+
+fn read_raw_parts(path: &Path) -> Option<Vec<Vec<u8>>> {
+    read_raw_file(path).map(|(_, parts)| parts)
+}
+
+fn read_raw_file(path: &Path) -> Option<(String, Vec<Vec<u8>>)> {
     let mut file = File::open(path).ok()?;
     let header = read_through_separator(&mut file, 1024)?;
     if !header
@@ -479,8 +814,6 @@ fn load_raw_chapter(root: &Path, book_id: &str, index: u32, path: &Path) -> Opti
     {
         return None;
     }
-    let uid = field(&header, "uid");
-    let idx = field(&header, "idx").parse().unwrap_or(index);
     let mut parts = Vec::new();
     loop {
         let line = read_line(&mut file, 24).ok()?;
@@ -508,24 +841,19 @@ fn load_raw_chapter(root: &Path, book_id: &str, index: u32, path: &Path) -> Opti
         }
         parts.push(buf);
     }
-    drop(file);
-    let text = materialize_parts(&parts).ok()?;
-    let cached = CachedChapter {
-        uid: uid.chars().take(16).collect(),
-        index: idx,
-        title: String::new(),
-        text: text.chars().take(MAX_CHAPTER_TEXT).collect(),
-    };
-    let _ = save_chapter(root, book_id, &cached);
-    Some(cached)
+    Some((header, parts))
 }
 
 fn materialize_parts(parts: &[Vec<u8>]) -> Result<String, &'static str> {
+    Ok(text::plain_from_blocks(&blocks_from_parts(parts)?))
+}
+
+fn blocks_from_parts(parts: &[Vec<u8>]) -> Result<Vec<Block>, &'static str> {
     if parts.is_empty() {
         return Err("chapter shard was empty or failed its checksum");
     }
     if parts.len() == 1 && parts[0].starts_with(b"PK\x03\x04") {
-        return text::zip_html_text(&parts[0]);
+        return text::blocks_from_zip(&parts[0]);
     }
     let owned: Vec<String> = parts
         .iter()
@@ -534,11 +862,9 @@ fn materialize_parts(parts: &[Vec<u8>]) -> Result<String, &'static str> {
     let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
     let bytes = decode::decode_shards(&refs)?;
     if bytes.starts_with(b"PK\x03\x04") {
-        return text::zip_html_text(&bytes);
+        return text::blocks_from_zip(&bytes);
     }
-    Ok(text::plain_from_blocks(&text::blocks_from_markup(
-        &String::from_utf8_lossy(&bytes),
-    )))
+    Ok(text::blocks_from_markup(&String::from_utf8_lossy(&bytes)))
 }
 
 fn read_through_separator(file: &mut File, max: usize) -> Option<String> {
@@ -936,6 +1262,56 @@ mod tests {
         assert!(error.starts_with("SD card"), "{error}");
         assert!(!super::chapter_cached(&dir, &book, 2));
         assert!(!super::book_dir(&dir, &book).join("CHAP.TMP").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn image_files_stay_beside_the_chapter_and_skips_do_not_drop_chapters() {
+        use crate::wifi_transfer::is_fat83_component;
+        let (dir, book) = temp_book();
+        let html = "<p>Hello</p><img alt=\"图\" src=\"https://res.weread.qq.com/a.jpg\">";
+        let shard = seal_plain(html);
+        let mut download = ChapterDownload::begin(&dir, &book, "2", 2).unwrap();
+        write_part(&mut download, "e0", shard.as_bytes());
+        download.commit().unwrap();
+        let refs = super::chapter_image_refs(&dir, &book, 2);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].slot, 0);
+        assert!(refs[0].url.contains("res.weread.qq.com"));
+
+        let name = super::image_name(2, 0);
+        assert!(is_fat83_component(&name), "{name}");
+        let mut image = super::ImageDownload::begin(&dir, &book, 2, 0).unwrap();
+        let bytes = b"not-a-real-image-but-stored";
+        image.apply(DownloadEvent::BeginPart("img")).unwrap();
+        image.apply(DownloadEvent::Chunk(bytes.to_vec())).unwrap();
+        image.apply(DownloadEvent::EndPart).unwrap();
+        image.commit().unwrap();
+        assert!(super::image_cached(&dir, &book, 2, 0));
+        let stored = fs::read(super::book_dir(&dir, &book).join(&name)).unwrap();
+        assert_eq!(stored, bytes);
+
+        let mut too_big = super::ImageDownload::begin(&dir, &book, 2, 1).unwrap();
+        too_big.apply(DownloadEvent::BeginPart("img")).unwrap();
+        let piece = vec![b'z'; DOWNLOAD_CHUNK_BYTES];
+        for _ in 0..(super::MAX_CHAPTER_IMAGE_BYTES / DOWNLOAD_CHUNK_BYTES) {
+            too_big.apply(DownloadEvent::Chunk(piece.clone())).unwrap();
+        }
+        assert!(too_big
+            .apply(DownloadEvent::Chunk(vec![1]))
+            .unwrap_err()
+            .contains("size limit"));
+        too_big.abort();
+        assert!(!super::book_dir(&dir, &book).join("IMG.TMP").exists());
+
+        super::save_download_skip(&dir, &book, &[3]).unwrap();
+        super::record_image_skip(&dir, &book, 2, 1).unwrap();
+        assert_eq!(super::load_download_skip(&dir, &book), vec![3]);
+        assert_eq!(super::load_image_skips(&dir, &book), vec![(2, 1)]);
+        super::save_download_skip(&dir, &book, &[3, 9]).unwrap();
+        assert_eq!(super::load_image_skips(&dir, &book), vec![(2, 1)]);
+        super::mark_images_settled(&dir, &book, 2).unwrap();
+        assert!(super::images_settled(&dir, &book, 2));
         let _ = fs::remove_dir_all(&dir);
     }
 }

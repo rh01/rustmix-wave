@@ -250,33 +250,14 @@ fn render_immersive_chapter(
     } else {
         BinaryColor::On
     });
-    let line_step = i32::from(body.line_height()) + 2 + i32::from(layout.line_spacing_px);
-    let left = i32::from(layout.margin_left_px);
-    let right = width - i32::from(layout.margin_right_px);
-    let top = i32::from(layout.margin_top_px);
-    let bottom = height - i32::from(layout.margin_bottom_px);
-    if let Some(page) = weread.pages.get(weread.page_index) {
-        for (index, line) in page.iter().enumerate() {
-            let baseline = top + i32::from(body.line_height()) + index as i32 * line_step;
-            if baseline > bottom {
-                break;
-            }
-            let indent = if line.first_line_indent {
-                layout.indent_px()
-            } else {
-                0
-            };
-            let shown = state.reader.preferences.display_line(&line.text);
-            let bounds = TextBounds::new(left + indent, top, right, bottom);
-            let (rendered, x) = super::reader::aligned_reader_line(
-                shown.as_str(),
-                line.paragraph_end,
-                state.reader.preferences.effective_alignment(),
-                body,
-                bounds,
-            );
-            Text::new(rendered.as_str(), Point::new(x, baseline), body).draw(display)?;
-        }
+    let bounds = TextBounds::new(
+        i32::from(layout.margin_left_px),
+        i32::from(layout.margin_top_px),
+        width - i32::from(layout.margin_right_px),
+        height - i32::from(layout.margin_bottom_px),
+    );
+    if weread.pages.get(weread.page_index).is_some() {
+        draw_chapter_flow(display, state, weread, dark, layout, body, bounds)?;
     } else {
         let ink = if dark {
             state.display.text_style(UiTextRole::Body, BinaryColor::Off)
@@ -357,13 +338,6 @@ pub fn render_read(
         let shown = chrome.truncate(&progress, 22, 168);
         Text::new(&shown, Point::new(300, 128), chrome).draw(display)?;
     }
-    let mut top = 160;
-    if weread.page_index == 0 {
-        if let Some(bitmap) = weread.images.iter().find_map(|image| image.bitmap.as_ref()) {
-            draw_bitmap(display, bitmap, 24, top, 432, 160, dark)?;
-            top += 168;
-        }
-    }
     let body = reader_body_style(
         state.reader.preferences.book_font,
         state.reader.preferences.font_size,
@@ -375,32 +349,24 @@ pub fn render_read(
     } else {
         BinaryColor::On
     });
-    let line_step = i32::from(body.line_height()) + 2 + i32::from(layout.line_spacing_px);
-    let left = 24 + i32::from(layout.margin_left_px);
-    let right = 456 - i32::from(layout.margin_right_px);
-    top += i32::from(layout.margin_top_px);
-    if let Some(page) = weread.pages.get(weread.page_index) {
-        for (index, line) in page.iter().enumerate() {
-            let baseline = top + i32::from(body.line_height()) + index as i32 * line_step;
-            if baseline > 700 - i32::from(layout.margin_bottom_px) {
-                break;
-            }
-            let indent = if line.first_line_indent {
-                layout.indent_px()
-            } else {
-                0
-            };
-            let shown = state.reader.preferences.display_line(&line.text);
-            let bounds = TextBounds::new(left + indent, top, right, 720);
-            let (rendered, x) = super::reader::aligned_reader_line(
-                shown.as_str(),
-                line.paragraph_end,
-                state.reader.preferences.effective_alignment(),
-                body,
-                bounds,
-            );
-            Text::new(rendered.as_str(), Point::new(x, baseline), body).draw(display)?;
-        }
+    let size = display.orientation().logical_size();
+    let width = size.width as i32;
+    let landscape = width > size.height as i32;
+    let left = if landscape {
+        24 + i32::from(layout.margin_left_px)
+    } else {
+        24 + i32::from(layout.margin_left_px)
+    };
+    let right = width - 24 - i32::from(layout.margin_right_px);
+    let top = if landscape {
+        88 + i32::from(layout.margin_top_px)
+    } else {
+        160 + i32::from(layout.margin_top_px)
+    };
+    let bottom = top + crate::weread::text::content_height_px(layout) as i32;
+    let bounds = TextBounds::new(left, top, right, bottom);
+    if weread.pages.get(weread.page_index).is_some() {
+        draw_chapter_flow(display, state, weread, dark, layout, body, bounds)?;
     } else {
         Text::new(&truncate(&weread.status, 40), Point::new(24, 220), chrome).draw(display)?;
     }
@@ -580,6 +546,98 @@ fn weread_progress_label(
         parts.push(battery.to_string());
     }
     parts.join("  ")
+}
+
+fn draw_chapter_flow(
+    display: &mut OrientedFrameBuffer<'_>,
+    state: &AppState,
+    weread: &crate::weread::WereadUi,
+    dark: bool,
+    layout: crate::reader::ReaderLayout,
+    body: crate::app::typography::UiTextStyle,
+    bounds: TextBounds,
+) -> Result<(), Infallible> {
+    let Some(page) = weread.pages.get(weread.page_index) else {
+        return Ok(());
+    };
+    let line_step = crate::weread::text::line_step_for(layout) as i32;
+    let mut top = bounds.top;
+    for item in page {
+        if top >= bounds.bottom {
+            break;
+        }
+        match item {
+            crate::weread::text::FlowItem::Line(line) => {
+                let baseline = top + i32::from(body.line_height());
+                if baseline > bounds.bottom {
+                    break;
+                }
+                let mut line_bounds = bounds;
+                line_bounds.top = top;
+                if line.first_line_indent {
+                    line_bounds.left += layout.indent_px();
+                }
+                let shown = state.reader.preferences.display_line(&line.text);
+                let (rendered, x) = super::reader::aligned_reader_line(
+                    shown.as_str(),
+                    line.paragraph_end,
+                    state.reader.preferences.effective_alignment(),
+                    body,
+                    line_bounds,
+                );
+                Text::new(rendered.as_str(), Point::new(x, baseline), body).draw(display)?;
+                top += line_step;
+            }
+            crate::weread::text::FlowItem::Image {
+                slot,
+                width,
+                height,
+            } => {
+                let width = u32::from(*width);
+                let height = u32::from(*height);
+                if let Some(bitmap) = weread
+                    .images
+                    .get(usize::from(*slot))
+                    .and_then(|image| image.bitmap.as_ref())
+                {
+                    draw_scaled_bitmap(display, bitmap, bounds.left, top, width, height, dark)?;
+                }
+                top += height as i32;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn draw_scaled_bitmap(
+    display: &mut OrientedFrameBuffer<'_>,
+    bitmap: &crate::weread::bitmap::MonoBitmap,
+    left: i32,
+    top: i32,
+    dest_width: u32,
+    dest_height: u32,
+    dark: bool,
+) -> Result<(), Infallible> {
+    if dest_width == 0 || dest_height == 0 || bitmap.width == 0 || bitmap.height == 0 {
+        return Ok(());
+    }
+    if dark {
+        Rectangle::new(Point::new(left, top), Size::new(dest_width, dest_height))
+            .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
+            .draw(display)?;
+    }
+    for y in 0..dest_height {
+        for x in 0..dest_width {
+            let source_x = (x * u32::from(bitmap.width) / dest_width) as u16;
+            let source_y = (y * u32::from(bitmap.height) / dest_height) as u16;
+            if bitmap.bit(source_x, source_y) {
+                Rectangle::new(Point::new(left + x as i32, top + y as i32), Size::new(1, 1))
+                    .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                    .draw(display)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn draw_bitmap(

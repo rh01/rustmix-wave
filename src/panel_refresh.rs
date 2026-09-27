@@ -6,6 +6,19 @@
 //! full-screen partial transport until windowed RAM writes receive their own
 //! isolated hardware experiment.
 
+/// Gray levels this panel refresh can show.
+///
+/// The SSD1677 path writes a 1-bit frame. Plane `0x26` keeps the previous image
+/// for partial refresh, not a gray plane, so chapter pictures are dithered to
+/// black and white. A grayscale waveform would set this above 2.
+pub const PANEL_GRAY_LEVELS: u8 = 2;
+
+/// `false` while the driver has no grayscale waveform.
+#[must_use]
+pub const fn supports_grayscale_refresh() -> bool {
+    PANEL_GRAY_LEVELS > 2
+}
+
 /// Periodic ghost-cleanup cadence shared by menus, Reader screens and games.
 /// UI navigation, library browsing, Reader page turns and the Wi-Fi portal all
 /// use partial refresh until this threshold, a wake/boot, a manual ghost
@@ -114,6 +127,12 @@ mod tests {
                 reason: PanelGlobalReason::PeriodicCleanup
             }
         );
+    }
+
+    #[test]
+    fn this_driver_has_no_grayscale_waveform() {
+        assert_eq!(super::PANEL_GRAY_LEVELS, 2);
+        assert!(!super::supports_grayscale_refresh());
     }
 
     #[test]

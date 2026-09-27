@@ -8,8 +8,8 @@ use crate::weread::{
     body::body_transfer_error,
     crypto, decode,
     limits::{
-        DOWNLOAD_CLASSIFY_BYTES, MAX_CHAPTER_IMAGES, MAX_HTML_BYTES, MAX_IMAGE_BYTES,
-        MAX_JSON_BYTES, MAX_SHARD_BYTES,
+        DOWNLOAD_CLASSIFY_BYTES, IMAGE_TARGET_HEIGHT, IMAGE_TARGET_WIDTH, MAX_CHAPTER_IMAGES,
+        MAX_CHAPTER_IMAGE_BYTES, MAX_HTML_BYTES, MAX_IMAGE_BYTES, MAX_JSON_BYTES, MAX_SHARD_BYTES,
     },
     parse::{
         self, BookDetail, ChapterMeta, LoginPoll, NoteLine, ReadingProgress, ResponseClass,
@@ -211,6 +211,13 @@ pub enum Job {
         book_id: String,
         url: String,
     },
+    /// Stream one chapter image onto the SD card. A failure does not drop the chapter text.
+    ChapterImage {
+        book_id: String,
+        chapter_idx: u32,
+        image_index: u16,
+        url: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -252,6 +259,8 @@ pub enum JobOutput {
         book_id: String,
         bitmap: MonoBitmap,
     },
+    /// The image bytes are already on the SD card.
+    ImageStored,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -396,6 +405,12 @@ fn dispatch(
         ),
         Job::Notes { book_id } => notes(transport, session, ctx, book_id),
         Job::Cover { book_id, url } => cover(transport, ctx, book_id, url),
+        Job::ChapterImage {
+            book_id: _,
+            chapter_idx: _,
+            image_index: _,
+            url,
+        } => stream_image(transport, session, ctx, url),
     }
 }
 
@@ -910,32 +925,7 @@ fn finish_chapter(
             let Block::Image(image) = block else {
                 continue;
             };
-            if !bitmap::allowed_asset_url(&image.url) {
-                images.push(ChapterImage {
-                    alt: image.alt.clone(),
-                    bitmap: None,
-                });
-                continue;
-            }
-            let fetched = call(
-                transport,
-                ctx,
-                Request {
-                    method: "GET",
-                    url: image.url.clone(),
-                    body: None,
-                    headers: protocol::browser_headers("", WEB_ORIGIN, false),
-                    max_bytes: MAX_IMAGE_BYTES,
-                },
-                false,
-            );
-            let bitmap = fetched
-                .ok()
-                .and_then(|response| bitmap::decode_mono(&response.body, 400, 480).ok());
-            images.push(ChapterImage {
-                alt: image.alt.clone(),
-                bitmap,
-            });
+            images.push(fetch_inline_image(transport, ctx, image));
         }
     }
     let text = text::plain_from_blocks(&blocks);
@@ -946,6 +936,98 @@ fn finish_chapter(
         psvts,
         format: format.into(),
     })
+}
+
+/// One inline image. A bad host, a body over the cap, or a decode failure becomes
+/// a placeholder and does not fail the chapter text.
+fn fetch_inline_image(
+    transport: &mut dyn Transport,
+    ctx: &mut CallCtx,
+    image: &crate::weread::text::ImageRef,
+) -> ChapterImage {
+    if !bitmap::allowed_asset_url(&image.url) {
+        return ChapterImage {
+            alt: image.alt.clone(),
+            bitmap: None,
+        };
+    }
+    let fetched = call(
+        transport,
+        ctx,
+        Request {
+            method: "GET",
+            url: image.url.clone(),
+            body: None,
+            headers: protocol::browser_headers("", WEB_ORIGIN, false),
+            max_bytes: MAX_CHAPTER_IMAGE_BYTES,
+        },
+        false,
+    );
+    let bitmap = fetched.ok().and_then(|response| {
+        bitmap::decode_mono(&response.body, IMAGE_TARGET_WIDTH, IMAGE_TARGET_HEIGHT).ok()
+    });
+    ChapterImage {
+        alt: image.alt.clone(),
+        bitmap,
+    }
+}
+
+fn stream_image(
+    transport: &mut dyn Transport,
+    session: &mut Session,
+    ctx: &mut CallCtx,
+    url: &str,
+) -> Result<JobOutput, JobError> {
+    if !bitmap::allowed_asset_url(url) {
+        return Err(JobError::Message("image host is not allowed".into()));
+    }
+    if !transport.streaming_download() {
+        return Err(JobError::Message(
+            "image download needs the SD stream".into(),
+        ));
+    }
+    if transport.cancelled() {
+        return Err(JobError::Cancelled);
+    }
+    if ctx.first {
+        ctx.first = false;
+    } else {
+        transport.idle();
+    }
+    if transport.cancelled() {
+        return Err(JobError::Cancelled);
+    }
+    let streamed = transport
+        .call_stream(
+            &Request {
+                method: "GET",
+                url: url.to_string(),
+                body: None,
+                headers: protocol::browser_headers("", WEB_ORIGIN, false),
+                max_bytes: MAX_CHAPTER_IMAGE_BYTES,
+            },
+            "img",
+        )
+        .map_err(transport_job_error)?;
+    if streamed.total > MAX_CHAPTER_IMAGE_BYTES {
+        return Err(JobError::Message("response exceeds size limit".into()));
+    }
+    if let Some(error) = body_transfer_error(
+        streamed.content_length,
+        streamed.total,
+        streamed.chunked,
+        streamed.terminal_chunk,
+    ) {
+        return Err(JobError::Message(error.into()));
+    }
+    session.absorb_set_cookie(&streamed.set_cookie);
+    if streamed.status != 200 {
+        return Err(JobError::Message(format!(
+            "WeRead image was not available (HTTP {}).",
+            streamed.status
+        )));
+    }
+    Ok(JobOutput::ImageStored)
 }
 
 fn upload_progress(
@@ -2379,5 +2461,70 @@ mod tests {
             panic!("empty chapter must fail");
         };
         assert!(message.contains("empty chapter"));
+    }
+
+    #[test]
+    fn streamed_image_checks_length_and_keeps_chunks_bounded() {
+        let body = b"image-bytes-0123456789".repeat(400);
+        let chunk = crate::weread::limits::DOWNLOAD_CHUNK_BYTES;
+        assert!(body.len() > chunk);
+        let mut transport = RecordingStream {
+            steps: vec![Response {
+                status: 200,
+                body: body.clone(),
+                set_cookie: String::new(),
+                content_length: Some(body.len()),
+            }],
+            index: 0,
+            urls: Vec::new(),
+            chunk_lens: Vec::new(),
+        };
+        let report = perform(
+            &mut transport,
+            Work {
+                generation: 1,
+                job: Job::ChapterImage {
+                    book_id: "43208843".into(),
+                    chapter_idx: 2,
+                    image_index: 0,
+                    url: "https://res.weread.qq.com/a.jpg".into(),
+                },
+                session: stream_session(),
+            },
+            Some(1_780_488_000),
+        );
+        assert!(matches!(report.result, Ok(JobOutput::ImageStored)));
+        assert!(transport.chunk_lens.iter().all(|len| *len <= chunk));
+        assert_eq!(transport.chunk_lens.iter().sum::<usize>(), body.len());
+
+        let mut short = RecordingStream {
+            steps: vec![Response {
+                status: 200,
+                body: b"short".to_vec(),
+                set_cookie: String::new(),
+                content_length: Some(100),
+            }],
+            index: 0,
+            urls: Vec::new(),
+            chunk_lens: Vec::new(),
+        };
+        let report = perform(
+            &mut short,
+            Work {
+                generation: 2,
+                job: Job::ChapterImage {
+                    book_id: "43208843".into(),
+                    chapter_idx: 2,
+                    image_index: 1,
+                    url: "https://res.weread.qq.com/b.jpg".into(),
+                },
+                session: stream_session(),
+            },
+            Some(1_780_488_000),
+        );
+        let Err(JobError::Message(message)) = report.result else {
+            panic!("short image must fail");
+        };
+        assert!(message.contains("Content-Length"));
     }
 }

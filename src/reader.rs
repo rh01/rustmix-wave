@@ -3721,19 +3721,9 @@ fn atomic_replace_text(path: &Path, text: &str) -> Result<(), String> {
         return Err(format!("replace {}: {error}", path.display()));
     }
     let _ = fs::remove_file(&backup);
-    fsync_parent_directory(path)
-}
-
-fn fsync_parent_directory(path: &Path) -> Result<(), String> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    if parent.as_os_str().is_empty() {
-        return Ok(());
-    }
-    let dir = File::open(parent).map_err(|error| format!("open {}: {error}", parent.display()))?;
-    dir.sync_all()
-        .map_err(|error| format!("fsync {}: {error}", parent.display()))
+    // ESP-IDF FAT cannot open a directory as a file (`EACCES`). The temp file
+    // `sync_all` above is the durability step; the rename is the commit.
+    Ok(())
 }
 
 fn with_extension(path: &Path, extension: &str) -> PathBuf {

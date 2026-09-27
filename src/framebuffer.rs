@@ -55,6 +55,20 @@ impl FrameBuffer {
         &self.bytes
     }
 
+    /// Copy the frame, or `None` when the 48 KB allocation cannot be reserved.
+    ///
+    /// On device this copy lives in PSRAM. Callers that get `None` must run the
+    /// next refresh as a global base instead of aborting on allocation failure.
+    #[must_use]
+    pub fn try_clone(&self) -> Option<Self> {
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(self.bytes.len()).ok()?;
+        bytes.extend_from_slice(&self.bytes);
+        Some(Self {
+            bytes: bytes.into_boxed_slice(),
+        })
+    }
+
     /// Reset the full image to white.
     pub fn clear_white(&mut self) {
         self.bytes.fill(0xFF);
@@ -128,6 +142,14 @@ mod tests {
         let frame = FrameBuffer::new_white();
         assert_eq!(frame.as_bytes().len(), FRAMEBUFFER_SIZE);
         assert!(frame.as_bytes().iter().all(|byte| *byte == 0xFF));
+    }
+
+    #[test]
+    fn try_clone_copies_the_packed_frame() {
+        let mut frame = FrameBuffer::new_white();
+        frame.set_native_black(Point::new(3, 4), true);
+        let copy = frame.try_clone().expect("host allocation");
+        assert_eq!(copy.as_bytes(), frame.as_bytes());
     }
 
     #[test]

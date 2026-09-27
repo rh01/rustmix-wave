@@ -87,6 +87,38 @@ impl PanelTransport {
     }
 }
 
+/// What the next refresh must assume after [`crate::epaper::Epaper397::sleep`].
+///
+/// Command `0x10` invalidates SSD1677 RAM before ALDO3 is cut. A later pin or
+/// rail error still means both planes are gone, so the retained frame is
+/// dropped and the next refresh is `show_base`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PanelSleepFollowUp {
+    /// `0x10` never left the bus. Controller RAM still holds the last frame.
+    KeepControllerRam,
+    /// `0x10` was accepted. Drop the retained frame and run `show_base` next.
+    ForceShowBase,
+}
+
+#[must_use]
+pub const fn panel_sleep_follow_up(deep_sleep_command_sent: bool) -> PanelSleepFollowUp {
+    if deep_sleep_command_sent {
+        PanelSleepFollowUp::ForceShowBase
+    } else {
+        PanelSleepFollowUp::KeepControllerRam
+    }
+}
+
+/// Whether the PSRAM copy of the last frame is still safe to reuse.
+///
+/// A failed display command can leave the waveform half-applied, so the copy
+/// is dropped. A failed PSRAM clone cannot support a later old-plane restore,
+/// so the next frame is a global base instead of aborting.
+#[must_use]
+pub const fn keep_retained_frame(display_succeeded: bool, clone_succeeded: bool) -> bool {
+    display_succeeded && clone_succeeded
+}
+
 /// Decide the panel command sequence. `refresh_screen` must use this and must
 /// not send a live partial after the rail was cut.
 #[must_use]
@@ -774,10 +806,11 @@ mod tests {
     use super::{
         alarm_wake_plan, clamp_auto_sleep_minutes, classify_wake_cause,
         cycle_auto_deep_sleep_minutes, days_from_civil, deep_sleep_blocked, format_battery,
-        mcu_mode, next_block_ms, plan_panel_transport, power_key_poll_ms, sd_clock_khz,
-        seconds_until, AlarmWakePlan, McuPowerMode, McuWake, PanelTransport, PowerDebugSnapshot,
-        RadioIdle, RadioJob, RefreshCause, SleepResume, WaitInput, CURRENT_DRAW_ESTIMATES,
-        DEFAULT_AUTO_DEEP_SLEEP_MINUTES, RADIO_IDLE_TIMEOUT_SECS, SD_IDLE_CLOCK_KHZ,
+        keep_retained_frame, mcu_mode, next_block_ms, panel_sleep_follow_up, plan_panel_transport,
+        power_key_poll_ms, sd_clock_khz, seconds_until, AlarmWakePlan, McuPowerMode, McuWake,
+        PanelSleepFollowUp, PanelTransport, PowerDebugSnapshot, RadioIdle, RadioJob, RefreshCause,
+        SleepResume, WaitInput, CURRENT_DRAW_ESTIMATES, DEFAULT_AUTO_DEEP_SLEEP_MINUTES,
+        RADIO_IDLE_TIMEOUT_SECS, SD_IDLE_CLOCK_KHZ,
     };
     use crate::rtc::RtcDateTime;
 
@@ -823,6 +856,25 @@ mod tests {
         );
         assert!(!RefreshCause::PanelRailWasCut.wants_global_refresh());
         assert!(RefreshCause::McuWake.wants_global_refresh());
+    }
+
+    #[test]
+    fn sleep_after_deep_sleep_command_forces_show_base() {
+        assert_eq!(
+            panel_sleep_follow_up(false),
+            PanelSleepFollowUp::KeepControllerRam
+        );
+        assert_eq!(
+            panel_sleep_follow_up(true),
+            PanelSleepFollowUp::ForceShowBase
+        );
+        assert_eq!(
+            plan_panel_transport(RefreshCause::PanelRailWasCut, false, false),
+            PanelTransport::GlobalBase
+        );
+        assert!(keep_retained_frame(true, true));
+        assert!(!keep_retained_frame(false, true));
+        assert!(!keep_retained_frame(true, false));
     }
 
     #[test]

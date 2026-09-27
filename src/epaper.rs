@@ -21,6 +21,38 @@ use crate::{
 const BUSY_POLL_MS: u32 = 20;
 const BUSY_TIMEOUT_MS: u32 = 15_000;
 
+/// `sleep` failed. `controller_asleep` is set once command `0x10` was accepted.
+#[derive(Debug)]
+pub struct PanelSleepError {
+    source: anyhow::Error,
+    controller_asleep: bool,
+}
+
+impl PanelSleepError {
+    /// `true` after deep-sleep command `0x10` was accepted.
+    ///
+    /// Controller RAM is gone from that point, including when the later reset
+    /// or ALDO3 step is what failed.
+    #[must_use]
+    pub const fn controller_asleep(&self) -> bool {
+        self.controller_asleep
+    }
+}
+
+impl core::fmt::Display for PanelSleepError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(formatter, "{:#}", self.source)
+    }
+}
+
+impl std::error::Error for PanelSleepError {}
+
+impl From<PanelSleepError> for anyhow::Error {
+    fn from(error: PanelSleepError) -> Self {
+        error.source
+    }
+}
+
 /// Controller driver with explicit ownership of the panel bus and pins.
 pub struct Epaper397<SPI, DC, RST, CS, BUSY, DELAY, POWER> {
     spi: SPI,
@@ -174,10 +206,29 @@ where
     }
 
     /// Put the panel controller into deep sleep and disable its PMIC rail.
-    pub fn sleep(&mut self) -> Result<()> {
+    ///
+    /// Command `0x10` is sent before the pins and ALDO3 are touched. Once it
+    /// has been accepted, [`PanelSleepError::controller_asleep`] is set even
+    /// if a later step fails, because controller RAM is already gone.
+    pub fn sleep(&mut self) -> core::result::Result<(), PanelSleepError> {
         info!("epd397: deep sleep and disable ALDO3");
-        self.command_data(0x10, &[0x01])?;
+        if let Err(error) = self.command_data(0x10, &[0x01]) {
+            return Err(PanelSleepError {
+                source: error,
+                controller_asleep: false,
+            });
+        }
         self.delay.delay_ms(10);
+        if let Err(error) = self.cut_rail_after_deep_sleep() {
+            return Err(PanelSleepError {
+                source: error,
+                controller_asleep: true,
+            });
+        }
+        Ok(())
+    }
+
+    fn cut_rail_after_deep_sleep(&mut self) -> Result<()> {
         self.reset
             .set_low()
             .map_err(|error| anyhow!("EPD_RST low failed: {error:?}"))?;

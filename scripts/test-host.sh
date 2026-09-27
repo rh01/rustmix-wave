@@ -16,11 +16,9 @@ echo 'host-test-native-target-isolation=ok'
 
 export PYTHONDONTWRITEBYTECODE=1
 python3 -B -m unittest discover -s tools/lexicon/tests
-# build.sh reaches this check through validate.sh. ESP-IDF and other generated
-# trees (notably .embuild) contain Python bytecode that is not tracked source.
-if find . \
-  \( -name .git -o -name target -o -name .embuild -o -name dist \) -prune \
-  -o -type d -name '__pycache__' -print -quit | grep -q .; then
+# build.sh reaches this check through validate.sh. Prune toolchain and build
+# trees; __pycache__ in tracked source still fails.
+if find . \( -path ./target -o -path ./.embuild \) -prune -o -name '__pycache__' -print -quit | grep -q .; then
   echo 'python-cache=failed' >&2
   exit 1
 fi

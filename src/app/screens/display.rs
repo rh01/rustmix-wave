@@ -64,7 +64,7 @@ pub fn render_display(
         .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
         .draw(display)?;
     Text::new("Reader", Point::new(44, 500), prefs.navigation_style()).draw(display)?;
-    Text::new("Books, progress and bookmarks", Point::new(44, 548), body).draw(display)?;
+    Text::new("Books, WeRead, and bookmarks", Point::new(44, 548), body).draw(display)?;
     Text::new(
         "Hold BOOT to return to Settings.",
         Point::new(22, 666),

@@ -68,6 +68,7 @@ mod firmware {
             espidf::NetworkRuntime, NetworkLogFingerprint, NetworkSnapshot, WifiConnectionState,
         },
         network_config::{NetworkConfig, WIFI_CONFIG_PATH},
+        ntp::unix_from_rtc_storage,
         panel_refresh::{
             PanelGlobalReason, PanelRefreshCoordinator, PanelRefreshPlan, PanelRefreshRequest,
             PANEL_PARTIAL_REFRESH_LIMIT,
@@ -104,6 +105,7 @@ mod firmware {
             WEATHER_RETRY_DELAYS_SECONDS, WEATHER_RETRY_LIMIT,
         },
         weather_config::{WeatherConfig, WEATHER_CONFIG_PATH},
+        weread::{self, http::WEREAD_HTTP_WORKER_STACK_BYTES},
         wifi_transfer::{
             espidf::WifiTransferServer, WifiTransferSnapshot, WifiTransferUiRequest,
             WIFI_TRANSFER_INACTIVITY_SECONDS, WIFI_TRANSFER_ROOT, WIFI_TRANSFER_SERVER_STACK_BYTES,
@@ -662,6 +664,7 @@ mod firmware {
         info!("rustmix-wave=voice-notes-organizer-controls-export-ready gain-persistence=SETTINGS.TXT metadata=META.TXT titles=friendly-sidecar filenames=fat83-wav recording-date-time=rtc-local storage=esp-vfs-fat-info delete-confirmation=true pause-resume=rx-discard export=wifi-transfer-shortcut");
         info!("rustmix-wave=offline-dictionary-x4-pack-native-foundation-ready root={DICTIONARY_ROOT} index=INDEX.TXT shards=DATA/*.JSN shard-max-bytes={DICTIONARY_SHARD_MAX_BYTES} lookup=exact-prefix-fallback wildcard=true ui=native-rust");
         info!("rustmix-wave=lexicon-vocab-ready root=/sdcard/RUSTMIX/LEXICON format=RMXLEX1 lists=RMXWLS1 vocab=/sdcard/RUSTMIX/VOCAB scheduler=fsrs6,sm2");
+        info!("rustmix-wave=weread-reader-ready root=/sdcard/RUSTMIX/WEREAD login=qr-web chapter=signed-e progress=web-upload offline=sd-text notes=official-gateway worker=weread-http stack-bytes={WEREAD_HTTP_WORKER_STACK_BYTES}");
         info!("rustmix-wave=dictionary-keyboard-boot-axis-navigation-ready short-press=boot toggle=horizontal,vertical default-axis=horizontal selected-key=preserved long-press=hierarchical-back helper=keyboard-grid-navigation");
         info!(
             "rustmix-wave=voice-notes-catalog status=completed notes={} root={VOICE_NOTES_ROOT}",
@@ -679,6 +682,7 @@ mod firmware {
         let mut last_imu_event_screen_refresh = Instant::now();
         let mut weather_retry = WeatherRetryState::default();
         let mut last_voice_record_refresh = Instant::now();
+        let weread_clock = Instant::now();
         loop {
             maintain_wifi_transfer_server(
                 &mut wifi_transfer_server,
@@ -1354,6 +1358,36 @@ mod firmware {
                             RefreshRequest::Normal,
                         )?;
                     }
+                }
+            }
+
+            if !sleep_mode.is_sleeping() && state.active_route().is_weread() {
+                if state.weread.holds_panel() {
+                    last_activity = Instant::now();
+                }
+                let unix = state.board.rtc.and_then(unix_from_rtc_storage);
+                let now_ms = weread_clock.elapsed().as_millis() as u64;
+                let layout = state.reader.preferences.layout();
+                let previous = state.active_route();
+                let outcome = weread::service(
+                    &mut state.weread,
+                    unix,
+                    now_ms,
+                    layout,
+                    state.storage.mounted,
+                );
+                if let Some(route) = outcome.route {
+                    state.router.navigate_to(route);
+                    state.weread.note_route(previous, route);
+                }
+                if outcome.refresh && state.panel_awake {
+                    refresh_screen(
+                        &mut panel,
+                        &mut frame,
+                        &mut state,
+                        &mut panel_refresh,
+                        RefreshRequest::Normal,
+                    )?;
                 }
             }
 

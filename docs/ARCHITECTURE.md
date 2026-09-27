@@ -149,6 +149,21 @@ Reader state lives below:
 
 Reader writes use FAT 8.3-safe `.TMP` and `.BAK` siblings. Bookmarks retain byte offsets as authoritative anchors. CJK rendering lives in `src/fonts/`: SD TTF/OTF faces under `/fonts` or `/RUSTMIX/FONTS` are rasterized into a PSRAM cache; GNU Unifont GB2312 is the flash fallback. Reader font sizes are the exact pixel steps 16, 20, 24, 32, 48 and 72.
 
+## WeRead boundary
+
+`src/weread/` is the personal WeChat Reading client. Host-testable code owns the web session, the official agent gateway, signed chapter requests, shard decoding, a bounded JSON scanner, QR module generation, and SD cache records. `src/weread/ui.rs` paginates chapter text with `reader::paginate_plain_text`, so CJK line breaks match the TXT/EPUB reader. The ESP-IDF HTTP worker is `weread-http` and is compiled only for the device.
+
+```text
+/sdcard/RUSTMIX/WEREAD.TXT
+/sdcard/RUSTMIX/WEREAD/SESS.TXT
+/sdcard/RUSTMIX/WEREAD/<8HEX>/META.TXT
+/sdcard/RUSTMIX/WEREAD/<8HEX>/TOC.TXT
+/sdcard/RUSTMIX/WEREAD/<8HEX>/CHxxxx.TXT
+/sdcard/RUSTMIX/WEREAD/<8HEX>/PROG.TXT
+```
+
+The main loop runs at most one WeRead job per iteration, then returns to button polling. Login polls and whole-book downloads are separate jobs. Chapter bytes and images are heap allocations checked against a cap before `Vec` reserve; allocations above 16 KiB use PSRAM.
+
 ## Voice Notes boundary
 
 Voice-note friendly-title editing reuses the shared keyboard-grid navigator: BOOT short toggles `NAV H` / `NAV V`, rotary movement follows the active axis, and keyboard `SAVE` / `CANCEL` actions keep long BOOT as hierarchical cancel/back.
@@ -274,6 +289,7 @@ Heavy operations are deliberately moved away from the main task:
 | Full EPUB parse | short-lived `epub-parser` thread | 64 KiB worker stack | heap-owned bounded EPUB document |
 | EPUB title lookup during library scans | short-lived EPUB title thread | 32 KiB worker stack | compact title string |
 | HTTPS weather fetch | `runtime_worker::run_named_worker("weather-fetch", ...)` | 64 KiB worker stack, bounded 8 KiB response | parsed weather snapshot or classified error |
+| WeRead HTTPS job | `runtime_worker::run_named_worker("weread-http", ...)` | 96 KiB worker stack, capped JSON/HTML/shard/image bodies | one login, shelf, chapter, progress, notes, or cover result |
 | Lua app open | `runtime_worker::run_named_worker("lua-loader", ...)` | 32 KiB worker stack, bounded script size | compact native Lua session and canvas |
 | Wi-Fi transfer portal | ESP-IDF HTTP server task | 24 KiB task stack, 4 KiB streaming chunks, 64 MiB upload cap | compact lifecycle snapshot |
 | Voice Notes PCM record/playback | cooperative main-loop chunks | bounded I2S RX/TX buffers, streamed `.TMP` finalization | compact UI progress snapshots |

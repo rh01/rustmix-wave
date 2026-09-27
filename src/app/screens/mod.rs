@@ -28,6 +28,7 @@ pub mod unit_converter;
 pub mod vocab;
 pub mod voice_notes;
 pub mod weather;
+pub mod weread;
 
 /// Draw the active screen selected by the router.
 pub fn render_active_screen(
@@ -48,6 +49,13 @@ pub fn render_active_screen(
         ScreenRoute::ReaderOptions => reader::render_options(display, state),
         ScreenRoute::ReaderPreferences => reader::render_preferences(display, state),
         ScreenRoute::ReaderToc => reader::render_toc(display, state),
+        ScreenRoute::WeRead => weread::render_shelf(display, state),
+        ScreenRoute::WeReadLogin => weread::render_login(display, state),
+        ScreenRoute::WeReadBook => weread::render_book(display, state),
+        ScreenRoute::WeReadToc => weread::render_toc(display, state),
+        ScreenRoute::WeReadRead => weread::render_read(display, state),
+        ScreenRoute::WeReadNotes => weread::render_notes(display, state),
+        ScreenRoute::WeReadDownload => weread::render_download(display, state),
         ScreenRoute::Calendar => calendar::render_calendar(display, state),
         ScreenRoute::CalendarAgenda => calendar::render_calendar_agenda(display, state),
         ScreenRoute::CalendarEventDetails => {

@@ -1,0 +1,3 @@
+# Optional WeRead official API key. Chapter text still needs the on-device QR login.
+# api_key=wrk-your-key
+covers=0

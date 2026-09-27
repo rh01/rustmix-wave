@@ -29,6 +29,61 @@ pub fn rtc_storage_wall_clock_from_utc(utc: RtcDateTime) -> RtcDateTime {
     utc.shift_minutes(i32::from(SAMPLE_RTC_STORAGE_UTC_OFFSET_MINUTES))
 }
 
+/// Invert [`utc_from_unix_seconds`]. Invalid civil fields return `None`.
+#[must_use]
+pub fn unix_from_utc(utc: RtcDateTime) -> Option<u64> {
+    if utc.year < 1970 || utc.month == 0 || utc.day == 0 {
+        return None;
+    }
+    let mut lo = 0u64;
+    let mut hi = 4_102_444_800u64;
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        match cmp_civil(&utc_from_unix_seconds(mid), &utc) {
+            core::cmp::Ordering::Equal => return Some(mid),
+            core::cmp::Ordering::Less => lo = mid.saturating_add(1),
+            core::cmp::Ordering::Greater => {
+                if mid == 0 {
+                    return None;
+                }
+                hi = mid - 1;
+            }
+        }
+    }
+    None
+}
+
+/// Convert the sample RTC storage basis (UTC+08:00) back to Unix seconds.
+#[must_use]
+pub fn unix_from_rtc_storage(stored: RtcDateTime) -> Option<u64> {
+    let utc = stored.shift_minutes(-i32::from(SAMPLE_RTC_STORAGE_UTC_OFFSET_MINUTES));
+    let unix = unix_from_utc(utc)?;
+    if unix < MIN_VALID_SNTP_UNIX_SECONDS {
+        None
+    } else {
+        Some(unix)
+    }
+}
+
+fn cmp_civil(left: &RtcDateTime, right: &RtcDateTime) -> core::cmp::Ordering {
+    (
+        left.year,
+        left.month,
+        left.day,
+        left.hour,
+        left.minute,
+        left.second,
+    )
+        .cmp(&(
+            right.year,
+            right.month,
+            right.day,
+            right.hour,
+            right.minute,
+            right.second,
+        ))
+}
+
 /// Convert days since 1970-01-01 into Gregorian date fields.
 fn civil_from_days(days_since_epoch: i64) -> (u16, u8, u8) {
     let z = days_since_epoch + 719_468;
@@ -61,5 +116,16 @@ mod tests {
     fn converts_utc_into_sample_rtc_storage_basis() {
         let stored = rtc_storage_wall_clock_from_utc(utc_from_unix_seconds(1_780_488_000));
         assert_eq!(stored.date_time(), "2026-06-03  20:00:00");
+    }
+
+    #[test]
+    fn rtc_storage_round_trips_to_unix_seconds() {
+        let unix = 1_780_488_000;
+        let stored = rtc_storage_wall_clock_from_utc(utc_from_unix_seconds(unix));
+        assert_eq!(super::unix_from_rtc_storage(stored), Some(unix));
+        assert_eq!(
+            super::unix_from_utc(utc_from_unix_seconds(unix)),
+            Some(unix)
+        );
     }
 }

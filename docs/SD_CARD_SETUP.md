@@ -39,6 +39,14 @@ Use a FAT-formatted SD card. Rustmix Wave mounts it at `/sdcard` and expects the
   VOCAB/
     PROGRESS.BIN
     SETTINGS.TXT
+  WEREAD.TXT
+  WEREAD/
+    SESS.TXT
+    <8HEX>/
+      META.TXT
+      TOC.TXT
+      CHxxxx.TXT
+      PROG.TXT
 ```
 
 ## Install bundled examples

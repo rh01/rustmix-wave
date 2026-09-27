@@ -303,6 +303,19 @@ fn rating_name(rating: Rating) -> &'static str {
     }
 }
 
+const MAX_WORDLIST_BYTES: usize = 1024 * 1024;
+
+fn read_capped(path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let mut limited = std::io::Read::take(file, limit as u64 + 1);
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut limited, &mut bytes)?;
+    if bytes.len() > limit {
+        bytes.truncate(limit);
+    }
+    Ok(bytes)
+}
+
 fn discover_decks(root: &Path) -> Vec<DeckChoice> {
     let mut decks = Vec::new();
     let lists = root.join("../LEXICON/LISTS");
@@ -314,7 +327,7 @@ fn discover_decks(root: &Path) -> Vec<DeckChoice> {
                 if path.extension().and_then(|ext| ext.to_str()) != Some("WLS") {
                     continue;
                 }
-                if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(bytes) = read_capped(&path, MAX_WORDLIST_BYTES) {
                     if let Ok(parsed) = parse_wordlist(&bytes) {
                         decks.push(DeckChoice {
                             name: path
@@ -346,7 +359,8 @@ fn discover_decks(root: &Path) -> Vec<DeckChoice> {
 }
 
 fn wordlist_pairs(root: &Path, deck: &DeckChoice) -> anyhow::Result<Vec<(u8, u32)>> {
-    let bytes = std::fs::read(&deck.path)?;
+    let bytes = read_capped(Path::new(&deck.path), MAX_WORDLIST_BYTES)
+        .map_err(|error| anyhow::anyhow!(error))?;
     let parsed = parse_wordlist(&bytes)?;
     let slot = ensure_dict_slot(root, &parsed.dict_id)?;
     Ok(parsed
@@ -448,5 +462,29 @@ mod tests {
         assert_eq!(ui.rating_cursor, 3);
         ui.apply_session_button(ButtonEvent::Up);
         assert_eq!(ui.rating_cursor, 2);
+    }
+
+    #[test]
+    fn wordlist_reads_are_capped_and_oversized_lists_are_skipped() {
+        let base = std::env::temp_dir().join(format!("rmx-wls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let lists = base.join("LEXICON/LISTS");
+        std::fs::create_dir_all(&lists).unwrap();
+        std::fs::create_dir_all(base.join("VOCAB")).unwrap();
+        std::fs::write(
+            lists.join("MINI.WLS"),
+            include_bytes!("../../tests/fixtures/lexicon/MINI.WLS"),
+        )
+        .unwrap();
+        let huge_path = lists.join("HUGE.WLS");
+        std::fs::write(&huge_path, vec![0u8; super::MAX_WORDLIST_BYTES + 64]).unwrap();
+        let capped = super::read_capped(&huge_path, super::MAX_WORDLIST_BYTES).unwrap();
+        assert_eq!(capped.len(), super::MAX_WORDLIST_BYTES);
+        let mut ui = VocabUiState::default();
+        ui.load_from(&base.join("VOCAB"));
+        let names: Vec<_> = ui.decks.iter().map(|deck| deck.name.as_str()).collect();
+        assert!(names.contains(&"MINI"));
+        assert!(!names.contains(&"HUGE"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

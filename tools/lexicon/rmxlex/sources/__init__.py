@@ -1,8 +1,4 @@
-"""Dictionary source plugins.
-
-`zhwikt` (kaikki.org Chinese Wiktionary) is reserved and intentionally not
-registered. Add a `Source` subclass and register it here when that stage starts.
-"""
+"""Dictionary source plugins registered with the lexicon builder."""
 
 from __future__ import annotations
 

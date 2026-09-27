@@ -37,7 +37,7 @@ pub const RESULT_LIMIT: usize = 8;
 pub const STATIC_CREDITS: &[&str] = &[
     "ECDICT: MIT, skywind3000",
     "JMdict: CC BY-SA 4.0, Electronic Dictionary Research and Development Group",
-    "JLPT lists: Tanos / Jonathan Waller; jamsinclair/open-anki-jlpt-decks MIT",
+    "JLPT vocabulary lists: Jonathan Waller, tanos.co.uk (Creative Commons BY, https://www.tanos.co.uk/jlpt/sharing/); CSV packaging: jamsinclair/open-anki-jlpt-decks (MIT)",
     "KANJIDIC2: CC BY-SA 4.0, Electronic Dictionary Research and Development Group",
     "CC-CEDICT: CC BY-SA 4.0, MDBG",
 ];

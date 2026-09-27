@@ -23,9 +23,31 @@ from ..format import (
 )
 from ..normalize import normalize_key
 from .base import BuildOutput, Source
+from .jlpt import JLPT_ATTRIBUTION
+from .jmdict_entities import JMDICT_ENTITIES
 
 COMMON_PRI = {"news1", "ichi1", "spec1", "spec2", "gai1"}
-_ENTITY = re.compile(r"&([A-Za-z0-9_-]+);")
+_ENTITY_DECL = re.compile(r'<!ENTITY\s+([A-Za-z0-9_-]+)\s+"([^"]*)"\s*>')
+_ENTITY_REF = re.compile(r"&(#x[0-9A-Fa-f]+|#[0-9]+|[A-Za-z0-9_-]+);")
+_XML_ENTITIES = {"amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'"}
+
+
+def expand_entities(text: str, entities: dict[str, str]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        token = match.group(1)
+        if token.startswith("#x") or token.startswith("#X"):
+            try:
+                return chr(int(token[2:], 16))
+            except ValueError:
+                return match.group(0)
+        if token.startswith("#"):
+            try:
+                return chr(int(token[1:], 10))
+            except ValueError:
+                return match.group(0)
+        return entities.get(token, match.group(0))
+
+    return _ENTITY_REF.sub(replace, text)
 
 
 def _texts(block: str, tag: str) -> list[str]:
@@ -35,19 +57,23 @@ def _texts(block: str, tag: str) -> list[str]:
 def iter_entries(path: Path):
     import gzip
 
+    entities = dict(JMDICT_ENTITIES)
     opener = gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt", encoding="utf-8") as handle:
         collecting = False
         buf: list[str] = []
         for line in handle:
             if not collecting:
+                for name, value in _ENTITY_DECL.findall(line):
+                    entities[name] = value
+                entities.update(_XML_ENTITIES)
                 if "<entry>" in line:
                     collecting = True
                     buf = [line]
                 continue
             buf.append(line)
             if "</entry>" in line:
-                raw = _ENTITY.sub(r"\1", "".join(buf))
+                raw = expand_entities("".join(buf), entities)
                 collecting = False
                 buf = []
                 yield raw
@@ -112,8 +138,7 @@ class JmdictSource(Source):
             "license": "CC BY-SA 4.0",
             "attribution": (
                 "JMdict / Electronic Dictionary Research and Development Group (EDRDG). "
-                "JLPT lists, when bundled: jamsinclair/open-anki-jlpt-decks (MIT); "
-                "source lists Jonathan Waller / Tanos.co.uk (CC BY)."
+                + JLPT_ATTRIBUTION
             ),
             "redistributable": "no" if args.get("personal") else "yes",
             "builder_version": "rmxlex-1",

@@ -35,6 +35,19 @@ def _attr_texts(block: str, tag: str, attr: str, value: str) -> list[str]:
     return [item.strip() for item in re.findall(pattern, block, flags=re.S)]
 
 
+def english_meanings(block: str) -> list[str]:
+    """Keep meanings with no m_lang, or an English m_lang. Other languages are dropped."""
+    meanings: list[str] = []
+    for attrs, text in re.findall(r"<meaning([^>]*)>(.*?)</meaning>", block, flags=re.S):
+        lang = re.search(r'm_lang="([^"]*)"', attrs)
+        if lang is not None and lang.group(1) not in {"en", "eng"}:
+            continue
+        stripped = text.strip()
+        if stripped:
+            meanings.append(stripped)
+    return meanings
+
+
 def iter_characters(path: Path):
     import gzip
 
@@ -79,7 +92,7 @@ class KanjidicSource(Source):
             strokes = _texts(block, "stroke_count")
             on = _attr_texts(block, "reading", "r_type", "ja_on")
             kun = _attr_texts(block, "reading", "r_type", "ja_kun")
-            meanings = re.findall(r"<meaning>(.*?)</meaning>", block, flags=re.S)
+            meanings = english_meanings(block)
             info = "on={};kun={};strokes={};grade={}".format(
                 ",".join(on),
                 ",".join(kun),

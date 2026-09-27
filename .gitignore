@@ -1,6 +1,6 @@
 # Rust / ESP-IDF build outputs
 /target/
-/.embuild/
+.embuild/
 
 # Generated releases
 /dist/

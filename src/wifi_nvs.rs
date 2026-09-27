@@ -93,7 +93,7 @@ fn load_espidf() -> Option<NetworkConfig> {
     fn read_str(
         handle: esp_idf_svc::sys::nvs_handle_t,
         key: &str,
-        buf: &mut [i8],
+        buf: &mut [core::ffi::c_char],
     ) -> Option<String> {
         let key = CString::new(key).ok()?;
         let mut len = buf.len();
@@ -113,10 +113,10 @@ fn load_espidf() -> Option<NetworkConfig> {
         if nvs_open(ns.as_ptr(), nvs_open_mode_t_NVS_READONLY, &mut handle) != ESP_OK {
             return None;
         }
-        let mut ssid_buf = [0i8; 40];
-        let mut pass_buf = [0i8; 80];
-        let mut tz_buf = [0i8; 40];
-        let mut ntp_buf = [0i8; 80];
+        let mut ssid_buf = [0 as core::ffi::c_char; 40];
+        let mut pass_buf = [0 as core::ffi::c_char; 80];
+        let mut tz_buf = [0 as core::ffi::c_char; 40];
+        let mut ntp_buf = [0 as core::ffi::c_char; 80];
         let ssid = read_str(handle, KEY_SSID, &mut ssid_buf);
         let password = read_str(handle, KEY_PASSWORD, &mut pass_buf).unwrap_or_default();
         let timezone =

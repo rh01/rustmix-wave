@@ -361,7 +361,7 @@ fn start_worker() -> Result<LongLivedWorker<QueuedJob, Report>, std::io::Error> 
 ///
 /// Restoring the previous config keeps weather, EPUB, and Lua workers on
 /// internal stacks. Those tasks touch the filesystem and NVS.
-struct PsramStackGuard {
+pub(crate) struct PsramStackGuard {
     restore: esp_idf_svc::sys::esp_pthread_cfg_t,
 }
 

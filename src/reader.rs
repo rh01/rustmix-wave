@@ -3121,19 +3121,31 @@ impl Default for ReaderUiState {
 fn page_window_for_offset(
     cached: Option<&ReaderAnchorCache>,
     offset: u64,
-) -> (usize, Vec<u64>, usize, u64, bool) {
-    if let Some(cache) = cached {
-        if let Some(index) = cache.offsets.iter().rposition(|start| *start <= offset) {
-            return (
-                cache.base_page,
-                cache.offsets.clone(),
-                index,
-                cache.indexed_through,
-                cache.complete,
-            );
-        }
+) -> Option<(usize, Vec<u64>, usize, u64, bool)> {
+    let cache = cached?;
+    if !cache.complete && offset >= cache.indexed_through {
+        return None;
     }
-    (0, vec![offset], 0, offset, false)
+    let index = cache.offsets.iter().rposition(|start| *start <= offset)?;
+    Some((
+        cache.base_page,
+        cache.offsets.clone(),
+        index,
+        cache.indexed_through,
+        cache.complete,
+    ))
+}
+
+/// Page number for a relayout that starts mid-book without a matching cache.
+///
+/// Uses the first rebuilt page's byte length so the status bar does not show
+/// page 1 while the new index is still empty.
+fn estimated_page_for_offset(offset: u64, first_page: &ReaderCachedPage) -> usize {
+    let page_bytes = first_page
+        .next_byte_offset
+        .saturating_sub(first_page.byte_offset)
+        .max(1);
+    usize::try_from(offset / page_bytes).unwrap_or(usize::MAX)
 }
 
 impl ReaderUiState {
@@ -3966,7 +3978,6 @@ impl ReaderUiState {
     pub fn begin_preferences_edit(&mut self) {
         self.preferences_selected = 0;
         self.preference_menu = PreferenceMenu::Root;
-        self.preferences_layout_dirty = false;
     }
 
     /// Leave a submenu for the root list. Returns false when already at root.
@@ -4257,7 +4268,6 @@ impl ReaderUiState {
             return false;
         }
         self.preferences_layout_dirty = true;
-        self.persist_preferences_best_effort();
         false
     }
 
@@ -4319,9 +4329,9 @@ impl ReaderUiState {
         self.note_deferred_layout()
     }
 
+    /// PREFS.TXT and NVS are written once when the editor closes.
     fn note_deferred_layout(&mut self) -> bool {
         self.preferences_layout_dirty = true;
-        self.persist_preferences_best_effort();
         false
     }
 
@@ -4487,13 +4497,17 @@ impl ReaderUiState {
                 None
             }
         };
-        let (page_number_base, page_offsets, current_page, indexed_through, index_complete) =
+        let mut uncached_anchor = None;
+        let (mut page_number_base, page_offsets, current_page, indexed_through, index_complete) =
             if anchor_by_offset {
                 let offset = requested
                     .filter(|location| location.matches_book(book))
                     .map(|location| location.byte_offset.min(book.size_bytes))
                     .unwrap_or(0);
-                page_window_for_offset(cached.as_ref(), offset)
+                page_window_for_offset(cached.as_ref(), offset).unwrap_or_else(|| {
+                    uncached_anchor = Some(offset);
+                    (0, vec![offset], 0, offset, false)
+                })
             } else if let Some(cache) = cached {
                 let saved = requested.filter(|location| location.matches_book(book));
                 if let Some(location) = saved {
@@ -4537,7 +4551,11 @@ impl ReaderUiState {
         let offset = page_offsets.get(current_page).copied().unwrap_or(0);
         let absolute_page = page_number_base.saturating_add(current_page);
         let layout = self.preferences.layout();
-        let page = read_txt_page(book, encoding, layout, offset, absolute_page)?;
+        let mut page = read_txt_page(book, encoding, layout, offset, absolute_page)?;
+        if let Some(anchor) = uncached_anchor {
+            page_number_base = estimated_page_for_offset(anchor, &page);
+            page.page_index = page_number_base.saturating_add(current_page);
+        }
         let indexed_through = indexed_through.max(page.next_byte_offset);
         let index_complete = index_complete || indexed_through >= book.size_bytes;
         Ok(ReaderSession {
@@ -6177,15 +6195,10 @@ mod tests {
         assert!(reader.finish_preferences_edit());
         assert_eq!(reader.tick(), ReaderTickOutcome::LoadingStageChanged);
         assert_eq!(reader.tick(), ReaderTickOutcome::FirstPageReady);
-        assert_eq!(
-            reader
-                .session
-                .as_ref()
-                .unwrap()
-                .current_location()
-                .byte_offset,
-            offset
-        );
+        let session = reader.session.as_ref().unwrap();
+        assert_eq!(session.current_location().byte_offset, offset);
+        assert!(session.current_absolute_page() >= 1);
+        assert!(session.current_cached_page().is_some());
     }
 
     #[test]
@@ -6219,6 +6232,8 @@ mod tests {
         assert!(!reader.activate_selected_preference());
         assert_eq!(reader.preferences.letter_spacing, LetterSpacing::Px1);
         assert!(reader.loading_stage().is_none());
+        let before = fs::read_to_string(state.join(READER_PREFS_FILE)).unwrap_or_default();
+        assert!(!before.contains("letter_spacing=1"));
         assert!(reader.finish_preferences_edit());
         assert_eq!(
             reader.loading_stage(),

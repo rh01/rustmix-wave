@@ -45,7 +45,12 @@ pub fn render_lua_apps(
             right: &page,
         },
     )?;
-    Text::new("Select an SD-loaded app", Point::new(22, 158), heading).draw(display)?;
+    let prompt = if state.lua_runtime.is_opening() {
+        "Loading app..."
+    } else {
+        "Select an SD-loaded app"
+    };
+    Text::new(prompt, Point::new(22, 158), heading).draw(display)?;
     Text::new("Hold BOOT to go back.", Point::new(22, 188), body).draw(display)?;
 
     if catalog.entries.is_empty() {

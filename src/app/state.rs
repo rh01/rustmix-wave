@@ -495,7 +495,7 @@ impl AppState {
                     self.calendar.refresh_events();
                 }
                 if target == ScreenRoute::Library {
-                    self.reader.refresh_library();
+                    self.reader.refresh_library_retrying_titles();
                 }
                 if target == ScreenRoute::LuaApps {
                     self.lua_runtime.refresh_catalog(true);
@@ -827,11 +827,39 @@ impl AppState {
         }
     }
 
+    /// Advance loads the main loop polls instead of waiting on: a Lua app
+    /// start and a large dictionary index. Returns true when the screen should
+    /// be redrawn.
+    pub fn poll_background_loads(&mut self) -> bool {
+        let lua = self.poll_lua_open();
+        let lexicon = self.lexicon.tick();
+        lua || lexicon
+    }
+
+    /// Finish a Lua app load the catalog started. Returns true when the screen
+    /// should be redrawn.
+    pub fn poll_lua_open(&mut self) -> bool {
+        let Some(opened) = self.lua_runtime.poll_open() else {
+            return false;
+        };
+        if self.router.current() == ScreenRoute::LuaApps {
+            self.router.navigate_to(if opened {
+                ScreenRoute::LuaGame
+            } else {
+                ScreenRoute::LuaGameError
+            });
+        }
+        true
+    }
+
     fn apply_lua_runtime(&mut self, event: ButtonEvent) {
         match self.router.current() {
             ScreenRoute::LuaApps => {
                 if event == ButtonEvent::Select {
                     self.note_select_press();
+                }
+                if self.lua_runtime.is_opening() {
+                    return;
                 }
                 if self.lua_runtime.apply_catalog_button(event) {
                     self.router.navigate_to(ScreenRoute::LuaGame);

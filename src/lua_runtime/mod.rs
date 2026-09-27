@@ -5,7 +5,7 @@
 //! state, motion latching and panel ownership remain in Rust; unrestricted Lua
 //! VM callbacks stay deferred.
 
-use std::path::PathBuf;
+use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
 use crate::{
     buttons::ButtonEvent,
@@ -24,7 +24,7 @@ pub mod manifest;
 
 use catalog::{LuaAppCatalog, LUA_APPS_DIRECTORY};
 use event_bridge::LuaEventBridge;
-use loader::open_entry_on_worker;
+use loader::start_entry_on_worker;
 use manifest::LuaAppEntry;
 
 pub const LUA_CATALOG_PAGE_SIZE: usize = 6;
@@ -45,6 +45,38 @@ pub struct LuaRuntimeUiState {
     pub session: Option<LuaAppSession>,
     pub error: Option<String>,
     diagnostics: Vec<String>,
+    opening: PendingLuaOpen,
+}
+
+/// Longest a Lua app load may run before the catalog shows an error.
+const LUA_OPEN_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+type LuaOpenJob = crate::runtime_worker::NamedWorkerHandle<LuaAppSession, String>;
+
+/// A Lua app load running on the loader thread. The main loop polls it.
+#[derive(Clone, Default)]
+struct PendingLuaOpen(Option<Rc<RefCell<(LuaOpenJob, String, std::time::Instant)>>>);
+
+impl PartialEq for PendingLuaOpen {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (None, None) => true,
+            (Some(left), Some(right)) => Rc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for PendingLuaOpen {}
+
+impl core::fmt::Debug for PendingLuaOpen {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(if self.0.is_some() {
+            "PendingLuaOpen(running)"
+        } else {
+            "PendingLuaOpen(idle)"
+        })
+    }
 }
 
 impl Default for LuaRuntimeUiState {
@@ -55,6 +87,7 @@ impl Default for LuaRuntimeUiState {
             session: None,
             error: None,
             diagnostics: Vec::new(),
+            opening: PendingLuaOpen::default(),
         }
     }
 }
@@ -112,7 +145,12 @@ impl LuaRuntimeUiState {
         }
     }
 
+    /// Start loading the selected app and return at once. The result arrives
+    /// through [`Self::poll_open`]; `false` here means nothing has opened yet.
     pub fn open_selected(&mut self) -> bool {
+        if self.is_opening() {
+            return false;
+        }
         self.error = None;
         let Some(entry) = self.selected_entry().cloned() else {
             self.error = Some("No SD Lua application is selected".into());
@@ -123,7 +161,50 @@ impl LuaRuntimeUiState {
             entry.manifest.id, entry.manifest.entry
         ));
         let entry_id = entry.manifest.id.clone();
-        match self.open_entry(entry) {
+        match start_entry_on_worker(entry) {
+            Ok(job) => {
+                self.opening = PendingLuaOpen(Some(Rc::new(RefCell::new((
+                    job,
+                    entry_id,
+                    std::time::Instant::now(),
+                )))));
+            }
+            Err(error) => self.finish_open(entry_id, Err(error)),
+        }
+        false
+    }
+
+    /// True while an app is loading on the worker.
+    #[must_use]
+    pub fn is_opening(&self) -> bool {
+        self.opening.0.is_some()
+    }
+
+    /// `Some(true)` once the pending app opened, `Some(false)` if it failed,
+    /// `None` while it is still loading or when nothing is loading.
+    pub fn poll_open(&mut self) -> Option<bool> {
+        let finished = {
+            let pending = self.opening.0.as_ref()?;
+            let mut pending = pending.borrow_mut();
+            let (job, entry_id, started) = &mut *pending;
+            let result = match job.try_join() {
+                Some(result) => result.map_err(|error| error.to_string()),
+                None if started.elapsed() >= LUA_OPEN_LIMIT => {
+                    Err("Lua app took too long to load".into())
+                }
+                None => return None,
+            };
+            (entry_id.clone(), result)
+        };
+        self.opening = PendingLuaOpen::default();
+        let (entry_id, result) = finished;
+        let opened = result.is_ok();
+        self.finish_open(entry_id, result);
+        Some(opened)
+    }
+
+    fn finish_open(&mut self, entry_id: String, result: Result<LuaAppSession, String>) {
+        match result {
             Ok(session) => {
                 let regions = session.canvas.dirty().regions().len();
                 let command_count = session.canvas.commands().len();
@@ -135,7 +216,6 @@ impl LuaRuntimeUiState {
                     session.entry.manifest.id, session.source_bytes
                 ));
                 self.session = Some(session);
-                true
             }
             Err(error) => {
                 self.push_diagnostic(format!(
@@ -145,13 +225,8 @@ impl LuaRuntimeUiState {
                 ));
                 self.error = Some(error);
                 self.session = None;
-                false
             }
         }
-    }
-
-    fn open_entry(&mut self, entry: LuaAppEntry) -> Result<LuaAppSession, String> {
-        open_entry_on_worker(entry)
     }
 
     pub fn apply_game_button(&mut self, event: ButtonEvent) -> bool {
@@ -372,7 +447,19 @@ mod tests {
         .unwrap();
         let mut runtime = LuaRuntimeUiState::default();
         runtime.refresh_catalog_from_root(&root, true);
-        assert!(runtime.apply_catalog_button(ButtonEvent::Select));
+        assert!(!runtime.apply_catalog_button(ButtonEvent::Select));
+        assert!(runtime.is_opening());
+        assert!(!runtime.apply_catalog_button(ButtonEvent::Select));
+        let started = std::time::Instant::now();
+        let opened = loop {
+            if let Some(opened) = runtime.poll_open() {
+                break opened;
+            }
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        assert!(opened);
+        assert!(!runtime.is_opening());
         assert!(runtime.session.is_some());
         assert!(!runtime.take_diagnostics().is_empty());
         std::fs::remove_dir_all(root).unwrap();

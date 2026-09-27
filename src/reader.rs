@@ -21,7 +21,7 @@ use std::{
 
 use crate::{
     buttons::ButtonEvent,
-    epub::{open_epub_on_worker, read_epub_title_on_worker, EpubDocument, EpubTocEntry},
+    epub::{read_epub_title_on_worker, EpubDocument, EpubOpenJob, EpubTocEntry},
 };
 
 /// SD-card library owned by the Reader subsystem.
@@ -1825,6 +1825,40 @@ pub struct PendingReaderOpen {
     pub epub_document: Option<EpubDocument>,
     pub resume: Option<ReaderLocation>,
     pub message: String,
+    pub epub_open: PendingEpubOpen,
+}
+
+/// The EPUB parse the loading screen is waiting on. `tick` polls it, so the
+/// main loop keeps reading buttons while a long book opens.
+#[derive(Clone, Default)]
+pub struct PendingEpubOpen(Option<std::rc::Rc<EpubOpenJob>>);
+
+impl PendingEpubOpen {
+    fn job(&self) -> Option<&EpubOpenJob> {
+        self.0.as_deref()
+    }
+}
+
+impl PartialEq for PendingEpubOpen {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (None, None) => true,
+            (Some(left), Some(right)) => std::rc::Rc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for PendingEpubOpen {}
+
+impl core::fmt::Debug for PendingEpubOpen {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(if self.0.is_some() {
+            "PendingEpubOpen(running)"
+        } else {
+            "PendingEpubOpen(idle)"
+        })
+    }
 }
 
 /// One wrapped Reader line. `paragraph_end` prevents Justified rendering from
@@ -3251,6 +3285,13 @@ impl ReaderUiState {
         }
     }
 
+    /// Library refresh the user asked for. EPUBs whose titles failed before
+    /// are parsed again, so a replaced or repaired file gets its real title.
+    pub fn refresh_library_retrying_titles(&mut self) {
+        clear_title_failures(Some(Path::new(&self.state_root)));
+        self.refresh_library();
+    }
+
     pub fn refresh_library(&mut self) {
         let removed = discard_legacy_whole_book_indexes(&self.cache_directory());
         if removed > 0 {
@@ -3405,6 +3446,7 @@ impl ReaderUiState {
             epub_document: None,
             resume,
             message: "Preparing reader...".into(),
+            epub_open: PendingEpubOpen::default(),
         });
     }
 
@@ -3440,6 +3482,7 @@ impl ReaderUiState {
             epub_document: session.epub_document.take(),
             resume: Some(resume),
             message: "Rebuilding the current page first...".into(),
+            epub_open: PendingEpubOpen::default(),
         });
         log::info!(
             "rustmix-wave=reader-session-memory-release status=completed reason=layout-rebuild"
@@ -3498,8 +3541,22 @@ impl ReaderUiState {
                     ReaderTickOutcome::LoadingStageChanged
                 }
                 ReaderLoadingStage::InspectingEpubArchive => {
-                    match open_epub_on_worker(&loading.book.path) {
-                        Ok(document) => {
+                    let polled = match loading.epub_open.job() {
+                        Some(job) => job.poll(),
+                        None => match EpubOpenJob::start(&loading.book.path) {
+                            Ok(job) => {
+                                loading.epub_open = PendingEpubOpen(Some(std::rc::Rc::new(job)));
+                                None
+                            }
+                            Err(error) => Some(Err(error)),
+                        },
+                    };
+                    if polled.is_some() {
+                        loading.epub_open = PendingEpubOpen::default();
+                    }
+                    match polled {
+                        None => ReaderTickOutcome::None,
+                        Some(Ok(document)) => {
                             loading.message = format!(
                                 "{} spine items / {} TOC entries",
                                 document.spine_count,
@@ -3509,7 +3566,7 @@ impl ReaderUiState {
                             loading.stage = ReaderLoadingStage::ReadingEpubPackage;
                             ReaderTickOutcome::LoadingStageChanged
                         }
-                        Err(error) => {
+                        Some(Err(error)) => {
                             loading.stage = ReaderLoadingStage::Failed;
                             loading.message = error;
                             ReaderTickOutcome::Failed
@@ -4745,6 +4802,18 @@ fn merge_title_failures(state_root: Option<&Path>) {
     }
 }
 
+fn clear_title_failures(state_root: Option<&Path>) {
+    title_failures()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+    if let Some(root) = state_root {
+        let path = root.join(TITLE_FAILURE_FILE);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(with_extension(&path, "BAK"));
+    }
+}
+
 fn title_failure_known(key: &str) -> bool {
     title_failures()
         .lock()
@@ -4806,6 +4875,9 @@ fn starts_with_zip_local_header(path: &Path) -> bool {
 
 fn scan_library(root: &Path, state_root: Option<&Path>) -> Result<Vec<ReaderBook>, String> {
     merge_title_failures(state_root);
+    // After one title times out the worker is still busy with it; the rest of
+    // this scan uses filenames instead of waiting behind it.
+    let mut titles_deferred = false;
     let mut books = Vec::new();
     let entries =
         fs::read_dir(root).map_err(|error| format!("Books folder unavailable: {error}"))?;
@@ -4843,13 +4915,26 @@ fn scan_library(root: &Path, state_root: Option<&Path>) -> Result<Vec<ReaderBook
             // channel; a dead title worker cannot panic this task.
             pause_between_library_books();
             let key = title_failure_key(&path, size_bytes, modified_seconds);
-            if title_failure_known(&key) {
+            if titles_deferred || title_failure_known(&key) {
                 fallback_title
             } else {
                 match read_epub_title_on_worker(&path) {
                     Ok(title) if !title.trim().is_empty() => title,
-                    _ => {
+                    Ok(_) => fallback_title,
+                    Err(error) if error.is_malformed() => {
+                        log::warn!(
+                            "rustmix-wave=library-title status=blacklisted path={} error={error}",
+                            path.display()
+                        );
                         remember_title_failure(state_root, key);
+                        fallback_title
+                    }
+                    Err(error) => {
+                        log::info!(
+                            "rustmix-wave=library-title status=deferred path={} error={error}",
+                            path.display()
+                        );
+                        titles_deferred |= error.is_timeout();
                         fallback_title
                     }
                 }
@@ -6743,6 +6828,12 @@ mod tests {
             blacklist.contains("broken-title-blacklist.epub"),
             "{blacklist}"
         );
+        reader.refresh_library_retrying_titles();
+        assert_eq!(
+            hits(),
+            before + 2,
+            "opening Library by hand parses a blacklisted EPUB again"
+        );
         let _ = fs::remove_dir_all(books);
         let _ = fs::remove_dir_all(state);
     }
@@ -6877,10 +6968,17 @@ mod tests {
     }
 
     fn open_until_ready(reader: &mut ReaderUiState) {
-        for _ in 0..8 {
+        let started = std::time::Instant::now();
+        let mut stages = 0;
+        while stages < 8 && started.elapsed() < std::time::Duration::from_secs(10) {
             let outcome = reader.tick();
             if outcome == ReaderTickOutcome::FirstPageReady {
                 return;
+            }
+            if outcome == ReaderTickOutcome::None {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            } else {
+                stages += 1;
             }
             assert_ne!(
                 outcome,

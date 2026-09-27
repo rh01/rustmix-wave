@@ -40,12 +40,10 @@ pub const EPUB_MANIFEST_LIMIT: usize = 256;
 pub const EPUB_SPINE_LIMIT: usize = 128;
 /// Maximum TOC records rendered by the Reader UI.
 pub const EPUB_TOC_LIMIT: usize = 128;
-/// Dedicated parser-worker stack budget. Real EPUB DEFLATE and XHTML work
-/// must not run on the 16 KB firmware main task.
+/// Stack of the one EPUB worker that runs both title scans and full opens.
+/// Full opens need 64 KiB for DEFLATE and XHTML flattening. The thread exits
+/// when idle, so this internal RAM is held only while EPUB work is queued.
 pub const EPUB_PARSER_WORKER_STACK_BYTES: usize = 64 * 1024;
-/// Lightweight OPF-title worker stack budget. Library scans only read bounded
-/// ZIP metadata and must not reserve the full parser stack for each title.
-pub const EPUB_TITLE_WORKER_STACK_BYTES: usize = 32 * 1024;
 /// Largest container.xml or OPF member a library title scan will inflate.
 /// The rest of a novel stays on the SD card.
 pub const EPUB_TITLE_MEMBER_LIMIT: usize = 256 * 1024;
@@ -230,8 +228,17 @@ struct ManifestItem {
 /// unexpectedly")` in the caller — which is the firmware main task. A missing
 /// or late reply is a normal error. The stack stays in internal RAM: this
 /// thread reads the SD card, and a PSRAM stack cannot call FATFS.
+///
+/// The thread is never replaced while it is alive, so a late job cannot run
+/// beside a new one. It exits after [`EPUB_WORKER_IDLE_EXIT`] with nothing
+/// queued, which returns its 64 KiB stack to the internal heap.
 const EPUB_TITLE_TIMEOUT: Duration = Duration::from_secs(8);
-const EPUB_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+/// An open is polled from the Reader tick. Past this the Reader shows an
+/// error; the parse keeps running and later jobs queue behind it.
+pub const EPUB_OPEN_TIMEOUT: Duration = Duration::from_secs(120);
+const EPUB_WORKER_IDLE_EXIT: Duration = Duration::from_secs(5);
+
+type EpubWorker = crate::runtime_worker::LongLivedWorker<EpubJob, EpubReply>;
 
 enum EpubJob {
     Title(PathBuf),
@@ -245,40 +252,65 @@ enum EpubReply {
     Open(Result<EpubDocument, String>),
 }
 
+/// Why a title could not be read. Only [`EpubTitleError::Malformed`] means the
+/// file itself is bad; the other cases are retried on the next scan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EpubTitleError {
+    Malformed(String),
+    Unavailable(String),
+    TimedOut,
+}
+
+impl EpubTitleError {
+    #[must_use]
+    pub fn is_malformed(&self) -> bool {
+        matches!(self, Self::Malformed(_))
+    }
+
+    #[must_use]
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Self::TimedOut)
+    }
+}
+
+impl core::fmt::Display for EpubTitleError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Malformed(message) | Self::Unavailable(message) => formatter.write_str(message),
+            Self::TimedOut => formatter.write_str("EPUB worker timed out"),
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) static TITLE_WORKER_PATHS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-fn epub_worker_slot(
-) -> &'static Mutex<Option<crate::runtime_worker::LongLivedWorker<EpubJob, EpubReply>>> {
-    static SLOT: Mutex<Option<crate::runtime_worker::LongLivedWorker<EpubJob, EpubReply>>> =
-        Mutex::new(None);
+fn epub_worker_slot() -> &'static Mutex<Option<EpubWorker>> {
+    static SLOT: Mutex<Option<EpubWorker>> = Mutex::new(None);
     &SLOT
 }
 
-fn reset_epub_worker() {
+fn epub_worker() -> Result<EpubWorker, String> {
     let mut slot = epub_worker_slot()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *slot = None;
-}
-
-fn epub_worker() -> Result<crate::runtime_worker::LongLivedWorker<EpubJob, EpubReply>, String> {
-    let mut slot = epub_worker_slot()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if slot.is_none() {
-        log::info!(
-            "rustmix-wave=epub-worker status=starting stack-bytes={EPUB_PARSER_WORKER_STACK_BYTES}"
-        );
-        let worker = crate::runtime_worker::LongLivedWorker::spawn(
-            "epub-worker",
-            EPUB_PARSER_WORKER_STACK_BYTES,
-            handle_epub_job,
-        )
-        .map_err(|error| format!("EPUB worker start failed: {error}"))?;
-        *slot = Some(worker);
+    if let Some(worker) = slot.as_ref() {
+        if worker.is_alive() {
+            return Ok(worker.clone());
+        }
     }
-    Ok(slot.as_ref().unwrap().clone())
+    log::info!(
+        "rustmix-wave=epub-worker status=starting stack-bytes={EPUB_PARSER_WORKER_STACK_BYTES}"
+    );
+    let worker = crate::runtime_worker::LongLivedWorker::spawn_with_idle_exit(
+        "epub-worker",
+        EPUB_PARSER_WORKER_STACK_BYTES,
+        Some(EPUB_WORKER_IDLE_EXIT),
+        handle_epub_job,
+    )
+    .map_err(|error| format!("EPUB worker start failed: {error}"))?;
+    *slot = Some(worker.clone());
+    Ok(worker)
 }
 
 fn handle_epub_job(job: EpubJob) -> EpubReply {
@@ -326,60 +358,97 @@ fn handle_epub_job(job: EpubJob) -> EpubReply {
     }
 }
 
-fn submit_epub_job(job: EpubJob, timeout: Duration) -> Result<EpubReply, String> {
-    let worker = epub_worker()?;
-    let inbox = match worker.submit(job) {
-        Ok(inbox) => inbox,
-        Err(_) => {
-            reset_epub_worker();
-            return Err("EPUB worker stopped".into());
+/// Queue a job. A thread that exited between jobs is replaced once; a live
+/// thread is always reused.
+fn queue_epub_job(mut job: EpubJob) -> Result<mpsc::Receiver<EpubReply>, String> {
+    for _ in 0..2 {
+        match epub_worker()?.submit(job) {
+            Ok(inbox) => return Ok(inbox),
+            Err(returned) => job = returned,
         }
-    };
-    match inbox.recv_timeout(timeout) {
-        Ok(reply) => Ok(reply),
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            reset_epub_worker();
-            Err("EPUB worker timed out".into())
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            reset_epub_worker();
-            Err("EPUB worker stopped".into())
+    }
+    Err("EPUB worker stopped".into())
+}
+
+/// An EPUB open running on the worker. The Reader polls it every tick.
+pub struct EpubOpenJob {
+    inbox: mpsc::Receiver<EpubReply>,
+    started: std::time::Instant,
+}
+
+impl EpubOpenJob {
+    pub fn start(path: impl AsRef<Path>) -> Result<Self, String> {
+        Ok(Self {
+            inbox: queue_epub_job(EpubJob::Open(path.as_ref().to_path_buf()))?,
+            started: std::time::Instant::now(),
+        })
+    }
+
+    /// `None` while the parse is still running.
+    pub fn poll(&self) -> Option<Result<EpubDocument, String>> {
+        match self.inbox.try_recv() {
+            Ok(EpubReply::Open(result)) => Some(result),
+            Ok(EpubReply::Title(_)) => {
+                Some(Err("EPUB worker returned an unexpected result".into()))
+            }
+            Err(mpsc::TryRecvError::Disconnected) => Some(Err("EPUB worker stopped".into())),
+            Err(mpsc::TryRecvError::Empty) if self.started.elapsed() >= EPUB_OPEN_TIMEOUT => {
+                log::warn!("rustmix-wave=epub-parser-worker status=timed-out");
+                Some(Err("Opening this EPUB took too long".into()))
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
         }
     }
 }
 
-/// Parse one EPUB on the long-lived worker. The caller blocks on a channel,
-/// not on `JoinHandle::join`, so a dead worker cannot abort the main task.
+/// Parse one EPUB on the long-lived worker and wait. Tests and non-UI callers
+/// use this; the Reader polls [`EpubOpenJob`] instead.
 pub fn open_epub_on_worker(path: impl AsRef<Path>) -> Result<EpubDocument, String> {
-    match submit_epub_job(
-        EpubJob::Open(path.as_ref().to_path_buf()),
-        EPUB_OPEN_TIMEOUT,
-    )? {
-        EpubReply::Open(result) => result,
-        EpubReply::Title(Err(error)) => Err(error),
-        EpubReply::Title(Ok(_)) => Err("EPUB worker returned an unexpected result".into()),
+    let job = EpubOpenJob::start(path)?;
+    loop {
+        if let Some(result) = job.poll() {
+            return result;
+        }
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 
-/// Read only the OPF title on the long-lived worker. A panic, timeout, or
-/// missing reply is an error the library scan turns into the FAT filename.
-pub fn read_epub_title_on_worker(path: impl AsRef<Path>) -> Result<String, String> {
-    match submit_epub_job(
-        EpubJob::Title(path.as_ref().to_path_buf()),
-        EPUB_TITLE_TIMEOUT,
-    )? {
-        EpubReply::Title(result) => result,
-        EpubReply::Open(Err(error)) => Err(error),
-        EpubReply::Open(Ok(_)) => Err("EPUB worker returned an unexpected result".into()),
+fn title_error_is_transient(message: &str) -> bool {
+    message.starts_with("EPUB open failed")
+        || message.starts_with("EPUB stat failed")
+        || message.starts_with("EPUB seek failed")
+        || (message.starts_with("EPUB read failed") && !message.contains("fill whole buffer"))
+}
+
+/// Read only the OPF title on the long-lived worker. A late reply, a stopped
+/// worker, or an SD read error is [`EpubTitleError::Unavailable`]; a bad
+/// archive or a parser panic is [`EpubTitleError::Malformed`].
+pub fn read_epub_title_on_worker(path: impl AsRef<Path>) -> Result<String, EpubTitleError> {
+    let inbox = queue_epub_job(EpubJob::Title(path.as_ref().to_path_buf()))
+        .map_err(EpubTitleError::Unavailable)?;
+    match inbox.recv_timeout(EPUB_TITLE_TIMEOUT) {
+        Ok(EpubReply::Title(Ok(title))) => Ok(title),
+        Ok(EpubReply::Title(Err(message))) if title_error_is_transient(&message) => {
+            Err(EpubTitleError::Unavailable(message))
+        }
+        Ok(EpubReply::Title(Err(message))) => Err(EpubTitleError::Malformed(message)),
+        Ok(EpubReply::Open(_)) => Err(EpubTitleError::Unavailable(
+            "EPUB worker returned an unexpected result".into(),
+        )),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(EpubTitleError::TimedOut),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(EpubTitleError::Unavailable("EPUB worker stopped".into()))
+        }
     }
 }
 
 #[cfg(test)]
-pub fn title_worker_panic_is_an_error() -> Result<String, String> {
-    match submit_epub_job(EpubJob::Panic, Duration::from_secs(2))? {
-        EpubReply::Title(result) => result,
-        EpubReply::Open(Err(error)) => Err(error),
-        EpubReply::Open(Ok(_)) => Err("EPUB worker returned an unexpected result".into()),
+pub fn title_worker_panic_is_an_error() -> Result<String, EpubTitleError> {
+    let inbox = queue_epub_job(EpubJob::Panic).map_err(EpubTitleError::Unavailable)?;
+    match inbox.recv_timeout(Duration::from_secs(2)) {
+        Ok(EpubReply::Title(Ok(title))) => Ok(title),
+        Ok(EpubReply::Title(Err(message))) => Err(EpubTitleError::Malformed(message)),
+        _ => Err(EpubTitleError::Unavailable("no reply".into())),
     }
 }
 
@@ -1226,7 +1295,7 @@ mod tests {
 
     use super::{
         attribute, first_open_tag, html_to_text, open_epub, open_epub_on_worker,
-        read_epub_title_on_worker, EPUB_PARSER_WORKER_STACK_BYTES, EPUB_TITLE_WORKER_STACK_BYTES,
+        read_epub_title_on_worker, EPUB_PARSER_WORKER_STACK_BYTES,
     };
 
     fn temp_epub(name: &str) -> PathBuf {
@@ -1325,15 +1394,21 @@ mod tests {
     }
 
     #[test]
-    fn title_worker_uses_a_smaller_bounded_stack() {
-        assert_eq!(EPUB_TITLE_WORKER_STACK_BYTES, 32 * 1024);
-        assert!(EPUB_TITLE_WORKER_STACK_BYTES < EPUB_PARSER_WORKER_STACK_BYTES);
+    fn a_bad_archive_is_malformed_and_a_missing_file_is_unavailable() {
+        let path = temp_epub("truncated");
+        fs::write(&path, b"PK\x03\x04 truncated").unwrap();
+        let error = read_epub_title_on_worker(&path).unwrap_err();
+        assert!(error.is_malformed(), "{error:?}");
+        let _ = fs::remove_file(&path);
+        let error = read_epub_title_on_worker(&path).unwrap_err();
+        assert!(!error.is_malformed(), "{error:?}");
     }
 
     #[test]
     fn title_worker_panic_is_an_error_and_the_next_read_still_runs() {
         let error = super::title_worker_panic_is_an_error().unwrap_err();
-        assert!(error.contains("panicked"), "{error}");
+        assert!(error.is_malformed(), "{error:?}");
+        assert!(error.to_string().contains("panicked"), "{error}");
         let path = temp_epub("after-panic");
         let bytes = stored_zip(&[
             (

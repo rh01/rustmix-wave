@@ -1150,6 +1150,7 @@ mod tests {
             encoding: None,
             epub_document: None,
             resume: None,
+            epub_open: Default::default(),
             message: "Preparing".into(),
         });
         render_loading(&mut display, &state).unwrap();

@@ -5,7 +5,7 @@ use crate::{
         canvas::NativeGameCanvas,
         refresh_policy::{GameRefreshPolicy, RefreshTrigger},
     },
-    runtime_worker::run_named_worker,
+    runtime_worker::NamedWorkerHandle,
 };
 
 use super::{
@@ -18,25 +18,25 @@ use super::{
 /// compact session.
 pub const LUA_LOADER_WORKER_STACK_BYTES: usize = 32 * 1024;
 
-pub fn open_entry_on_worker(entry: LuaAppEntry) -> Result<LuaAppSession, String> {
+/// Start the loader thread for one app and return its handle.
+pub fn start_entry_on_worker(
+    entry: LuaAppEntry,
+) -> Result<NamedWorkerHandle<LuaAppSession, String>, String> {
     log::info!(
         "rustmix-wave=lua-loader-worker status=starting stack-bytes={LUA_LOADER_WORKER_STACK_BYTES}"
     );
-    let result = run_named_worker("lua-loader", LUA_LOADER_WORKER_STACK_BYTES, move || {
-        let path = entry.entry_path();
-        let source = read_bounded_script(&path)?;
-        let mut canvas = NativeGameCanvas::default();
-        let event_bridge = LuaEventBridge::load(&source, &mut canvas)?;
-        let refresh_plan = GameRefreshPolicy::plan(canvas.dirty(), RefreshTrigger::RouteTransition);
-        Ok::<_, String>(LuaAppSession {
-            entry,
-            source_bytes: source.len(),
-            canvas,
-            refresh_plan,
-            event_bridge,
-        })
+    NamedWorkerHandle::spawn("lua-loader", LUA_LOADER_WORKER_STACK_BYTES, move || {
+        load_entry(entry)
     })
-    .map_err(|error| error.to_string());
+    .map_err(|error| format!("Lua loader worker start failed: {error}"))
+}
+
+/// Load one app on the loader thread and wait. The UI polls
+/// [`start_entry_on_worker`] instead.
+pub fn open_entry_on_worker(entry: LuaAppEntry) -> Result<LuaAppSession, String> {
+    let result = start_entry_on_worker(entry)?
+        .join()
+        .map_err(|error| error.to_string());
     match &result {
         Ok(session) => log::info!(
             "rustmix-wave=lua-loader-worker status=completed source-bytes={} commands={} bridge={}",
@@ -47,6 +47,21 @@ pub fn open_entry_on_worker(entry: LuaAppEntry) -> Result<LuaAppSession, String>
         Err(error) => log::warn!("rustmix-wave=lua-loader-worker status=failed error={error}"),
     }
     result
+}
+
+fn load_entry(entry: LuaAppEntry) -> Result<LuaAppSession, String> {
+    let path = entry.entry_path();
+    let source = read_bounded_script(&path)?;
+    let mut canvas = NativeGameCanvas::default();
+    let event_bridge = LuaEventBridge::load(&source, &mut canvas)?;
+    let refresh_plan = GameRefreshPolicy::plan(canvas.dirty(), RefreshTrigger::RouteTransition);
+    Ok(LuaAppSession {
+        entry,
+        source_bytes: source.len(),
+        canvas,
+        refresh_plan,
+        event_bridge,
+    })
 }
 
 fn read_bounded_script(path: &std::path::Path) -> Result<String, String> {

@@ -104,6 +104,7 @@ mod firmware {
         rtc::RtcDateTime,
         rtc_alarm_interrupt::{espidf::RtcAlarmInterruptMonitor, RTC_ALARM_INTERRUPT_GPIO},
         runtime_memory::{log_runtime_memory, RuntimeMemorySnapshot},
+        runtime_worker::NamedWorkerError,
         shared_i2c::SharedI2cBus,
         sleep_images::{
             stamp_deep_sleep_wake_hint, SleepImageCatalog, SleepImageSelection,
@@ -125,8 +126,9 @@ mod firmware {
             VOICE_PCM_MONO_CHUNK_BYTES, VOICE_PCM_STEREO_CAPTURE_BYTES,
         },
         weather::{
-            espidf::fetch_open_meteo_on_worker, WeatherFetchError, WeatherSnapshot,
-            WEATHER_RETRY_DELAYS_SECONDS, WEATHER_RETRY_LIMIT,
+            espidf::{finish_open_meteo_fetch, start_open_meteo_fetch, WeatherFetchJob},
+            WeatherData, WeatherFetchError, WeatherSnapshot, WEATHER_RETRY_DELAYS_SECONDS,
+            WEATHER_RETRY_LIMIT,
         },
         weather_config::{WeatherConfig, WEATHER_CONFIG_PATH},
         weread::{self, http::WEREAD_HTTP_WORKER_STACK_BYTES},
@@ -827,6 +829,7 @@ mod firmware {
         let mut last_imu_event_sample = Instant::now();
         let mut last_imu_event_screen_refresh = Instant::now();
         let mut weather_retry = WeatherRetryState::default();
+        let mut weather_job: Option<(WeatherFetchJob, WeatherFetchAttempt, Instant)> = None;
         let mut last_voice_record_refresh = Instant::now();
         let weread_clock = Instant::now();
         let mut weread_jobs = weread::http::HttpJobs::default();
@@ -870,6 +873,8 @@ mod firmware {
                 RadioJob::TransferPortal
             } else if weread_needs_radio {
                 RadioJob::WeRead
+            } else if weather_job.is_some() {
+                RadioJob::Weather
             } else if ntp_holding {
                 RadioJob::Ntp
             } else {
@@ -1583,7 +1588,9 @@ mod firmware {
                     } else {
                         None
                     };
-                    let attempt = if manual_weather_refresh {
+                    let attempt = if weather_job.is_some() {
+                        None
+                    } else if manual_weather_refresh {
                         Some(WeatherFetchAttempt::initial("manual"))
                     } else if let Some(retry) = scheduled_retry {
                         Some(retry)
@@ -1607,12 +1614,13 @@ mod firmware {
                                 "weather",
                             );
                         if wifi_connected {
-                            run_weather_fetch_attempt(
+                            weather_job = start_weather_fetch_attempt(
                                 config,
                                 attempt,
                                 &mut weather_retry,
                                 &mut state,
-                            );
+                            )
+                            .map(|job| (job, attempt, Instant::now()));
                             last_weather_attempt = Some(Instant::now());
                             radio_idle.set_useful(true, weread_clock.elapsed().as_millis() as u64);
                             if state.panel_awake
@@ -1672,6 +1680,59 @@ mod firmware {
                             RefreshRequest::Normal,
                         )?;
                     }
+                }
+            }
+
+            if state.poll_background_loads() && state.panel_awake {
+                last_activity = Instant::now();
+                refresh_screen(
+                    &mut panel,
+                    &mut frame,
+                    &mut state,
+                    &mut panel_refresh,
+                    &mut previous_panel_frame,
+                    RefreshRequest::Normal,
+                )?;
+            }
+
+            let finished_weather = match weather_job.as_mut() {
+                Some((job, attempt, started)) => job
+                    .try_join()
+                    .or_else(|| {
+                        (started.elapsed() >= Duration::from_secs(WEATHER_JOB_LIMIT_SECS)).then(
+                            || {
+                                Err(NamedWorkerError::Operation(WeatherFetchError::Transport(
+                                    "weather fetch timed out".into(),
+                                )))
+                            },
+                        )
+                    })
+                    .map(|result| (result, *attempt)),
+                None => None,
+            };
+            if let Some((result, attempt)) = finished_weather {
+                weather_job = None;
+                finish_weather_fetch_attempt(
+                    finish_open_meteo_fetch(result),
+                    attempt,
+                    &mut weather_retry,
+                    &mut state,
+                );
+                radio_idle.set_useful(true, weread_clock.elapsed().as_millis() as u64);
+                if state.panel_awake
+                    && matches!(
+                        state.active_route(),
+                        ScreenRoute::Home | ScreenRoute::Weather | ScreenRoute::WeatherDetails
+                    )
+                {
+                    refresh_screen(
+                        &mut panel,
+                        &mut frame,
+                        &mut state,
+                        &mut panel_refresh,
+                        &mut previous_panel_frame,
+                        RefreshRequest::Normal,
+                    )?;
                 }
             }
 
@@ -3346,23 +3407,47 @@ mod firmware {
         }
     }
 
-    fn run_weather_fetch_attempt(
+    /// A fetch still running after this is treated as a transport failure.
+    /// The HTTP client has its own shorter timeout; this only bounds a stuck worker.
+    const WEATHER_JOB_LIMIT_SECS: u64 = 120;
+
+    fn start_weather_fetch_attempt(
         config: &WeatherConfig,
         attempt: WeatherFetchAttempt,
         retry: &mut WeatherRetryState,
         state: &mut AppState,
-    ) {
-        let attempt_label = if attempt.retry_attempt == 0 {
-            "initial".into()
-        } else {
-            format!("{}/{}", attempt.retry_attempt, WEATHER_RETRY_LIMIT)
-        };
+    ) -> Option<WeatherFetchJob> {
+        let attempt_label = weather_attempt_label(attempt);
         info!(
             "rustmix-wave=weather-fetch status=starting cause={} attempt={} provider={} location={}",
             attempt.cause, attempt_label, config.provider, config.location
         );
         state.weather.mark_fetching();
-        match fetch_open_meteo_on_worker(config) {
+        match start_open_meteo_fetch(config) {
+            Ok(job) => Some(job),
+            Err(error) => {
+                handle_weather_fetch_failure(attempt, error, retry, state);
+                log_weather_snapshot(&state.weather);
+                None
+            }
+        }
+    }
+
+    fn weather_attempt_label(attempt: WeatherFetchAttempt) -> String {
+        if attempt.retry_attempt == 0 {
+            "initial".into()
+        } else {
+            format!("{}/{}", attempt.retry_attempt, WEATHER_RETRY_LIMIT)
+        }
+    }
+
+    fn finish_weather_fetch_attempt(
+        result: Result<WeatherData, WeatherFetchError>,
+        attempt: WeatherFetchAttempt,
+        retry: &mut WeatherRetryState,
+        state: &mut AppState,
+    ) {
+        match result {
             Ok(data) => {
                 retry.clear();
                 state.weather.record_success(data);
@@ -3370,7 +3455,7 @@ mod firmware {
                 info!(
                     "rustmix-wave=weather-fetch status=completed cause={} attempt={} forecast-days={}",
                     attempt.cause,
-                    attempt_label,
+                    weather_attempt_label(attempt),
                     state.weather.forecast.len()
                 );
             }

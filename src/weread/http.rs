@@ -85,23 +85,30 @@ struct QueuedJob {
     download_tx: Option<mpsc::SyncSender<DownloadEvent>>,
 }
 
+/// Raw ESP-IDF client pointer. Access is serialized by [`LiveClient`]'s mutex.
+struct ClientSlot(esp_http_client_handle_t);
+
+// SAFETY: the pointer is only used while `LiveClient`'s mutex is held. The
+// worker installs and clears it, and cancel closes it from the main task.
+unsafe impl Send for ClientSlot {}
+
 /// Client handle shared with the main task so cancel can close the socket.
 struct LiveClient {
-    handle: Mutex<esp_http_client_handle_t>,
+    handle: Mutex<ClientSlot>,
 }
 
 impl LiveClient {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            handle: Mutex::new(core::ptr::null_mut()),
+            handle: Mutex::new(ClientSlot(core::ptr::null_mut())),
         })
     }
 
     fn install(&self, handle: esp_http_client_handle_t) {
-        *self
-            .handle
+        self.handle
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = handle;
+            .unwrap_or_else(|error| error.into_inner())
+            .0 = handle;
     }
 
     fn clear(&self, handle: esp_http_client_handle_t) {
@@ -109,8 +116,8 @@ impl LiveClient {
             .handle
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if *slot == handle {
-            *slot = core::ptr::null_mut();
+        if slot.0 == handle {
+            slot.0 = core::ptr::null_mut();
         }
     }
 
@@ -119,9 +126,9 @@ impl LiveClient {
             .handle
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if !slot.is_null() {
+        if !slot.0.is_null() {
             unsafe {
-                let _ = esp_http_client_close(*slot);
+                let _ = esp_http_client_close(slot.0);
             }
         }
     }

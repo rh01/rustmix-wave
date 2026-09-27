@@ -70,7 +70,7 @@ pub struct HttpJobs {
 struct Inflight {
     reply: mpsc::Receiver<Report>,
     chunks: Option<mpsc::Receiver<DownloadEvent>>,
-    download: Option<offline::ChapterDownload>,
+    download: Option<offline::CardDownload>,
     write_error: Option<String>,
     chunks_closed: bool,
     cancel: Arc<AtomicBool>,
@@ -195,6 +195,8 @@ fn spawn_work(work: Work, unix: Option<u64>, cancel: Arc<AtomicBool>) -> Result<
     let (download, download_tx, chunks) = match &job {
         Job::Chapter {
             fetch_images: false,
+            image_width: 0,
+            image_height: 0,
             book_id,
             chapter_uid,
             chapter_idx,
@@ -208,7 +210,32 @@ fn spawn_work(work: Work, unix: Option<u64>, cancel: Arc<AtomicBool>) -> Result<
             ) {
                 Ok(file) => {
                     let (tx, rx) = mpsc::sync_channel(2);
-                    (Some(file), Some(tx), Some(rx))
+                    (
+                        Some(offline::CardDownload::Chapter(file)),
+                        Some(tx),
+                        Some(rx),
+                    )
+                }
+                Err(error) => {
+                    return Err(error_report(generation, job, session, error));
+                }
+            }
+        }
+        Job::ChapterImage {
+            book_id,
+            chapter_idx,
+            image_index,
+            ..
+        } => {
+            match offline::ImageDownload::begin(
+                Path::new("/sdcard/RUSTMIX"),
+                book_id,
+                *chapter_idx,
+                *image_index,
+            ) {
+                Ok(file) => {
+                    let (tx, rx) = mpsc::sync_channel(2);
+                    (Some(offline::CardDownload::Image(file)), Some(tx), Some(rx))
                 }
                 Err(error) => {
                     return Err(error_report(generation, job, session, error));
@@ -299,7 +326,7 @@ fn worker_slot() -> &'static Mutex<Option<WorkerSlot>> {
 
 fn start_worker() -> Result<LongLivedWorker<QueuedJob, Report>, std::io::Error> {
     log_runtime_memory("weread-http-spawn");
-    let _psram_stack = PsramStackGuard::enter(WEREAD_HTTP_WORKER_STACK_BYTES);
+    let _psram_stack = PsramStackGuard::enter(WEREAD_HTTP_WORKER_STACK_BYTES, c"weread-http");
     LongLivedWorker::spawn(
         "weread-http",
         WEREAD_HTTP_WORKER_STACK_BYTES,
@@ -336,12 +363,15 @@ fn start_worker() -> Result<LongLivedWorker<QueuedJob, Report>, std::io::Error> 
 ///
 /// Restoring the previous config keeps weather, EPUB, and Lua workers on
 /// internal stacks. Those tasks touch the filesystem and NVS.
-struct PsramStackGuard {
+pub(crate) struct PsramStackGuard {
     restore: esp_idf_svc::sys::esp_pthread_cfg_t,
 }
 
 impl PsramStackGuard {
-    fn enter(stack_bytes: usize) -> Self {
+    /// Install the PSRAM stack. `Err` means `esp_pthread_set_cfg` failed and
+    /// the process config was left unchanged.
+    fn try_enter(stack_bytes: usize, label: &'static CStr) -> Result<Self, &'static str> {
+        let name = label.to_str().unwrap_or("weread-worker");
         unsafe {
             let fallback = sys::esp_pthread_get_default_config();
             let mut restore = fallback;
@@ -352,19 +382,50 @@ impl PsramStackGuard {
             cfg.stack_size = stack_bytes;
             cfg.stack_alloc_caps = sys::MALLOC_CAP_SPIRAM | sys::MALLOC_CAP_8BIT;
             cfg.inherit_cfg = false;
-            cfg.thread_name = c"weread-http".as_ptr();
-            if sys::esp_pthread_set_cfg(&cfg) == ESP_OK {
-                log::info!(
-                    "rustmix-wave=weread-http status=psram-stack stack-bytes={stack_bytes} caps=spiram"
-                );
-            } else {
+            cfg.thread_name = label.as_ptr();
+            if sys::esp_pthread_set_cfg(&cfg) != ESP_OK {
                 log::warn!(
-                    "rustmix-wave=weread-http status=psram-stack-cfg-failed stack-bytes={stack_bytes} fallback=internal"
+                    "rustmix-wave={name} status=psram-stack-cfg-failed stack-bytes={stack_bytes}"
                 );
+                return Err("psram stack cfg failed");
             }
-            Self { restore }
+            log::info!(
+                "rustmix-wave={name} status=psram-stack stack-bytes={stack_bytes} caps=spiram"
+            );
+            Ok(Self { restore })
         }
     }
+
+    fn enter(stack_bytes: usize, label: &'static CStr) -> Self {
+        let fallback = unsafe { sys::esp_pthread_get_default_config() };
+        let mut restore = fallback;
+        unsafe {
+            if sys::esp_pthread_get_cfg(&mut restore) != ESP_OK {
+                restore = fallback;
+            }
+        }
+        match Self::try_enter(stack_bytes, label) {
+            Ok(guard) => guard,
+            Err(_) => {
+                log::warn!(
+                    "rustmix-wave={} status=psram-stack-cfg-failed stack-bytes={stack_bytes} fallback=internal",
+                    label.to_str().unwrap_or("weread-worker")
+                );
+                Self { restore }
+            }
+        }
+    }
+}
+
+/// PSRAM pthread stack for the next `std::thread` spawn. Drop restores the
+/// previous config so other workers stay on internal stacks.
+///
+/// `Err` when the config was not installed. Callers must not spawn.
+pub(crate) fn psram_stack(
+    stack_bytes: usize,
+    label: &'static CStr,
+) -> Result<PsramStackGuard, &'static str> {
+    PsramStackGuard::try_enter(stack_bytes, label)
 }
 
 impl Drop for PsramStackGuard {
@@ -563,6 +624,7 @@ fn http_call(
     config.event_handler = Some(on_http_event);
     config.user_data = &mut cookies as *mut CookieList as *mut core::ffi::c_void;
     config.crt_bundle_attach = Some(sys::esp_crt_bundle_attach);
+    config.disable_auto_redirect = !request.follow_redirects;
     let raw = unsafe { esp_http_client_init(&config) };
     if raw.is_null() {
         return Err("HTTP connection init failed".into());
@@ -672,6 +734,7 @@ fn http_call_stream(
     config.event_handler = Some(on_http_event);
     config.user_data = &mut cookies as *mut CookieList as *mut core::ffi::c_void;
     config.crt_bundle_attach = Some(sys::esp_crt_bundle_attach);
+    config.disable_auto_redirect = !request.follow_redirects;
     let raw = unsafe { esp_http_client_init(&config) };
     if raw.is_null() {
         return Err("HTTP connection init failed".into());

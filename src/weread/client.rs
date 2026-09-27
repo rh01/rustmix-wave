@@ -8,8 +8,8 @@ use crate::weread::{
     body::body_transfer_error,
     crypto, decode,
     limits::{
-        DOWNLOAD_CLASSIFY_BYTES, MAX_CHAPTER_IMAGES, MAX_HTML_BYTES, MAX_IMAGE_BYTES,
-        MAX_JSON_BYTES, MAX_SHARD_BYTES,
+        DOWNLOAD_CLASSIFY_BYTES, MAX_CHAPTER_IMAGES, MAX_CHAPTER_IMAGE_BYTES, MAX_HTML_BYTES,
+        MAX_IMAGE_BYTES, MAX_JSON_BYTES, MAX_SHARD_BYTES,
     },
     parse::{
         self, BookDetail, ChapterMeta, LoginPoll, NoteLine, ReadingProgress, ResponseClass,
@@ -27,6 +27,8 @@ pub struct Request {
     pub body: Option<String>,
     pub headers: Vec<(String, String)>,
     pub max_bytes: usize,
+    /// Image fetches stay on the allowlisted host. Other calls may follow redirects.
+    pub follow_redirects: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -194,6 +196,9 @@ pub enum Job {
         chapter_idx: u32,
         psvts: String,
         fetch_images: bool,
+        /// Content box the inline image is upscaled into. Zero skips upscaling.
+        image_width: u32,
+        image_height: u32,
     },
     UploadProgress {
         book_id: String,
@@ -209,6 +214,13 @@ pub enum Job {
     },
     Cover {
         book_id: String,
+        url: String,
+    },
+    /// Stream one chapter image onto the SD card. A failure does not drop the chapter text.
+    ChapterImage {
+        book_id: String,
+        chapter_idx: u32,
+        image_index: u16,
         url: String,
     },
 }
@@ -252,6 +264,8 @@ pub enum JobOutput {
         book_id: String,
         bitmap: MonoBitmap,
     },
+    /// The image bytes are already on the SD card.
+    ImageStored,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -364,6 +378,8 @@ fn dispatch(
             chapter_idx,
             psvts,
             fetch_images,
+            image_width,
+            image_height,
         } => chapter(
             transport,
             session,
@@ -373,6 +389,8 @@ fn dispatch(
             *chapter_idx,
             psvts,
             *fetch_images,
+            *image_width,
+            *image_height,
         ),
         Job::UploadProgress {
             book_id,
@@ -396,6 +414,12 @@ fn dispatch(
         ),
         Job::Notes { book_id } => notes(transport, session, ctx, book_id),
         Job::Cover { book_id, url } => cover(transport, ctx, book_id, url),
+        Job::ChapterImage {
+            book_id: _,
+            chapter_idx: _,
+            image_index: _,
+            url,
+        } => stream_image(transport, session, ctx, url),
     }
 }
 
@@ -413,6 +437,7 @@ fn login_uid(
             body: None,
             headers: protocol::browser_headers("", &format!("{WEB_ORIGIN}/"), false),
             max_bytes: 32 * 1024,
+            follow_redirects: true,
         },
         false,
     );
@@ -433,6 +458,7 @@ fn login_uid(
                 true,
             ),
             max_bytes: MAX_JSON_BYTES,
+            follow_redirects: true,
         },
         true,
     )?;
@@ -469,6 +495,7 @@ fn poll_login(
             body: None,
             headers: protocol::browser_headers(cookie, &protocol::skills_page_url(), true),
             max_bytes: MAX_JSON_BYTES,
+            follow_redirects: true,
         },
         true,
     )?;
@@ -565,6 +592,7 @@ fn shelf(
                     true,
                 ),
                 max_bytes: MAX_JSON_BYTES,
+                follow_redirects: true,
             },
             true,
         )?;
@@ -612,6 +640,7 @@ fn open_book(
                     true,
                 ),
                 max_bytes: MAX_JSON_BYTES,
+                follow_redirects: true,
             },
             true,
         )?;
@@ -634,6 +663,7 @@ fn open_book(
                     true,
                 ),
                 max_bytes: MAX_JSON_BYTES,
+                follow_redirects: true,
             },
             true,
         ) {
@@ -782,6 +812,8 @@ fn chapter(
     _chapter_idx: u32,
     psvts: &str,
     fetch_images: bool,
+    image_width: u32,
+    image_height: u32,
 ) -> Result<JobOutput, JobError> {
     let prepared = prepare_chapter(transport, session, ctx, book_id, chapter_uid, psvts)?;
     if transport.streaming_download() {
@@ -807,7 +839,16 @@ fn chapter(
         let text =
             text::zip_html_text(&e0.body).map_err(|error| JobError::Message(error.into()))?;
         let blocks = text::blocks_from_markup(&text);
-        return finish_chapter(transport, ctx, blocks, psvts, "epub", fetch_images);
+        return finish_chapter(
+            transport,
+            ctx,
+            blocks,
+            psvts,
+            "epub",
+            fetch_images,
+            image_width,
+            image_height,
+        );
     }
     let e0_text = String::from_utf8_lossy(&e0.body);
     if e0_text.trim() == "{}" {
@@ -840,7 +881,16 @@ fn chapter(
         )?;
         let plain = decode_pair(&t0.body, &t1.body)?;
         let blocks = text::blocks_from_markup(&plain);
-        return finish_chapter(transport, ctx, blocks, psvts, "txt", fetch_images);
+        return finish_chapter(
+            transport,
+            ctx,
+            blocks,
+            psvts,
+            "txt",
+            fetch_images,
+            image_width,
+            image_height,
+        );
     }
     let e1 = post_shard(
         transport,
@@ -880,6 +930,8 @@ fn chapter(
             psvts,
             "epub",
             fetch_images,
+            image_width,
+            image_height,
         );
     }
     let markup = String::from_utf8_lossy(&bytes).into_owned();
@@ -890,6 +942,8 @@ fn chapter(
         psvts,
         "epub",
         fetch_images,
+        image_width,
+        image_height,
     )
 }
 
@@ -900,6 +954,8 @@ fn finish_chapter(
     psvts: String,
     format: &str,
     fetch_images: bool,
+    image_width: u32,
+    image_height: u32,
 ) -> Result<JobOutput, JobError> {
     let mut images = Vec::new();
     if fetch_images {
@@ -910,32 +966,13 @@ fn finish_chapter(
             let Block::Image(image) = block else {
                 continue;
             };
-            if !bitmap::allowed_asset_url(&image.url) {
-                images.push(ChapterImage {
-                    alt: image.alt.clone(),
-                    bitmap: None,
-                });
-                continue;
-            }
-            let fetched = call(
+            images.push(fetch_inline_image(
                 transport,
                 ctx,
-                Request {
-                    method: "GET",
-                    url: image.url.clone(),
-                    body: None,
-                    headers: protocol::browser_headers("", WEB_ORIGIN, false),
-                    max_bytes: MAX_IMAGE_BYTES,
-                },
-                false,
-            );
-            let bitmap = fetched
-                .ok()
-                .and_then(|response| bitmap::decode_mono(&response.body, 400, 480).ok());
-            images.push(ChapterImage {
-                alt: image.alt.clone(),
-                bitmap,
-            });
+                image,
+                image_width,
+                image_height,
+            ));
         }
     }
     let text = text::plain_from_blocks(&blocks);
@@ -946,6 +983,106 @@ fn finish_chapter(
         psvts,
         format: format.into(),
     })
+}
+
+/// One inline image. A bad host, a body over the cap, or a decode failure becomes
+/// a placeholder and does not fail the chapter text.
+fn fetch_inline_image(
+    transport: &mut dyn Transport,
+    ctx: &mut CallCtx,
+    image: &crate::weread::text::ImageRef,
+    image_width: u32,
+    image_height: u32,
+) -> ChapterImage {
+    if !bitmap::allowed_asset_url(&image.url) {
+        return ChapterImage {
+            alt: image.alt.clone(),
+            bitmap: None,
+        };
+    }
+    let fetched = call(
+        transport,
+        ctx,
+        Request {
+            method: "GET",
+            url: image.url.clone(),
+            body: None,
+            headers: protocol::browser_headers("", WEB_ORIGIN, false),
+            max_bytes: MAX_CHAPTER_IMAGE_BYTES,
+            follow_redirects: false,
+        },
+        false,
+    );
+    let bitmap = fetched.ok().and_then(|response| {
+        bitmap::decode_on_image_thread(response.body, image_width.max(1), image_height.max(1))
+    });
+    ChapterImage {
+        alt: image.alt.clone(),
+        bitmap,
+    }
+}
+
+fn stream_image(
+    transport: &mut dyn Transport,
+    _session: &mut Session,
+    ctx: &mut CallCtx,
+    url: &str,
+) -> Result<JobOutput, JobError> {
+    if !bitmap::allowed_asset_url(url) {
+        return Err(JobError::Message("image host is not allowed".into()));
+    }
+    if !transport.streaming_download() {
+        return Err(JobError::Message(
+            "image download needs the SD stream".into(),
+        ));
+    }
+    if transport.cancelled() {
+        return Err(JobError::Cancelled);
+    }
+    if ctx.first {
+        ctx.first = false;
+    } else {
+        transport.idle();
+    }
+    if transport.cancelled() {
+        return Err(JobError::Cancelled);
+    }
+    let streamed = transport
+        .call_stream(
+            &Request {
+                method: "GET",
+                url: url.to_string(),
+                body: None,
+                headers: protocol::browser_headers("", WEB_ORIGIN, false),
+                max_bytes: MAX_CHAPTER_IMAGE_BYTES,
+                follow_redirects: false,
+            },
+            "img",
+        )
+        .map_err(transport_job_error)?;
+    if streamed.total > MAX_CHAPTER_IMAGE_BYTES {
+        return Err(JobError::Message("response exceeds size limit".into()));
+    }
+    if let Some(error) = body_transfer_error(
+        streamed.content_length,
+        streamed.total,
+        streamed.chunked,
+        streamed.terminal_chunk,
+    ) {
+        return Err(JobError::Message(error.into()));
+    }
+    // Image hosts must not refresh wr_skey. A redirected or hostile Set-Cookie
+    // used to overwrite the session.
+    if streamed.total == 0 {
+        return Err(JobError::Message("empty image".into()));
+    }
+    if streamed.status != 200 {
+        return Err(JobError::Message(format!(
+            "WeRead image was not available (HTTP {}).",
+            streamed.status
+        )));
+    }
+    Ok(JobOutput::ImageStored)
 }
 
 fn upload_progress(
@@ -1006,6 +1143,7 @@ fn upload_progress(
                 true,
             ),
             max_bytes: 8 * 1024,
+            follow_redirects: true,
         },
         true,
     )?;
@@ -1069,10 +1207,11 @@ fn cover(
             body: None,
             headers: protocol::browser_headers("", WEB_ORIGIN, false),
             max_bytes: MAX_IMAGE_BYTES,
+            follow_redirects: false,
         },
         false,
     )?;
-    let bitmap = bitmap::decode_mono(&response.body, 48, 64)
+    let bitmap = bitmap::decode_mono(response.body, 48, 64)
         .map_err(|error| JobError::Message(error.into()))?;
     Ok(JobOutput::Cover {
         book_id: book_id.to_string(),
@@ -1229,6 +1368,7 @@ fn stream_part(
                 body: Some(body),
                 headers: protocol::browser_headers(&session.cookie_header(), referer, true),
                 max_bytes: MAX_SHARD_BYTES,
+                follow_redirects: true,
             },
             part,
         )
@@ -1284,6 +1424,7 @@ fn post_shard(
             body: Some(body),
             headers: protocol::browser_headers(&session.cookie_header(), referer, true),
             max_bytes: MAX_SHARD_BYTES,
+            follow_redirects: true,
         },
         true,
     )
@@ -1309,6 +1450,7 @@ fn fetch_reader_html(
                 false,
             ),
             max_bytes: MAX_HTML_BYTES,
+            follow_redirects: true,
         },
         true,
     )?;
@@ -1341,6 +1483,7 @@ fn gateway_response(
             body: Some(protocol::gateway_body(api_name, fields)),
             headers: protocol::official_headers(&session.api_key),
             max_bytes: MAX_JSON_BYTES,
+            follow_redirects: true,
         },
         true,
     )?;
@@ -1422,6 +1565,7 @@ fn authed_get(
             body: None,
             headers,
             max_bytes: MAX_JSON_BYTES,
+            follow_redirects: true,
         },
         true,
     )?;
@@ -1465,6 +1609,7 @@ fn renew(
                 true,
             ),
             max_bytes: 8 * 1024,
+            follow_redirects: true,
         },
         false,
     )?;
@@ -1693,6 +1838,8 @@ mod tests {
                     chapter_idx: 2,
                     psvts: String::new(),
                     fetch_images: false,
+                    image_width: 0,
+                    image_height: 0,
                 },
                 session,
             },
@@ -2014,6 +2161,7 @@ mod tests {
             index: 0,
             urls: Vec::new(),
             chunk_lens: Vec::new(),
+            redirects: Vec::new(),
         };
         let report = perform(
             &mut short,
@@ -2170,12 +2318,14 @@ mod tests {
         index: usize,
         urls: Vec<String>,
         chunk_lens: Vec<usize>,
+        redirects: Vec<bool>,
     }
 
     impl Transport for RecordingStream {
         fn idle(&mut self) {}
         fn call(&mut self, request: &Request) -> Result<Response, String> {
             self.urls.push(request.url.clone());
+            self.redirects.push(request.follow_redirects);
             let response = self
                 .steps
                 .get(self.index)
@@ -2239,6 +2389,8 @@ mod tests {
             chapter_idx: 2,
             psvts: "ps".into(),
             fetch_images,
+            image_width: 0,
+            image_height: 0,
         }
     }
 
@@ -2270,6 +2422,7 @@ mod tests {
             index: 0,
             urls: Vec::new(),
             chunk_lens: Vec::new(),
+            redirects: Vec::new(),
         };
         let report = perform(
             &mut transport,
@@ -2312,6 +2465,7 @@ mod tests {
             index: 0,
             urls: Vec::new(),
             chunk_lens: Vec::new(),
+            redirects: Vec::new(),
         };
         let report = perform(
             &mut zip,
@@ -2345,6 +2499,7 @@ mod tests {
             index: 0,
             urls: Vec::new(),
             chunk_lens: Vec::new(),
+            redirects: Vec::new(),
         };
         let report = perform(
             &mut txt,
@@ -2365,6 +2520,7 @@ mod tests {
             index: 0,
             urls: Vec::new(),
             chunk_lens: Vec::new(),
+            redirects: Vec::new(),
         };
         let report = perform(
             &mut empty,
@@ -2379,5 +2535,134 @@ mod tests {
             panic!("empty chapter must fail");
         };
         assert!(message.contains("empty chapter"));
+    }
+
+    #[test]
+    fn streamed_image_checks_length_and_keeps_chunks_bounded() {
+        let body = b"image-bytes-0123456789".repeat(400);
+        let chunk = crate::weread::limits::DOWNLOAD_CHUNK_BYTES;
+        assert!(body.len() > chunk);
+        let mut transport = RecordingStream {
+            steps: vec![Response {
+                status: 200,
+                body: body.clone(),
+                set_cookie: String::new(),
+                content_length: Some(body.len()),
+            }],
+            index: 0,
+            urls: Vec::new(),
+            chunk_lens: Vec::new(),
+            redirects: Vec::new(),
+        };
+        let report = perform(
+            &mut transport,
+            Work {
+                generation: 1,
+                job: Job::ChapterImage {
+                    book_id: "43208843".into(),
+                    chapter_idx: 2,
+                    image_index: 0,
+                    url: "https://res.weread.qq.com/a.jpg".into(),
+                },
+                session: stream_session(),
+            },
+            Some(1_780_488_000),
+        );
+        assert!(matches!(report.result, Ok(JobOutput::ImageStored)));
+        assert!(transport.chunk_lens.iter().all(|len| *len <= chunk));
+        assert_eq!(transport.chunk_lens.iter().sum::<usize>(), body.len());
+        assert_eq!(transport.redirects, vec![false]);
+        assert_eq!(report.session.skey, "tok");
+
+        let mut cooked = RecordingStream {
+            steps: vec![Response {
+                status: 200,
+                body: b"image".to_vec(),
+                set_cookie: "wr_skey=evil-key".into(),
+                content_length: Some(5),
+            }],
+            index: 0,
+            urls: Vec::new(),
+            chunk_lens: Vec::new(),
+            redirects: Vec::new(),
+        };
+        let report = perform(
+            &mut cooked,
+            Work {
+                generation: 4,
+                job: Job::ChapterImage {
+                    book_id: "43208843".into(),
+                    chapter_idx: 2,
+                    image_index: 3,
+                    url: "https://res.weread.qq.com/c.jpg".into(),
+                },
+                session: stream_session(),
+            },
+            Some(1_780_488_000),
+        );
+        assert!(matches!(report.result, Ok(JobOutput::ImageStored)));
+        assert_eq!(report.session.skey, "tok");
+
+        let mut blank = RecordingStream {
+            steps: vec![Response {
+                status: 200,
+                body: Vec::new(),
+                set_cookie: String::new(),
+                content_length: Some(0),
+            }],
+            index: 0,
+            urls: Vec::new(),
+            chunk_lens: Vec::new(),
+            redirects: Vec::new(),
+        };
+        let report = perform(
+            &mut blank,
+            Work {
+                generation: 5,
+                job: Job::ChapterImage {
+                    book_id: "43208843".into(),
+                    chapter_idx: 2,
+                    image_index: 4,
+                    url: "https://res.weread.qq.com/d.jpg".into(),
+                },
+                session: stream_session(),
+            },
+            Some(1_780_488_000),
+        );
+        let Err(JobError::Message(message)) = report.result else {
+            panic!("empty image must fail");
+        };
+        assert!(message.contains("empty image"));
+
+        let mut short = RecordingStream {
+            steps: vec![Response {
+                status: 200,
+                body: b"short".to_vec(),
+                set_cookie: String::new(),
+                content_length: Some(100),
+            }],
+            index: 0,
+            urls: Vec::new(),
+            chunk_lens: Vec::new(),
+            redirects: Vec::new(),
+        };
+        let report = perform(
+            &mut short,
+            Work {
+                generation: 2,
+                job: Job::ChapterImage {
+                    book_id: "43208843".into(),
+                    chapter_idx: 2,
+                    image_index: 1,
+                    url: "https://res.weread.qq.com/b.jpg".into(),
+                },
+                session: stream_session(),
+            },
+            Some(1_780_488_000),
+        );
+        let Err(JobError::Message(message)) = report.result else {
+            panic!("short image must fail");
+        };
+        assert!(message.contains("Content-Length"));
     }
 }

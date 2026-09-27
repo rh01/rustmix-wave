@@ -1735,7 +1735,7 @@ mod tests {
 
         let mut state = AppState::default();
         state.router.navigate_to(ScreenRoute::WeReadRead);
-        state.weread.chapter_source = "abcd ".repeat(80);
+        state.weread.chapter_source = "abcd ".repeat(240);
         let layout = state.reader.preferences.layout();
         state.weread.repaginate(layout);
         let before = state.weread.pages.len();
@@ -1799,7 +1799,7 @@ mod tests {
     fn reading_preferences_repaginates_an_open_weread_chapter() {
         let mut state = AppState::default();
         state.router.navigate_to(ScreenRoute::ReaderPreferences);
-        state.weread.chapter_source = "abcd ".repeat(80);
+        state.weread.chapter_source = "abcd ".repeat(240);
         assert!(state.weread.sync_layout(state.reader.preferences.layout()));
         let before = state.weread.pages.len();
         state.apply(ButtonEvent::Down);

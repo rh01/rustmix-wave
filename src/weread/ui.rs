@@ -5,6 +5,7 @@
 //! whole-book downloads also return between requests.
 
 use std::{
+    collections::VecDeque,
     path::PathBuf,
     sync::{atomic::AtomicBool, Arc},
 };
@@ -12,13 +13,14 @@ use std::{
 use crate::{
     app::router::ScreenRoute,
     buttons::ButtonEvent,
-    reader::{ReaderLayout, ReaderPageLine},
+    reader::ReaderLayout,
+    runtime_worker::NamedWorkerHandle,
     weread::{
         bitmap::{self, MonoBitmap},
         client::{ChapterImage, Job, JobError, JobOutput, Report, Work},
         limits::{
             DOWNLOAD_ATTEMPTS, DOWNLOAD_RETRY_MS, LOGIN_POLL_MS, LOGIN_TIMEOUT_MS,
-            MIN_REQUEST_GAP_MS, PROGRESS_DELAY_MS,
+            MAX_CHAPTER_IMAGES, MIN_REQUEST_GAP_MS, PROGRESS_DELAY_MS,
         },
         nvs,
         offline::{self, CachedChapter},
@@ -58,9 +60,12 @@ pub struct WereadUi {
     pub progress: Option<ReadingProgress>,
     pub psvts: String,
     pub chapter_pos: usize,
-    pub pages: Vec<Vec<ReaderPageLine>>,
+    pub pages: Vec<Vec<text::FlowItem>>,
     pub page_index: usize,
     pub images: Vec<ChapterImage>,
+    decode_slots: VecDeque<u16>,
+    decode_inflight: bool,
+    decode_generation: u64,
     pub notes: Vec<NoteLine>,
     pub download_done: usize,
     pub qr_url: String,
@@ -80,6 +85,14 @@ pub struct WereadUi {
     download_attempts: u8,
     download_skip: Vec<u32>,
     download_last_error: String,
+    /// Image URLs for the chapter whose text is already on the card.
+    download_images: Vec<text::ImageRef>,
+    download_image_pos: usize,
+    download_image_attempts: u8,
+    download_image_skips: Vec<(u32, u16)>,
+    /// Chapters whose image pass finished in this session, even if the marker
+    /// file could not be written.
+    download_images_done: Vec<u32>,
     read_after_contents: bool,
     toc_after_contents: bool,
     session_dirty: bool,
@@ -108,6 +121,9 @@ impl Default for WereadUi {
             pages: Vec::new(),
             page_index: 0,
             images: Vec::new(),
+            decode_slots: VecDeque::new(),
+            decode_inflight: false,
+            decode_generation: 0,
             notes: Vec::new(),
             download_done: 0,
             qr_url: String::new(),
@@ -125,6 +141,11 @@ impl Default for WereadUi {
             download_attempts: 0,
             download_skip: Vec::new(),
             download_last_error: String::new(),
+            download_images: Vec::new(),
+            download_image_pos: 0,
+            download_image_attempts: 0,
+            download_image_skips: Vec::new(),
+            download_images_done: Vec::new(),
             read_after_contents: false,
             toc_after_contents: false,
             session_dirty: false,
@@ -155,6 +176,77 @@ pub struct ServiceOutcome {
     pub route: Option<ScreenRoute>,
     /// Restart the panel idle timer. Set while a job is running and when it returns.
     pub touch_activity: bool,
+}
+
+struct ImageDecodeJob {
+    generation: u64,
+    chapter_index: u32,
+    slot: u16,
+    handle: NamedWorkerHandle<Option<MonoBitmap>, &'static str>,
+}
+
+/// Decode handle for one stored chapter image.
+///
+/// It stays outside [`WereadUi`] so the UI can stay `Clone` without copying a
+/// thread or a 1 MiB file. The main loop polls it; the 16 KiB main task does not
+/// run the decoder.
+#[derive(Default)]
+pub struct ImageDecodeJobs {
+    job: Option<ImageDecodeJob>,
+}
+
+impl ImageDecodeJobs {
+    #[must_use]
+    pub fn busy(&self) -> bool {
+        self.job.is_some()
+    }
+
+    /// Start or finish one decode. `true` when the open chapter gained a bitmap.
+    pub fn poll(&mut self, ui: &mut WereadUi, layout: ReaderLayout) -> bool {
+        let mut refresh = false;
+        if let Some(mut job) = self.job.take() {
+            match job.handle.try_join() {
+                None => {
+                    self.job = Some(job);
+                    return false;
+                }
+                Some(Ok(Some(bitmap))) if job.generation == ui.decode_generation => {
+                    refresh = ui.install_decoded_image(job.chapter_index, job.slot, bitmap, layout);
+                }
+                Some(_) => {}
+            }
+            ui.decode_inflight = false;
+        }
+        if self.job.is_none() {
+            if let Some(next) = ui.take_image_decode() {
+                let (image_width, image_height) = text::content_box_px(layout);
+                match bitmap::spawn_image_decode(next.bytes, image_width, image_height) {
+                    Ok(handle) => {
+                        self.job = Some(ImageDecodeJob {
+                            generation: next.generation,
+                            chapter_index: next.chapter_index,
+                            slot: next.slot,
+                            handle,
+                        });
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "rustmix-wave=weread-image status=decode-start-failed error={error}"
+                        );
+                        ui.decode_inflight = false;
+                    }
+                }
+            }
+        }
+        refresh
+    }
+}
+
+struct PendingImageDecode {
+    generation: u64,
+    chapter_index: u32,
+    slot: u16,
+    bytes: Vec<u8>,
 }
 
 impl WereadUi {
@@ -244,9 +336,7 @@ impl WereadUi {
         }
         if previous == ScreenRoute::WeReadDownload && current != ScreenRoute::WeReadDownload {
             self.download_cancel = true;
-            if matches!(self.pending, Some(Job::Chapter { .. })) {
-                self.pending = None;
-            }
+            self.clear_download_queue();
         }
         // Reading Preferences is the shared TXT/EPUB screen. Keep the open
         // chapter so BOOT can return to it and repaginate.
@@ -438,6 +528,10 @@ impl WereadUi {
                         self.download_cancel = false;
                         self.download_attempts = 0;
                         self.download_skip = offline::load_download_skip(&sd_root(), &self.book_id);
+                        self.download_image_skips =
+                            offline::load_image_skips(&sd_root(), &self.book_id);
+                        self.download_images.clear();
+                        self.download_images_done.clear();
                         self.download_last_error.clear();
                         self.download_done = self.count_cached(mounted);
                         self.phase = Phase::Download;
@@ -556,9 +650,7 @@ impl WereadUi {
     fn on_download(&mut self, event: ButtonEvent) -> Option<ScreenRoute> {
         if event == ButtonEvent::Select {
             self.download_cancel = true;
-            if matches!(self.pending, Some(Job::Chapter { .. })) {
-                self.pending = None;
-            }
+            self.clear_download_queue();
             self.status = "Download stopped. Saved chapters stay on the SD card.".into();
             return Some(ScreenRoute::WeReadBook);
         }
@@ -650,17 +742,17 @@ impl WereadUi {
         let chapter = self.chapters[self.chapter_pos].clone();
         if mounted {
             if let Some(cached) = offline::load_chapter(&sd_root(), &self.book_id, chapter.index) {
+                self.images.clear();
                 self.show_text(&cached.text, layout);
-                if self.page_index == usize::MAX {
-                    self.page_index = self.pages.len().saturating_sub(1);
-                }
-                self.page_index = self.page_index.min(self.pages.len().saturating_sub(1));
+                self.place_open_page();
+                self.queue_stored_images(chapter.index);
                 self.arm_progress(0);
                 self.remember_local_progress(mounted);
                 self.status = chapter.title.clone();
                 return true;
             }
         }
+        self.cancel_image_decode();
         if !self.session.web_signed_in() {
             self.status =
                 "Chapter text needs a QR sign-in. An API key covers shelf, progress, and notes."
@@ -670,6 +762,7 @@ impl WereadUi {
         }
         self.pages.clear();
         self.images.clear();
+        let (image_width, image_height) = text::content_box_px(layout);
         self.queue(
             Job::Chapter {
                 book_id: self.book_id.clone(),
@@ -677,6 +770,8 @@ impl WereadUi {
                 chapter_idx: chapter.index,
                 psvts: self.psvts.clone(),
                 fetch_images: true,
+                image_width,
+                image_height,
             },
             0,
         );
@@ -687,13 +782,9 @@ impl WereadUi {
     fn show_text(&mut self, text: &str, layout: ReaderLayout) {
         let blocks = text::blocks_from_markup(text);
         self.chapter_source = text.to_string();
-        self.pages = text::paginate_blocks(&blocks, layout);
+        let measures = self.image_measures(layout);
+        self.pages = text::paginate_blocks(&blocks, layout, &measures);
         self.paginated_layout = Some(layout);
-        self.images.clear();
-        if self.page_index == usize::MAX {
-            self.page_index = self.pages.len().saturating_sub(1);
-        }
-        self.page_index = self.page_index.min(self.pages.len().saturating_sub(1));
     }
 
     /// Rebuild the open chapter after a shared reader layout change.
@@ -702,15 +793,11 @@ impl WereadUi {
             self.paginated_layout = None;
             return;
         }
-        let page = self.page_index;
+        let offset = self.chapter_offset();
         let source = std::mem::take(&mut self.chapter_source);
         self.show_text(&source, layout);
         self.chapter_source = source;
-        if self.pages.is_empty() {
-            self.page_index = 0;
-        } else {
-            self.page_index = page.min(self.pages.len() - 1);
-        }
+        self.page_index = text::page_for_text_offset(&self.pages, offset);
     }
 
     /// Rebuild when Reading Preferences changed the layout after the chapter loaded.
@@ -755,10 +842,36 @@ impl WereadUi {
         self.pages
             .iter()
             .take(self.page_index)
-            .flat_map(|page| page.iter())
-            .map(|line| line.text.chars().count())
-            .sum::<usize>()
-            .min(u32::MAX as usize) as u32
+            .map(|page| text::page_resume_units(page))
+            .fold(0u32, |sum, units| sum.saturating_add(units))
+    }
+
+    /// Resume by text offset. A stored page number shifts when a placeholder
+    /// becomes a real image, or the other way around.
+    fn place_open_page(&mut self) {
+        if self.pages.is_empty() {
+            self.page_index = 0;
+            return;
+        }
+        if self.page_index == usize::MAX {
+            self.page_index = self.pages.len() - 1;
+            return;
+        }
+        if let Some(offset) = self.progress_offset_for_open_chapter() {
+            self.page_index = text::page_for_text_offset(&self.pages, offset);
+            return;
+        }
+        self.page_index = self.page_index.min(self.pages.len() - 1);
+    }
+
+    fn progress_offset_for_open_chapter(&self) -> Option<u32> {
+        let progress = self.progress.as_ref()?;
+        let chapter = self.chapters.get(self.chapter_pos)?;
+        if progress.chapter_uid == chapter.uid {
+            Some(progress.chapter_offset)
+        } else {
+            None
+        }
     }
 
     fn percent(&self) -> u8 {
@@ -805,33 +918,55 @@ impl WereadUi {
             .count()
     }
 
+    fn chapter_download_complete(&self, index: u32) -> bool {
+        let root = sd_root();
+        offline::chapter_cached(&root, &self.book_id, index)
+            && (offline::images_settled(&root, &self.book_id, index)
+                || self.download_images_done.contains(&index))
+    }
+
     fn queue_next_download(&mut self, mounted: bool, due_ms: u64) {
         if self.download_cancel || !mounted {
             return;
         }
-        let root = sd_root();
-        if let Some((pos, chapter)) = self.chapters.iter().enumerate().find(|(_, chapter)| {
-            !self.download_skip.contains(&chapter.index)
-                && !offline::chapter_cached(&root, &self.book_id, chapter.index)
-        }) {
+        loop {
+            let found = self
+                .chapters
+                .iter()
+                .enumerate()
+                .find(|(_, chapter)| {
+                    !self.download_skip.contains(&chapter.index)
+                        && !self.chapter_download_complete(chapter.index)
+                })
+                .map(|(pos, chapter)| (pos, chapter.index, chapter.uid.clone()));
+            let Some((pos, index, uid)) = found else {
+                break;
+            };
             self.chapter_pos = pos;
-            self.download_attempts = 0;
-            self.queue(
-                Job::Chapter {
-                    book_id: self.book_id.clone(),
-                    chapter_uid: chapter.uid.clone(),
-                    chapter_idx: chapter.index,
-                    psvts: self.psvts.clone(),
-                    fetch_images: false,
-                },
-                due_ms,
-            );
-            self.status = format!(
-                "Saving {} / {}",
-                self.download_done + 1,
-                self.chapters.len()
-            );
-            return;
+            if !offline::chapter_cached(&sd_root(), &self.book_id, index) {
+                self.download_attempts = 0;
+                self.queue(
+                    Job::Chapter {
+                        book_id: self.book_id.clone(),
+                        chapter_uid: uid,
+                        chapter_idx: index,
+                        psvts: self.psvts.clone(),
+                        fetch_images: false,
+                        image_width: 0,
+                        image_height: 0,
+                    },
+                    due_ms,
+                );
+                self.status = format!(
+                    "Saving {} / {}",
+                    self.download_done + 1,
+                    self.chapters.len()
+                );
+                return;
+            }
+            if self.begin_image_downloads(due_ms) {
+                return;
+            }
         }
         self.pending = None;
         self.download_done = self.count_cached(mounted);
@@ -850,6 +985,233 @@ impl WereadUi {
         self.release_settled_download();
     }
 
+    /// Queue the next missing image. `false` when this chapter has nothing left to fetch.
+    fn begin_image_downloads(&mut self, due_ms: u64) -> bool {
+        let Some(index) = self
+            .chapters
+            .get(self.chapter_pos)
+            .map(|chapter| chapter.index)
+        else {
+            return false;
+        };
+        self.download_images = offline::chapter_image_refs(&sd_root(), &self.book_id, index);
+        self.download_image_pos = 0;
+        self.download_image_attempts = 0;
+        if self.queue_pending_image(due_ms) {
+            return true;
+        }
+        self.finish_image_pass();
+        false
+    }
+
+    fn queue_pending_image(&mut self, due_ms: u64) -> bool {
+        let Some(chapter_index) = self
+            .chapters
+            .get(self.chapter_pos)
+            .map(|chapter| chapter.index)
+        else {
+            return false;
+        };
+        let root = sd_root();
+        while self.download_image_pos < self.download_images.len() {
+            let image = self.download_images[self.download_image_pos].clone();
+            let already = self
+                .download_image_skips
+                .contains(&(chapter_index, image.slot))
+                || offline::image_cached(&root, &self.book_id, chapter_index, image.slot);
+            if already {
+                self.download_image_pos += 1;
+                self.download_image_attempts = 0;
+                continue;
+            }
+            if !bitmap::allowed_asset_url(&image.url) {
+                self.note_image_skip(chapter_index, image.slot);
+                self.download_image_pos += 1;
+                self.download_image_attempts = 0;
+                continue;
+            }
+            self.queue(
+                Job::ChapterImage {
+                    book_id: self.book_id.clone(),
+                    chapter_idx: chapter_index,
+                    image_index: image.slot,
+                    url: image.url,
+                },
+                due_ms,
+            );
+            self.status = format!(
+                "Saving image {} of {}",
+                self.download_image_pos + 1,
+                self.download_images.len()
+            );
+            return true;
+        }
+        false
+    }
+
+    fn note_image_skip(&mut self, chapter: u32, slot: u16) {
+        if !self.download_image_skips.contains(&(chapter, slot)) {
+            self.download_image_skips.push((chapter, slot));
+            let _ = offline::record_image_skip(&sd_root(), &self.book_id, chapter, slot);
+        }
+        log::info!("rustmix-wave=weread-image status=skipped chapter={chapter} slot={slot}");
+    }
+
+    fn finish_image_pass(&mut self) {
+        let Some(index) = self
+            .chapters
+            .get(self.chapter_pos)
+            .map(|chapter| chapter.index)
+        else {
+            return;
+        };
+        if !self.download_images_done.contains(&index) {
+            self.download_images_done.push(index);
+        }
+        let _ = offline::mark_images_settled(&sd_root(), &self.book_id, index);
+        self.download_images.clear();
+        self.download_image_pos = 0;
+        self.download_image_attempts = 0;
+    }
+
+    fn retry_or_skip_image(&mut self, now_ms: u64, mounted: bool, message: &str) {
+        let immediate = message.contains("size limit")
+            || message.contains("too large")
+            || message.contains("not allowed");
+        self.download_last_error = message.to_string();
+        self.download_image_attempts = self.download_image_attempts.saturating_add(1);
+        if !immediate && self.download_image_attempts < DOWNLOAD_ATTEMPTS {
+            if self.queue_pending_image(now_ms.saturating_add(DOWNLOAD_RETRY_MS)) {
+                self.status = format!(
+                    "Retrying image ({}/{}): {message}",
+                    self.download_image_attempts,
+                    DOWNLOAD_ATTEMPTS - 1
+                );
+                return;
+            }
+        }
+        let chapter = self.chapters.get(self.chapter_pos).map(|item| item.index);
+        let slot = self
+            .download_images
+            .get(self.download_image_pos)
+            .map(|image| image.slot);
+        if let (Some(chapter), Some(slot)) = (chapter, slot) {
+            self.note_image_skip(chapter, slot);
+        }
+        self.download_image_attempts = 0;
+        self.download_image_pos = self.download_image_pos.saturating_add(1);
+        if self.queue_pending_image(now_ms.saturating_add(MIN_REQUEST_GAP_MS)) {
+            return;
+        }
+        self.finish_image_pass();
+        self.queue_next_download(mounted, now_ms.saturating_add(MIN_REQUEST_GAP_MS));
+    }
+
+    fn clear_download_queue(&mut self) {
+        self.download_images.clear();
+        self.download_image_pos = 0;
+        if matches!(
+            self.pending,
+            Some(Job::Chapter { .. } | Job::ChapterImage { .. })
+        ) {
+            self.pending = None;
+        }
+    }
+
+    fn image_measures(&self, layout: ReaderLayout) -> Vec<Option<text::ImageMeasure>> {
+        let max_w = layout.max_line_width_px.max(1) as u32;
+        let max_h = text::page_budget_px(layout).max(1);
+        self.images
+            .iter()
+            .map(|image| {
+                image.bitmap.as_ref().map(|bitmap| {
+                    let (width, height) = bitmap::fitted_size(
+                        u32::from(bitmap.width),
+                        u32::from(bitmap.height),
+                        max_w,
+                        max_h,
+                    );
+                    text::ImageMeasure { width, height }
+                })
+            })
+            .collect()
+    }
+
+    fn cancel_image_decode(&mut self) {
+        self.decode_generation = self.decode_generation.saturating_add(1);
+        self.decode_slots.clear();
+    }
+
+    fn queue_stored_images(&mut self, chapter_index: u32) {
+        self.cancel_image_decode();
+        let root = sd_root();
+        for slot in 0..MAX_CHAPTER_IMAGES {
+            if offline::image_cached(&root, &self.book_id, chapter_index, slot as u16) {
+                self.decode_slots.push_back(slot as u16);
+            }
+        }
+    }
+
+    /// True while a stored image is queued or handed to the decode thread.
+    #[must_use]
+    pub fn images_decoding(&self) -> bool {
+        self.decode_inflight || !self.decode_slots.is_empty()
+    }
+
+    fn take_image_decode(&mut self) -> Option<PendingImageDecode> {
+        if self.decode_inflight || self.phase == Phase::Download {
+            return None;
+        }
+        let chapter_index = self.chapters.get(self.chapter_pos)?.index;
+        while let Some(slot) = self.decode_slots.pop_front() {
+            let Ok(bytes) =
+                offline::read_chapter_image(&sd_root(), &self.book_id, chapter_index, slot)
+            else {
+                continue;
+            };
+            self.decode_inflight = true;
+            return Some(PendingImageDecode {
+                generation: self.decode_generation,
+                chapter_index,
+                slot,
+                bytes,
+            });
+        }
+        None
+    }
+
+    fn install_decoded_image(
+        &mut self,
+        chapter_index: u32,
+        slot: u16,
+        bitmap: MonoBitmap,
+        layout: ReaderLayout,
+    ) -> bool {
+        let Some(chapter) = self.chapters.get(self.chapter_pos) else {
+            return false;
+        };
+        if chapter.index != chapter_index || self.chapter_source.is_empty() {
+            return false;
+        }
+        let slot = usize::from(slot);
+        if self.images.len() <= slot {
+            self.images.resize(
+                slot + 1,
+                ChapterImage {
+                    alt: String::new(),
+                    bitmap: None,
+                },
+            );
+        }
+        self.images[slot].bitmap = Some(bitmap);
+        let offset = self.chapter_offset();
+        let source = std::mem::take(&mut self.chapter_source);
+        self.show_text(&source, layout);
+        self.chapter_source = source;
+        self.page_index = text::page_for_text_offset(&self.pages, offset);
+        true
+    }
+
     fn requeue_current_chapter(&mut self, due_ms: u64) {
         let Some(chapter) = self.chapters.get(self.chapter_pos).cloned() else {
             return;
@@ -861,6 +1223,8 @@ impl WereadUi {
                 chapter_idx: chapter.index,
                 psvts: self.psvts.clone(),
                 fetch_images: false,
+                image_width: 0,
+                image_height: 0,
             },
             due_ms,
         );
@@ -923,7 +1287,7 @@ impl WereadUi {
                         .pages
                         .get(self.page_index)
                         .and_then(|page| page.first())
-                        .map(|line| line.text.chars().take(20).collect())
+                        .map(|item| item.line_text().chars().take(20).collect())
                         .unwrap_or_default();
                     self.queue(
                         Job::UploadProgress {
@@ -987,7 +1351,7 @@ impl WereadUi {
         self.session = report.session;
         match report.result {
             Ok(output) => self.apply_output(output, layout, mounted, now_ms),
-            Err(error) => self.apply_error(error, now_ms, mounted),
+            Err(error) => self.apply_error(error, &report.job, now_ms, mounted),
         }
     }
 
@@ -1165,8 +1529,9 @@ impl WereadUi {
                     drop(blocks);
                     drop(images);
                 } else {
-                    self.show_text(&text, layout);
                     self.images = images;
+                    self.show_text(&text, layout);
+                    self.place_open_page();
                 }
                 if mounted {
                     if let Some(chapter) = self.chapters.get(self.chapter_pos) {
@@ -1284,6 +1649,24 @@ impl WereadUi {
                     touch_activity: false,
                 }
             }
+            JobOutput::ImageStored => {
+                if self.phase == Phase::Download && !self.download_cancel {
+                    self.download_image_attempts = 0;
+                    self.download_image_pos = self.download_image_pos.saturating_add(1);
+                    if !self.queue_pending_image(now_ms.saturating_add(MIN_REQUEST_GAP_MS)) {
+                        self.finish_image_pass();
+                        self.queue_next_download(
+                            mounted,
+                            now_ms.saturating_add(MIN_REQUEST_GAP_MS),
+                        );
+                    }
+                }
+                ServiceOutcome {
+                    refresh: true,
+                    route: None,
+                    touch_activity: false,
+                }
+            }
             JobOutput::Cover { book_id, bitmap } => {
                 if let Some(index) = self.books.iter().position(|book| book.book_id == book_id) {
                     if self.covers.len() != self.books.len() {
@@ -1300,13 +1683,20 @@ impl WereadUi {
         }
     }
 
-    fn apply_error(&mut self, error: JobError, now_ms: u64, mounted: bool) -> ServiceOutcome {
+    fn apply_error(
+        &mut self,
+        error: JobError,
+        job: &Job,
+        now_ms: u64,
+        mounted: bool,
+    ) -> ServiceOutcome {
         match error {
             JobError::Expired => {
                 self.session.expire_web();
                 self.session_dirty = true;
                 self.progress_arm = false;
                 self.download_cancel = true;
+                self.clear_download_queue();
                 self.read_after_contents = false;
                 self.toc_after_contents = false;
                 self.begin_login(now_ms);
@@ -1321,9 +1711,7 @@ impl WereadUi {
                 self.download_cancel = true;
                 self.read_after_contents = false;
                 self.toc_after_contents = false;
-                if matches!(self.pending, Some(Job::Chapter { .. })) {
-                    self.pending = None;
-                }
+                self.clear_download_queue();
                 self.release_settled_download();
                 self.status = error.to_string();
                 ServiceOutcome {
@@ -1337,7 +1725,11 @@ impl WereadUi {
                 self.read_after_contents = false;
                 self.toc_after_contents = false;
                 if self.phase == Phase::Download && !self.download_cancel {
-                    self.retry_or_skip_download(now_ms, mounted, &message);
+                    if matches!(job, Job::ChapterImage { .. }) {
+                        self.retry_or_skip_image(now_ms, mounted, &message);
+                    } else {
+                        self.retry_or_skip_download(now_ms, mounted, &message);
+                    }
                 } else {
                     self.status = message;
                 }
@@ -1477,7 +1869,7 @@ fn sd_root() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::WereadUi;
+    use super::{text, WereadUi};
     use crate::{
         app::router::ScreenRoute,
         buttons::ButtonEvent,
@@ -1535,7 +1927,9 @@ mod tests {
         assert!(ui.begin_read(layout, true));
         assert!(ui.pending.is_none());
         assert!(!ui.pages.is_empty());
-        assert!(ui.pages[0].iter().any(|line| line.text.contains("微信")));
+        assert!(ui.pages[0]
+            .iter()
+            .any(|item| item.line_text().contains("微信")));
 
         ui.generation = 7;
         let mut expired = Session::default();
@@ -1573,8 +1967,12 @@ mod tests {
             level: 1,
         }];
         ui.pages = vec![
-            vec![crate::reader::ReaderPageLine::new("one", true)],
-            vec![crate::reader::ReaderPageLine::new("two", true)],
+            vec![text::FlowItem::Line(crate::reader::ReaderPageLine::new(
+                "one", true,
+            ))],
+            vec![text::FlowItem::Line(crate::reader::ReaderPageLine::new(
+                "two", true,
+            ))],
         ];
         let layout = ReaderPreferences::default().layout();
         assert_eq!(
@@ -1864,6 +2262,8 @@ mod tests {
                         chapter_idx: 1,
                         psvts: String::new(),
                         fetch_images: false,
+                        image_width: 0,
+                        image_height: 0,
                     },
                     session: ui.session.clone(),
                     result: Err(JobError::Message("Not enough memory".into())),
@@ -1891,6 +2291,8 @@ mod tests {
                     chapter_idx: 1,
                     psvts: String::new(),
                     fetch_images: false,
+                    image_width: 0,
+                    image_height: 0,
                 },
                 session: ui.session.clone(),
                 result: Err(JobError::Message("Not enough memory".into())),
@@ -1924,6 +2326,8 @@ mod tests {
                     chapter_idx: 1,
                     psvts: String::new(),
                     fetch_images: false,
+                    image_width: 0,
+                    image_height: 0,
                 },
                 session: ui.session.clone(),
                 result: Err(JobError::Message(HTTP_STALL_ERROR.into())),
@@ -1948,7 +2352,9 @@ mod tests {
         ui.phase = super::Phase::Download;
         ui.chapters = vec![chapter("1", 1, "One")];
         ui.generation = 2;
-        ui.pages = vec![vec![crate::reader::ReaderPageLine::new("old", true)]];
+        ui.pages = vec![vec![text::FlowItem::Line(
+            crate::reader::ReaderPageLine::new("old", true),
+        )]];
         ui.chapter_source = "old".into();
         ui.apply_report(
             Report {
@@ -1959,6 +2365,8 @@ mod tests {
                     chapter_idx: 1,
                     psvts: String::new(),
                     fetch_images: false,
+                    image_width: 0,
+                    image_height: 0,
                 },
                 session: ui.session.clone(),
                 result: Ok(JobOutput::Chapter {
@@ -2008,7 +2416,9 @@ mod tests {
         ui.chapters = vec![chapter("1", 1, "One")];
         ui.generation = 3;
         ui.chapter_source = "old".into();
-        ui.pages = vec![vec![crate::reader::ReaderPageLine::new("old", true)]];
+        ui.pages = vec![vec![text::FlowItem::Line(
+            crate::reader::ReaderPageLine::new("old", true),
+        )]];
         ui.apply_report(
             Report {
                 generation: 3,
@@ -2018,6 +2428,8 @@ mod tests {
                     chapter_idx: 1,
                     psvts: "ps".into(),
                     fetch_images: false,
+                    image_width: 0,
+                    image_height: 0,
                 },
                 session: ui.session.clone(),
                 result: Ok(JobOutput::ChapterStored { psvts: "ps".into() }),
@@ -2037,6 +2449,202 @@ mod tests {
         assert!(!ui.pages.is_empty());
         std::env::remove_var("WEREAD_SD_ROOT");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_image_does_not_fail_the_saved_chapter() {
+        let _sd = sd_root_lock();
+        let dir = std::env::temp_dir().join(format!("weread-ui-image-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("WEREAD_SD_ROOT", &dir);
+        let book_id = "43208843";
+        let html =
+            "<p>Hello 微信</p><img alt=\"图\" src=\"https://res.weread.qq.com/a.jpg\"><p>After</p>";
+        let shard = crate::weread::decode::seal_plain(html);
+        let mut download = ChapterDownload::begin(&dir, book_id, "1", 1).unwrap();
+        download.apply(DownloadEvent::BeginPart("e0")).unwrap();
+        for chunk in shard
+            .as_bytes()
+            .chunks(crate::weread::limits::DOWNLOAD_CHUNK_BYTES)
+        {
+            download
+                .apply(DownloadEvent::Chunk(chunk.to_vec()))
+                .unwrap();
+        }
+        download.apply(DownloadEvent::EndPart).unwrap();
+        download.commit().unwrap();
+
+        let mut ui = signed_in();
+        ui.book_id = book_id.into();
+        ui.phase = super::Phase::Download;
+        ui.chapters = vec![chapter("1", 1, "One")];
+        ui.generation = 3;
+        let layout = ReaderPreferences::default().layout();
+        ui.apply_report(
+            Report {
+                generation: 3,
+                job: Job::Chapter {
+                    book_id: book_id.into(),
+                    chapter_uid: "1".into(),
+                    chapter_idx: 1,
+                    psvts: "ps".into(),
+                    fetch_images: false,
+                    image_width: 0,
+                    image_height: 0,
+                },
+                session: ui.session.clone(),
+                result: Ok(JobOutput::ChapterStored { psvts: "ps".into() }),
+            },
+            layout,
+            true,
+            10,
+        );
+        match &ui.pending {
+            Some(Job::ChapterImage {
+                chapter_idx,
+                image_index,
+                url,
+                ..
+            }) => {
+                assert_eq!(*chapter_idx, 1);
+                assert_eq!(*image_index, 0);
+                assert!(url.contains("res.weread.qq.com"));
+            }
+            other => panic!("expected an image download, got {other:?}"),
+        }
+        assert!(offline::chapter_cached(&dir, book_id, 1));
+        for attempt in 1..DOWNLOAD_ATTEMPTS {
+            ui.apply_report(
+                Report {
+                    generation: 3,
+                    job: Job::ChapterImage {
+                        book_id: book_id.into(),
+                        chapter_idx: 1,
+                        image_index: 0,
+                        url: "https://res.weread.qq.com/a.jpg".into(),
+                    },
+                    session: ui.session.clone(),
+                    result: Err(JobError::Message("HTTP response stalled".into())),
+                },
+                layout,
+                true,
+                1_000,
+            );
+            assert!(ui.status.contains("Retrying image"), "{}", ui.status);
+            assert_eq!(ui.download_image_attempts, attempt);
+            assert!(ui.download_skip.is_empty());
+        }
+        ui.apply_report(
+            Report {
+                generation: 3,
+                job: Job::ChapterImage {
+                    book_id: book_id.into(),
+                    chapter_idx: 1,
+                    image_index: 0,
+                    url: "https://res.weread.qq.com/a.jpg".into(),
+                },
+                session: ui.session.clone(),
+                result: Err(JobError::Message("response exceeds size limit".into())),
+            },
+            layout,
+            true,
+            2_000,
+        );
+        assert!(ui.download_skip.is_empty());
+        assert!(offline::chapter_cached(&dir, book_id, 1));
+        assert_eq!(offline::load_image_skips(&dir, book_id), vec![(1, 0)]);
+        assert!(ui.pending.is_none());
+        assert!(ui.begin_read(layout, true));
+        assert!(ui.chapter_source.contains("Hello"));
+        assert!(ui.chapter_source.contains("weread-img"));
+        assert!(ui
+            .pages
+            .iter()
+            .flatten()
+            .any(|item| item.line_text().contains("[image:")));
+        std::env::remove_var("WEREAD_SD_ROOT");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stored_images_decode_off_the_main_task_and_corrupt_files_stay_placeholders() {
+        let _sd = sd_root_lock();
+        let dir = std::env::temp_dir().join(format!("weread-ui-decode-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("WEREAD_SD_ROOT", &dir);
+        let book_id = "43208843";
+        offline::save_chapter(
+            &dir,
+            book_id,
+            &CachedChapter {
+                uid: "1".into(),
+                index: 1,
+                title: "One".into(),
+                text: "Hello\n[[weread-img:0|图]]\nAfter".into(),
+            },
+        )
+        .unwrap();
+        let image_path = offline::book_dir(&dir, book_id).join(offline::image_name(1, 0));
+        fs::write(&image_path, tiny_png()).unwrap();
+        let mut ui = signed_in();
+        ui.book_id = book_id.into();
+        ui.chapters = vec![chapter("1", 1, "One")];
+        let layout = ReaderPreferences::default().layout();
+        assert!(ui.begin_read(layout, true));
+        assert!(ui.images_decoding());
+        assert!(ui
+            .images
+            .first()
+            .and_then(|image| image.bitmap.as_ref())
+            .is_none());
+        let mut decode = super::ImageDecodeJobs::default();
+        let started = std::time::Instant::now();
+        while (ui.images_decoding() || decode.busy())
+            && started.elapsed() < std::time::Duration::from_secs(3)
+        {
+            decode.poll(&mut ui, layout);
+            std::thread::yield_now();
+        }
+        assert!(
+            ui.images
+                .first()
+                .and_then(|image| image.bitmap.as_ref())
+                .is_some(),
+            "decoded bitmap missing"
+        );
+        fs::write(&image_path, b"\xff\xd8\xff").unwrap();
+        assert!(ui.begin_read(layout, true));
+        let started = std::time::Instant::now();
+        while (ui.images_decoding() || decode.busy())
+            && started.elapsed() < std::time::Duration::from_secs(3)
+        {
+            decode.poll(&mut ui, layout);
+            std::thread::yield_now();
+        }
+        assert!(ui
+            .images
+            .first()
+            .and_then(|image| image.bitmap.as_ref())
+            .is_none());
+        assert!(ui
+            .pages
+            .iter()
+            .flatten()
+            .any(|item| item.line_text().contains("[image:")));
+        std::env::remove_var("WEREAD_SD_ROOT");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        use image::ImageEncoder;
+        let image = image::GrayImage::from_pixel(2, 2, image::Luma([0]));
+        let mut bytes = Vec::new();
+        image::codecs::png::PngEncoder::new(std::io::Cursor::new(&mut bytes))
+            .write_image(image.as_raw(), 2, 2, image::ColorType::L8)
+            .unwrap();
+        bytes
     }
 
     #[test]
@@ -2072,11 +2680,11 @@ mod tests {
         let text = "中".repeat(80) + &"abcd ".repeat(80);
         let tight = ReaderPreferences::default();
         ui.show_text(&text, tight.layout());
-        let tight_line = ui.pages[0][0].text.chars().count();
+        let tight_line = ui.pages[0][0].line_text().chars().count();
         let mut loose = tight;
         loose.letter_spacing = crate::reader::LetterSpacing::Px4;
         assert!(ui.sync_layout(loose.layout()));
-        assert!(ui.pages[0][0].text.chars().count() < tight_line);
+        assert!(ui.pages[0][0].line_text().chars().count() < tight_line);
         assert_eq!(ui.chapter_source, text);
         assert!(!ui.sync_layout(loose.layout()));
     }
@@ -2107,6 +2715,8 @@ mod tests {
             chapter_idx: 2,
             psvts: String::new(),
             fetch_images: false,
+            image_width: 0,
+            image_height: 0,
         });
         assert!(ui.needs_radio());
         ui.phase = super::Phase::Book;
@@ -2125,6 +2735,8 @@ mod tests {
                 chapter_idx: 1,
                 psvts: String::new(),
                 fetch_images: false,
+                image_width: 0,
+                image_height: 0,
             },
             session: ui.session.clone(),
             result: Err(error),
@@ -2155,6 +2767,8 @@ mod tests {
                     chapter_idx: 1,
                     psvts: String::new(),
                     fetch_images: false,
+                    image_width: 0,
+                    image_height: 0,
                 },
                 session: ui.session.clone(),
                 result: Ok(JobOutput::Chapter {
@@ -2241,6 +2855,8 @@ mod tests {
                     chapter_idx: 1,
                     psvts: String::new(),
                     fetch_images: false,
+                    image_width: 0,
+                    image_height: 0,
                 },
                 session: ui.session.clone(),
                 result: Ok(JobOutput::ChapterStored {
@@ -2268,6 +2884,8 @@ mod tests {
             chapter_idx: 1,
             psvts: String::new(),
             fetch_images: false,
+            image_width: 0,
+            image_height: 0,
         });
         assert!(ui.needs_radio());
         ui.note_route(ScreenRoute::WeReadDownload, ScreenRoute::Home);
@@ -2340,6 +2958,8 @@ mod tests {
                     chapter_idx: 1,
                     psvts: String::new(),
                     fetch_images: false,
+                    image_width: 0,
+                    image_height: 0,
                 },
                 session: done.session.clone(),
                 result: Ok(JobOutput::ChapterStored {

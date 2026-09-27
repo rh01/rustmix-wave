@@ -830,6 +830,7 @@ mod firmware {
         let mut last_voice_record_refresh = Instant::now();
         let weread_clock = Instant::now();
         let mut weread_jobs = weread::http::HttpJobs::default();
+        let mut weread_images = weread::ui::ImageDecodeJobs::default();
         let mut radio_idle = RadioIdle::new(RADIO_IDLE_TIMEOUT_SECS);
         let mut ntp_hold_started = Instant::now();
         let mut last_power_log = PowerDebugSnapshot::default();
@@ -1674,7 +1675,11 @@ mod firmware {
                 }
             }
 
-            if !sleep_mode.is_sleeping() && (state.active_route().is_weread() || weread_jobs.busy())
+            if !sleep_mode.is_sleeping()
+                && (state.active_route().is_weread()
+                    || weread_jobs.busy()
+                    || state.weread.images_decoding()
+                    || weread_images.busy())
             {
                 let unix = state.board.rtc.and_then(unix_from_rtc_storage);
                 let now_ms = weread_clock.elapsed().as_millis() as u64;
@@ -1690,6 +1695,7 @@ mod firmware {
                     )?;
                 }
                 let previous = state.active_route();
+                let images_changed = weread_images.poll(&mut state.weread, layout);
                 let outcome = weread_jobs.poll(
                     &mut state.weread,
                     unix,
@@ -1700,14 +1706,14 @@ mod firmware {
                 // Restart the 60s idle timer after the job, not from the moment
                 // it was queued. A join longer than the sleep threshold used to
                 // put the panel to sleep on the same iteration the request returned.
-                if outcome.touch_activity || state.weread.holds_panel() {
+                if outcome.touch_activity || images_changed || state.weread.holds_panel() {
                     last_activity = Instant::now();
                 }
                 if let Some(route) = outcome.route {
                     state.router.navigate_to(route);
                     state.weread.note_route(previous, route);
                 }
-                if outcome.refresh && state.panel_awake {
+                if (outcome.refresh || images_changed) && state.panel_awake {
                     refresh_screen(
                         &mut panel,
                         &mut frame,

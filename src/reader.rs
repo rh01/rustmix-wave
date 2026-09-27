@@ -1,15 +1,20 @@
 //! Offline Reader state, TXT / EPUB pagination and Reader-owned persistence.
 //!
-//! EPUB page anchors are stored in a paged SD index (RAM fallback when the card
-//! cannot be written) so long CJK books open before indexing finishes. Hitting
-//! the safety cap keeps the current page readable and switches progress to an
-//! approximation instead of refusing the book.
-// rustmix-wave=epub-paged-anchor-index-ready
+//! EPUB layout is chapter-on-demand. Opening a book or jumping to a saved
+//! offset lays out only the spine item that contains that offset, so a long
+//! novel becomes readable before the rest of its chapters are paginated.
+//! Neighbouring chapters are laid out when the reader reaches a chapter
+//! boundary. Page numbers are chapter-local (`chapter i/N` plus the page
+//! within that chapter). The byte offset remains the progress anchor, so
+//! older whole-book page indexes are ignored on restore.
+// rustmix-wave=epub-chapter-on-demand-ready
 
 use std::{
+    cell::Cell,
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    ptr::NonNull,
     time::{Duration, UNIX_EPOCH},
 };
 
@@ -60,28 +65,23 @@ pub const READER_BOOKMARK_LIMIT: usize = 128;
 pub const READER_CACHE_OFFSET_LIMIT: usize = 4096;
 /// Persist an anchor-cache checkpoint after this many newly indexed pages.
 pub const READER_CACHE_CHECKPOINT_PAGES: usize = 4;
-/// Safety ceiling for EPUB page anchors in the SD page index.
+/// Safety ceiling for page anchors stored for one EPUB spine item.
 ///
-/// Realistic novels, including long CJK books at 16 px, stay far below this.
-/// Hostile input stops here and remains readable with approximate progress.
+/// A chapter that reaches the cap stays readable. Further pages in that
+/// chapter use an approximate page number instead of refusing the book.
 pub const READER_EPUB_PAGE_ANCHOR_LIMIT: usize = 262_144;
-/// Byte cap for one EPUB page-index file, including its header and chapter
-/// directory. Indexing stops at whichever of the page ceiling or this byte
-/// cap is reached first.
+/// Byte cap for one chapter anchor cache, including its header. Layout stops
+/// at whichever of the page ceiling or this byte cap is reached first.
 pub const READER_EPUB_ANCHOR_INDEX_BYTES_LIMIT: usize =
     8 * 1024 + READER_EPUB_PAGE_ANCHOR_LIMIT * 8;
-/// Anchors kept in RAM when the SD page index cannot be created.
-pub const READER_EPUB_RAM_FALLBACK_ANCHORS: usize = 16_384;
-/// Reading-window anchors kept beside the open page. The full index is not
-/// stored in this window.
-pub const READER_EPUB_READING_WINDOW: usize = 64;
-/// EPUB anchors recorded on each background tick after the current page is open.
+/// EPUB pages laid out on each background tick after the current page is open.
+/// Only the current spine item is advanced; the next chapter waits until the
+/// reader reaches this chapter's end.
 pub const READER_EPUB_BACKGROUND_INDEX_PAGES: usize = 16;
-/// Number of EPUB page anchors generated before briefly blocking the current
-/// task. The pause lets the ESP-IDF idle task feed its watchdog while large
-/// chapters are indexed for chapter-relative totals.
+/// Number of EPUB pages laid out before the main loop can poll buttons.
+/// The pause also lets the ESP-IDF idle task feed its watchdog.
 pub const READER_EPUB_INDEX_YIELD_EVERY_PAGES: usize = 4;
-/// Cooperative pause used during bounded EPUB chapter pagination.
+/// Cooperative pause used between EPUB chapter layout batches.
 pub const READER_EPUB_INDEX_YIELD_MILLIS: u64 = 1;
 
 const READER_PERSISTENCE_VERSION: &str = "1";
@@ -89,6 +89,46 @@ const READER_CACHE_VERSION: &str = "3";
 const READER_PREFS_VERSION: &str = "1";
 const CACHE_FNV_OFFSET: u64 = 0xcbf29ce484222325;
 const CACHE_FNV_PRIME: u64 = 0x100000001b3;
+
+std::thread_local! {
+    static LAYOUT_BUTTON_POLL: Cell<Option<NonNull<dyn FnMut() -> bool + 'static>>> =
+        const { Cell::new(None) };
+}
+
+/// Run `body` while EPUB layout batches can poll buttons.
+///
+/// The main loop installs a check that reports whether a key is down. Layout
+/// stops at the next batch boundary so the loop can deliver the press instead
+/// of paginating through it.
+pub fn with_layout_button_poll<R>(poll: &mut dyn FnMut() -> bool, body: impl FnOnce() -> R) -> R {
+    struct Restore(Option<NonNull<dyn FnMut() -> bool + 'static>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LAYOUT_BUTTON_POLL.with(|slot| slot.set(self.0.take()));
+        }
+    }
+
+    LAYOUT_BUTTON_POLL.with(|slot| {
+        let previous = slot.get();
+        let poll_ptr = std::ptr::from_mut::<dyn FnMut() -> bool>(poll);
+        // SAFETY: `poll` stays borrowed until `body` returns. The `'static`
+        // erasure only lets the thread-local hold the fat pointer; `Restore`
+        // clears that slot before this function returns, including on panic.
+        let poll_ptr = unsafe {
+            NonNull::new_unchecked(std::mem::transmute::<
+                *mut dyn FnMut() -> bool,
+                *mut (dyn FnMut() -> bool + 'static),
+            >(poll_ptr))
+        };
+        slot.set(Some(poll_ptr));
+        let _restore = Restore(previous);
+        body()
+    })
+}
+
+fn layout_button_pending() -> bool {
+    LAYOUT_BUTTON_POLL.with(|slot| slot.get().is_some_and(|poll| unsafe { (*poll.as_ptr())() }))
+}
 
 /// Reader-supported content types. TXT and bounded reflowable EPUB are active.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,6 +178,9 @@ pub struct ReaderBook {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReaderChapterPageLabel {
     pub chapter_number: usize,
+    /// Readable chapters in the book. Zero means a legacy record that did not
+    /// store the total; the UI then shows the chapter number alone.
+    pub chapter_count: usize,
     pub page_number: usize,
     pub page_count: usize,
     /// Set when `page_count` is estimated or still unknown. Unknown totals
@@ -146,6 +189,20 @@ pub struct ReaderChapterPageLabel {
 }
 
 impl ReaderChapterPageLabel {
+    /// `i/N` when the chapter total is known, otherwise just `i`.
+    #[must_use]
+    pub fn chapter_text(&self) -> String {
+        if self.chapter_count == 0 {
+            self.chapter_number.to_string()
+        } else {
+            format!(
+                "{}/{}",
+                self.chapter_number,
+                self.chapter_count.max(self.chapter_number)
+            )
+        }
+    }
+
     #[must_use]
     pub fn page_text(&self) -> String {
         if self.approximate {
@@ -862,6 +919,256 @@ struct ReaderAnchorCache {
     complete: bool,
 }
 
+/// Page anchors for the one spine item currently being laid out.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EpubChapterLayout {
+    index: usize,
+    chapter_number: usize,
+    chapter_count: usize,
+    text_offset: u64,
+    text_end_offset: u64,
+    pages: Vec<u64>,
+    next_offset: u64,
+    complete: bool,
+    truncated: bool,
+    on_sd: bool,
+    dirty: bool,
+    fingerprint: u64,
+    cache_path: PathBuf,
+    anchor_limit: usize,
+    byte_limit: usize,
+    warning: Option<String>,
+}
+
+impl EpubChapterLayout {
+    fn admits_another_page(&self) -> bool {
+        if self.pages.len() >= self.anchor_limit.max(1) {
+            return false;
+        }
+        let pages = (self.pages.len() as u64).saturating_add(1);
+        match pages
+            .checked_mul(8)
+            .and_then(|anchors| anchors.checked_add(crate::epub_page_index::HEADER_LEN as u64))
+        {
+            Some(bytes) => bytes <= self.byte_limit.max(crate::epub_page_index::HEADER_LEN) as u64,
+            None => false,
+        }
+    }
+
+    fn at_start(&self, offset: u64) -> bool {
+        match self.pages.first() {
+            Some(&first) => offset <= first,
+            None => offset <= self.text_offset,
+        }
+    }
+
+    fn page_index_of(&self, offset: u64) -> Option<usize> {
+        if self.pages.is_empty() {
+            return None;
+        }
+        let index = self
+            .pages
+            .partition_point(|start| *start <= offset)
+            .checked_sub(1)?;
+        if self.pages[index] > offset {
+            return None;
+        }
+        if let Some(&next) = self.pages.get(index + 1) {
+            if offset < next {
+                Some(index)
+            } else {
+                None
+            }
+        } else if self.complete || self.truncated || self.next_offset > offset {
+            Some(index)
+        } else {
+            None
+        }
+    }
+
+    fn next_anchor(&self, offset: u64) -> Option<u64> {
+        let current = self.page_index_of(offset)?;
+        self.pages.get(current + 1).copied()
+    }
+
+    fn previous_anchor(&self, offset: u64) -> Option<u64> {
+        if !(self.complete || self.truncated || self.next_offset > offset) {
+            return None;
+        }
+        let current = self
+            .pages
+            .partition_point(|start| *start <= offset)
+            .checked_sub(1)?;
+        let previous = current.checked_sub(1)?;
+        Some(self.pages[previous])
+    }
+
+    fn estimate_pages(&self, offset: u64) -> (usize, usize) {
+        let length = self.text_end_offset.saturating_sub(self.text_offset).max(1);
+        let into_chapter = offset.saturating_sub(self.text_offset).min(length);
+        if self.pages.is_empty() || self.next_offset <= self.text_offset {
+            return (1, 0);
+        }
+        let through = self.next_offset.saturating_sub(self.text_offset).max(1);
+        let indexed = self.pages.len() as u64;
+        let pages = (length.saturating_mul(indexed) / through)
+            .max(indexed)
+            .max(1);
+        let number = (into_chapter.saturating_mul(indexed) / through)
+            .saturating_add(1)
+            .min(pages);
+        (
+            usize::try_from(number).unwrap_or(usize::MAX),
+            usize::try_from(pages).unwrap_or(usize::MAX),
+        )
+    }
+
+    fn label_for(&self, offset: u64) -> ReaderChapterPageLabel {
+        if let Some(index) = self.page_index_of(offset) {
+            let page_number = index.saturating_add(1);
+            if self.complete && !self.truncated {
+                return ReaderChapterPageLabel {
+                    chapter_number: self.chapter_number,
+                    chapter_count: self.chapter_count,
+                    page_number,
+                    page_count: self.pages.len().max(1),
+                    approximate: false,
+                };
+            }
+            if self.truncated {
+                let (_, estimated) = self.estimate_pages(offset);
+                return ReaderChapterPageLabel {
+                    chapter_number: self.chapter_number,
+                    chapter_count: self.chapter_count,
+                    page_number,
+                    page_count: estimated.max(page_number),
+                    approximate: true,
+                };
+            }
+            return ReaderChapterPageLabel {
+                chapter_number: self.chapter_number,
+                chapter_count: self.chapter_count,
+                page_number,
+                page_count: 0,
+                approximate: true,
+            };
+        }
+        let (page_number, page_count) = self.estimate_pages(offset);
+        ReaderChapterPageLabel {
+            chapter_number: self.chapter_number,
+            chapter_count: self.chapter_count,
+            page_number,
+            page_count: if self.truncated { page_count } else { 0 },
+            approximate: true,
+        }
+    }
+
+    fn store_if_dirty(&mut self) -> Result<(), String> {
+        if !self.dirty || (self.pages.is_empty() && !self.complete && !self.truncated) {
+            return Ok(());
+        }
+        let cache = crate::epub_page_index::ChapterAnchorCache {
+            fingerprint: self.fingerprint,
+            chapter_index: u32::try_from(self.index).unwrap_or(u32::MAX),
+            text_offset: self.text_offset,
+            text_end_offset: self.text_end_offset,
+            anchors: self.pages.clone(),
+            next_offset: self.next_offset,
+            complete: self.complete,
+            truncated: self.truncated,
+        };
+        match cache.store(&self.cache_path) {
+            Ok(()) => {
+                self.dirty = false;
+                self.on_sd = true;
+                Ok(())
+            }
+            Err(error) => {
+                self.warning = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+}
+
+fn layout_one_epub_page(
+    layout: &mut EpubChapterLayout,
+    document: &EpubDocument,
+    prefs: ReaderLayout,
+) -> Result<bool, String> {
+    if layout.complete || layout.truncated {
+        return Ok(false);
+    }
+    if layout.next_offset >= layout.text_end_offset {
+        layout.complete = true;
+        layout.dirty = true;
+        return Ok(false);
+    }
+    if !layout.admits_another_page() {
+        layout.truncated = true;
+        layout.dirty = true;
+        return Ok(false);
+    }
+    let page = read_epub_page_until(
+        document,
+        prefs,
+        layout.next_offset,
+        layout.pages.len(),
+        layout.text_end_offset,
+    )?;
+    if page.next_byte_offset <= layout.next_offset {
+        layout.truncated = true;
+        layout.dirty = true;
+        return Ok(false);
+    }
+    let start = page.byte_offset;
+    if layout.pages.last().is_some_and(|last| *last >= start)
+        || start < layout.text_offset
+        || start > layout.text_end_offset
+    {
+        layout.truncated = true;
+        layout.dirty = true;
+        return Ok(false);
+    }
+    layout.pages.push(start);
+    layout.next_offset = page.next_byte_offset.min(layout.text_end_offset);
+    layout.dirty = true;
+    if layout.next_offset >= layout.text_end_offset {
+        layout.complete = true;
+    }
+    Ok(true)
+}
+
+fn chapter_cache_fingerprint(
+    book: &ReaderBook,
+    layout: ReaderLayout,
+    chapter_index: usize,
+    text_offset: u64,
+    text_end_offset: u64,
+) -> u64 {
+    let mut hash = book_fingerprint(book, layout);
+    for value in [
+        chapter_index as u64,
+        text_offset,
+        text_end_offset,
+        0x4550_4348,
+    ] {
+        hash ^= value;
+        hash = hash.wrapping_mul(CACHE_FNV_PRIME);
+    }
+    hash
+}
+
+fn clamp_to_chapter(offset: u64, start: u64, end: u64) -> u64 {
+    if offset < start {
+        start
+    } else if offset > end {
+        end
+    } else {
+        offset
+    }
+}
+
 /// One EPUB chapter's layout-specific page accounting. Anchors themselves live
 /// in the SD page index; this record only keeps the chapter range and how many
 /// pages have been recorded for it.
@@ -897,7 +1204,13 @@ pub struct ReaderSession {
     pub epub_page_numbers_exact: bool,
     pub cache: Vec<ReaderCachedPage>,
     pub epub_chapter_pages: Vec<ReaderEpubChapterPages>,
-    epub_anchor_index: Option<crate::epub_page_index::EpubAnchorIndex>,
+    epub_chapter: Option<EpubChapterLayout>,
+    epub_preparing: Option<EpubChapterLayout>,
+    pending_show_last: bool,
+    pending_rewind_offset: Option<u64>,
+    epub_cache_dir: PathBuf,
+    epub_anchor_limit: usize,
+    epub_byte_limit: usize,
 }
 
 impl ReaderSession {
@@ -953,16 +1266,16 @@ impl ReaderSession {
 
     #[must_use]
     pub fn indexed_page_count(&self) -> usize {
-        self.epub_anchor_index
+        self.epub_chapter
             .as_ref()
-            .map_or(self.page_offsets.len(), |index| index.page_count())
+            .map_or(self.page_offsets.len(), |chapter| chapter.pages.len())
     }
 
     #[must_use]
     pub fn epub_index_on_sd(&self) -> bool {
-        self.epub_anchor_index
+        self.epub_chapter
             .as_ref()
-            .is_some_and(|index| index.on_sd())
+            .is_some_and(|chapter| chapter.on_sd)
     }
 
     #[must_use]
@@ -970,6 +1283,10 @@ impl ReaderSession {
         let source_size = self.source_size_bytes();
         if source_size == 0 {
             return 100;
+        }
+        if self.epub_chapter.is_some() {
+            let offset = self.view_offset();
+            return ((offset.saturating_mul(100) / source_size).min(100)) as u8;
         }
         if self.index_truncated {
             let offset = self
@@ -998,13 +1315,8 @@ impl ReaderSession {
 
     #[must_use]
     fn known_page_total(&self) -> usize {
-        let window = self
-            .page_number_base
-            .saturating_add(self.page_offsets.len());
-        self.epub_anchor_index
-            .as_ref()
-            .map(|index| index.page_count().max(window))
-            .unwrap_or(window)
+        self.page_number_base
+            .saturating_add(self.page_offsets.len())
     }
 
     #[must_use]
@@ -1019,8 +1331,8 @@ impl ReaderSession {
         usize::try_from(scaled.max(indexed_pages as u64)).unwrap_or(usize::MAX)
     }
 
-    /// Product-facing page label. TXT keeps the accepted book-relative label;
-    /// EPUB uses a chapter-relative label as requested by the Reader UI.
+    /// Product-facing page label. TXT keeps the book-relative label. EPUB shows
+    /// the chapter as `i/N` and the page within that chapter.
     #[must_use]
     pub fn display_page_label(&self) -> String {
         self.current_epub_chapter_page_label().map_or_else(
@@ -1028,7 +1340,7 @@ impl ReaderSession {
             |chapter| {
                 format!(
                     "CH {}  PAGE {}",
-                    chapter.chapter_number,
+                    chapter.chapter_text(),
                     chapter.page_text()
                 )
             },
@@ -1036,13 +1348,25 @@ impl ReaderSession {
     }
 
     #[must_use]
-    pub fn current_epub_chapter_page_label(&self) -> Option<ReaderChapterPageLabel> {
-        let offset = self
-            .page_offsets
+    fn view_offset(&self) -> u64 {
+        self.page_offsets
             .get(self.current_page)
             .copied()
-            .or_else(|| self.current_cached_page().map(|page| page.byte_offset))?;
-        self.epub_chapter_page_label_for_offset(offset)
+            .or_else(|| self.current_cached_page().map(|page| page.byte_offset))
+            .unwrap_or(0)
+    }
+
+    #[must_use]
+    pub fn current_epub_chapter_page_label(&self) -> Option<ReaderChapterPageLabel> {
+        if self.epub_chapter.is_none() {
+            return None;
+        }
+        let offset = self.view_offset();
+        self.epub_chapter_page_label_for_offset(offset).or_else(|| {
+            self.epub_chapter
+                .as_ref()
+                .map(|layout| layout.label_for(offset))
+        })
     }
 
     #[must_use]
@@ -1050,82 +1374,18 @@ impl ReaderSession {
         &self,
         offset: u64,
     ) -> Option<ReaderChapterPageLabel> {
+        if self.book.format != BookFormat::Epub {
+            return None;
+        }
+        let layout = self.epub_chapter.as_ref()?;
         let source_size = self.source_size_bytes();
-        let (chapter_number, text_offset, text_end_offset, first_page, indexed_pages, complete) = {
-            let chapter = self.epub_chapter_pages.iter().find(|chapter| {
-                offset >= chapter.text_offset
-                    && (offset < chapter.text_end_offset
-                        || (offset == chapter.text_end_offset
-                            && chapter.text_end_offset == source_size))
-            })?;
-            (
-                chapter.chapter_number,
-                chapter.text_offset,
-                chapter.text_end_offset,
-                chapter.first_page,
-                chapter.indexed_pages,
-                chapter.complete,
-            )
-        };
-        let located = self
-            .epub_anchor_index
-            .as_ref()
-            .and_then(|index| index.page_containing(offset));
-        let indexed_total = self.indexed_page_count();
-        let through = self.indexed_through;
-        if let (Some(page), Some(first)) = (located, first_page) {
-            let page_number = page.saturating_sub(first).saturating_add(1);
-            if complete {
-                return Some(ReaderChapterPageLabel {
-                    chapter_number,
-                    page_number,
-                    page_count: indexed_pages.max(1),
-                    approximate: false,
-                });
-            }
-            if self.index_truncated {
-                let (_, estimated) = estimate_chapter_pages(
-                    text_offset,
-                    text_end_offset,
-                    offset,
-                    indexed_total,
-                    through,
-                );
-                return Some(ReaderChapterPageLabel {
-                    chapter_number,
-                    page_number,
-                    page_count: estimated.max(page_number),
-                    approximate: true,
-                });
-            }
-            return Some(ReaderChapterPageLabel {
-                chapter_number,
-                page_number,
-                page_count: 0,
-                approximate: true,
-            });
+        let in_chapter = offset >= layout.text_offset
+            && (offset < layout.text_end_offset
+                || (offset == layout.text_end_offset && layout.text_end_offset == source_size));
+        if !in_chapter {
+            return None;
         }
-        if self.index_truncated {
-            let (page_number, page_count) = estimate_chapter_pages(
-                text_offset,
-                text_end_offset,
-                offset,
-                indexed_total,
-                through,
-            );
-            return Some(ReaderChapterPageLabel {
-                chapter_number,
-                page_number,
-                page_count,
-                approximate: true,
-            });
-        }
-        Some(ReaderChapterPageLabel {
-            chapter_number,
-            page_number: 1,
-            page_count: 0,
-            approximate: true,
-        })
+        Some(layout.label_for(offset))
     }
 
     fn push_cached_page(&mut self, page: ReaderCachedPage) {
@@ -1209,7 +1469,7 @@ impl ReaderSession {
     }
 
     pub fn next_page(&mut self) -> Result<(), String> {
-        if self.epub_anchor_index.is_some() {
+        if self.epub_chapter.is_some() {
             return self.next_epub_page();
         }
         let target = self.current_page.saturating_add(1);
@@ -1224,7 +1484,7 @@ impl ReaderSession {
     }
 
     pub fn previous_page(&mut self) -> Result<(), String> {
-        if self.epub_anchor_index.is_some() {
+        if self.epub_chapter.is_some() {
             return self.previous_epub_page();
         }
         if self.current_page > 0 {
@@ -1235,85 +1495,359 @@ impl ReaderSession {
     }
 
     fn next_epub_page(&mut self) -> Result<(), String> {
-        let target = self.current_page.saturating_add(1);
-        if target < self.page_offsets.len() {
-            self.current_page = target;
-            self.ensure_page_cached(target)?;
-            return Ok(());
+        self.cancel_chapter_prepare();
+        self.pending_rewind_offset = None;
+        let offset = self.view_offset();
+        if let Some(next) = self
+            .epub_chapter
+            .as_ref()
+            .and_then(|layout| layout.next_anchor(offset))
+        {
+            return self.render_epub_offset(next);
         }
-        let current_offset = self
-            .page_offsets
-            .get(self.current_page)
-            .copied()
+        let chapter_end = self
+            .epub_chapter
+            .as_ref()
+            .map(|layout| layout.text_end_offset)
             .unwrap_or(0);
-        if let Some(next_offset) = self.indexed_successor(current_offset) {
-            self.push_reading_anchor(next_offset);
-            self.ensure_page_cached(self.current_page)?;
+        let next_byte = self.current_page_end_offset()?;
+        if next_byte > offset && next_byte < chapter_end {
+            return self.render_epub_offset(next_byte);
+        }
+        self.enter_next_chapter()
+    }
+
+    fn previous_epub_page(&mut self) -> Result<(), String> {
+        let offset = self.view_offset();
+        let at_start = self
+            .epub_chapter
+            .as_ref()
+            .is_some_and(|layout| layout.at_start(offset));
+        if at_start {
+            self.pending_rewind_offset = None;
+            return self.prepare_previous_chapter();
+        }
+        self.cancel_chapter_prepare();
+        if let Some(previous) = self
+            .epub_chapter
+            .as_ref()
+            .and_then(|layout| layout.previous_anchor(offset))
+        {
+            self.pending_rewind_offset = None;
+            return self.render_epub_offset(previous);
+        }
+        self.pending_rewind_offset = Some(offset);
+        self.layout_epub_batch(READER_EPUB_INDEX_YIELD_EVERY_PAGES)?;
+        self.finish_pending_rewind().map(|_| ())
+    }
+
+    fn enter_next_chapter(&mut self) -> Result<(), String> {
+        let Some(current) = self.epub_chapter.as_ref() else {
+            return Ok(());
+        };
+        let next_index = current.index.saturating_add(1);
+        let count = self
+            .epub_document
+            .as_ref()
+            .map(|document| document.chapters.len())
+            .unwrap_or(0);
+        if next_index >= count {
             return Ok(());
         }
-        let next_start = self.current_page_end_offset()?;
-        if next_start >= self.source_size_bytes() {
+        let start = self
+            .epub_document
+            .as_ref()
+            .and_then(|document| document.chapters.get(next_index))
+            .map(|chapter| chapter.text_offset)
+            .unwrap_or(0);
+        self.jump_to_chapter(next_index, start)
+    }
+
+    fn prepare_previous_chapter(&mut self) -> Result<(), String> {
+        let Some(current) = self.epub_chapter.as_ref() else {
+            return Ok(());
+        };
+        if current.index == 0 {
             return Ok(());
         }
-        let absolute = self
-            .page_number_base
-            .saturating_add(self.page_offsets.len());
+        let prepared = self.load_chapter_layout(current.index - 1)?;
+        if prepared.complete || prepared.truncated {
+            let offset = prepared
+                .pages
+                .last()
+                .copied()
+                .unwrap_or(prepared.text_offset);
+            self.store_epub_caches()?;
+            self.epub_preparing = None;
+            self.pending_show_last = false;
+            self.epub_chapter = Some(prepared);
+            return self.render_epub_offset(offset);
+        }
+        self.epub_preparing = Some(prepared);
+        self.pending_show_last = true;
+        self.layout_epub_batch(READER_EPUB_BACKGROUND_INDEX_PAGES)?;
+        self.finish_pending_last_page().map(|_| ())
+    }
+
+    fn cancel_chapter_prepare(&mut self) {
+        if let Some(layout) = self.epub_preparing.as_mut() {
+            let _ = layout.store_if_dirty();
+        }
+        self.epub_preparing = None;
+        self.pending_show_last = false;
+    }
+
+    fn jump_to_chapter(&mut self, index: usize, offset: u64) -> Result<(), String> {
+        self.store_epub_caches()?;
+        self.epub_preparing = None;
+        self.pending_show_last = false;
+        self.pending_rewind_offset = None;
+        let layout = self.load_chapter_layout(index)?;
+        let offset = clamp_to_chapter(offset, layout.text_offset, layout.text_end_offset);
+        self.epub_chapter = Some(layout);
+        self.render_epub_offset(offset)
+    }
+
+    fn load_chapter_layout(&self, index: usize) -> Result<EpubChapterLayout, String> {
         let document = self
             .epub_document
             .as_ref()
             .ok_or_else(|| "EPUB document is unavailable".to_string())?;
-        let page = read_epub_page(document, self.layout, next_start, absolute)?;
-        if page.next_byte_offset <= next_start && page.byte_offset == current_offset {
-            return Ok(());
-        }
-        self.push_reading_anchor(page.byte_offset);
-        self.push_cached_page(page);
-        Ok(())
+        let chapter = document
+            .chapters
+            .get(index)
+            .ok_or_else(|| "EPUB chapter is unavailable".to_string())?;
+        let fingerprint = chapter_cache_fingerprint(
+            &self.book,
+            self.layout,
+            index,
+            chapter.text_offset,
+            chapter.text_end_offset,
+        );
+        let cache_path = crate::epub_page_index::cache_path(&self.epub_cache_dir, fingerprint);
+        let loaded = crate::epub_page_index::ChapterAnchorCache::load(
+            &cache_path,
+            &crate::epub_page_index::ChapterCacheExpect {
+                fingerprint,
+                chapter_index: u32::try_from(index).unwrap_or(u32::MAX),
+                text_offset: chapter.text_offset,
+                text_end_offset: chapter.text_end_offset,
+            },
+        );
+        Ok(EpubChapterLayout {
+            index,
+            chapter_number: chapter.number,
+            chapter_count: document.chapters.len().max(chapter.number),
+            text_offset: chapter.text_offset,
+            text_end_offset: chapter.text_end_offset,
+            pages: loaded
+                .as_ref()
+                .map(|cache| cache.anchors.clone())
+                .unwrap_or_default(),
+            next_offset: loaded
+                .as_ref()
+                .map(|cache| cache.next_offset)
+                .unwrap_or(chapter.text_offset),
+            complete: loaded.as_ref().is_some_and(|cache| cache.complete),
+            truncated: loaded.as_ref().is_some_and(|cache| cache.truncated),
+            on_sd: loaded.is_some(),
+            dirty: false,
+            fingerprint,
+            cache_path,
+            anchor_limit: self.epub_anchor_limit,
+            byte_limit: self.epub_byte_limit,
+            warning: None,
+        })
     }
 
-    fn previous_epub_page(&mut self) -> Result<(), String> {
-        if self.current_page > 0 {
-            self.current_page -= 1;
-            self.ensure_page_cached(self.current_page)?;
-            return Ok(());
-        }
-        let front = self.page_offsets.first().copied().unwrap_or(0);
-        let Some(page) = self
-            .epub_anchor_index
-            .as_ref()
-            .and_then(|index| index.page_containing(front))
-        else {
-            return Ok(());
+    fn render_epub_offset(&mut self, offset: u64) -> Result<(), String> {
+        let prefs = self.layout;
+        let mut page = {
+            let document = self
+                .epub_document
+                .as_ref()
+                .ok_or_else(|| "EPUB document is unavailable".to_string())?;
+            read_epub_page(document, prefs, offset, 0)?
         };
-        if page == 0 {
-            return Ok(());
-        }
-        let Some(offset) = self
-            .epub_anchor_index
+        let local = self
+            .epub_chapter
             .as_ref()
-            .and_then(|index| index.anchor(page - 1))
-        else {
-            return Ok(());
-        };
-        self.page_offsets.insert(0, offset);
-        self.page_number_base = page - 1;
-        self.epub_page_numbers_exact = true;
-        while self.page_offsets.len() > READER_EPUB_READING_WINDOW {
-            self.page_offsets.pop();
-        }
+            .and_then(|layout| layout.page_index_of(page.byte_offset));
+        self.page_number_base = local.unwrap_or(0);
         self.current_page = 0;
-        self.ensure_page_cached(0)?;
+        self.page_offsets = vec![page.byte_offset];
+        self.epub_page_numbers_exact = local.is_some()
+            && self
+                .epub_chapter
+                .as_ref()
+                .is_some_and(|layout| layout.complete && !layout.truncated);
+        page.page_index = self.current_absolute_page();
+        self.cache.clear();
+        self.push_cached_page(page);
+        self.sync_epub_flags();
         Ok(())
     }
 
-    fn indexed_successor(&self, offset: u64) -> Option<u64> {
-        let index = self.epub_anchor_index.as_ref()?;
-        let page = index.page_containing(offset)?;
-        let anchor = index.anchor(page)?;
-        if anchor != offset {
-            return None;
+    fn layout_epub_batch(&mut self, budget: usize) -> Result<usize, String> {
+        let preparing = self.epub_preparing.is_some();
+        let Some(mut layout) = (if preparing {
+            self.epub_preparing.take()
+        } else {
+            self.epub_chapter.take()
+        }) else {
+            return Ok(0);
+        };
+        let prefs = self.layout;
+        let mut added = 0_usize;
+        let result = (|| {
+            while added < budget {
+                if added > 0 && added % READER_EPUB_INDEX_YIELD_EVERY_PAGES == 0 {
+                    std::thread::sleep(Duration::from_millis(READER_EPUB_INDEX_YIELD_MILLIS));
+                    if layout_button_pending() {
+                        break;
+                    }
+                }
+                let document = self
+                    .epub_document
+                    .as_ref()
+                    .ok_or_else(|| "EPUB document is unavailable".to_string())?;
+                if !layout_one_epub_page(&mut layout, document, prefs)? {
+                    break;
+                }
+                added += 1;
+            }
+            Ok(added)
+        })();
+        if preparing {
+            self.epub_preparing = Some(layout);
+        } else {
+            self.epub_chapter = Some(layout);
         }
-        index.anchor(page + 1)
+        self.sync_epub_flags();
+        result
+    }
+
+    fn sync_epub_flags(&mut self) {
+        let Some(layout) = self.epub_chapter.as_ref() else {
+            return;
+        };
+        self.indexed_through = layout.next_offset;
+        self.index_complete = layout.complete;
+        self.index_truncated = layout.truncated;
+        self.epub_chapter_pages = vec![ReaderEpubChapterPages {
+            chapter_number: layout.chapter_number,
+            text_offset: layout.text_offset,
+            text_end_offset: layout.text_end_offset,
+            first_page: if layout.pages.is_empty() {
+                None
+            } else {
+                Some(0)
+            },
+            indexed_pages: layout.pages.len(),
+            complete: layout.complete,
+        }];
+    }
+
+    fn reconcile_view_page_number(&mut self) {
+        let offset = self.view_offset();
+        if let Some(index) = self
+            .epub_chapter
+            .as_ref()
+            .and_then(|layout| layout.page_index_of(offset))
+        {
+            self.page_number_base = index;
+            self.epub_page_numbers_exact = self
+                .epub_chapter
+                .as_ref()
+                .is_some_and(|layout| layout.complete && !layout.truncated);
+            if let Some(page) = self
+                .cache
+                .iter_mut()
+                .find(|page| page.byte_offset == offset)
+            {
+                page.page_index = index;
+            }
+        }
+        self.sync_epub_flags();
+    }
+
+    fn finish_pending_last_page(&mut self) -> Result<bool, String> {
+        let ready = self
+            .epub_preparing
+            .as_ref()
+            .is_some_and(|layout| layout.complete || layout.truncated);
+        if !self.pending_show_last || !ready {
+            return Ok(false);
+        }
+        if let Some(layout) = self.epub_preparing.as_mut() {
+            let _ = layout.store_if_dirty();
+        }
+        let prepared = self
+            .epub_preparing
+            .take()
+            .ok_or_else(|| "EPUB chapter prepare disappeared".to_string())?;
+        let offset = prepared
+            .pages
+            .last()
+            .copied()
+            .unwrap_or(prepared.text_offset);
+        if let Some(current) = self.epub_chapter.as_mut() {
+            let _ = current.store_if_dirty();
+        }
+        self.epub_chapter = Some(prepared);
+        self.pending_show_last = false;
+        self.render_epub_offset(offset)?;
+        Ok(true)
+    }
+
+    fn finish_pending_rewind(&mut self) -> Result<bool, String> {
+        let Some(offset) = self.pending_rewind_offset else {
+            return Ok(false);
+        };
+        if let Some(previous) = self
+            .epub_chapter
+            .as_ref()
+            .and_then(|layout| layout.previous_anchor(offset))
+        {
+            self.pending_rewind_offset = None;
+            self.render_epub_offset(previous)?;
+            return Ok(true);
+        }
+        let stalled = self
+            .epub_chapter
+            .as_ref()
+            .is_some_and(|layout| layout.complete || layout.truncated);
+        if stalled {
+            self.pending_rewind_offset = None;
+        }
+        Ok(false)
+    }
+
+    /// Returns true when the visible page changed because a deferred chapter
+    /// edge finished.
+    fn resolve_epub_edge(&mut self) -> Result<bool, String> {
+        if self.finish_pending_last_page()? {
+            return Ok(true);
+        }
+        self.finish_pending_rewind()
+    }
+
+    fn store_epub_caches(&mut self) -> Result<(), String> {
+        let mut error = None;
+        if let Some(layout) = self.epub_chapter.as_mut() {
+            if let Err(err) = layout.store_if_dirty() {
+                error = Some(err);
+            }
+        }
+        if let Some(layout) = self.epub_preparing.as_mut() {
+            if let Err(err) = layout.store_if_dirty() {
+                error = Some(err);
+            }
+        }
+        match error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn current_page_end_offset(&mut self) -> Result<u64, String> {
@@ -1329,160 +1863,6 @@ impl ReaderSession {
             .ok_or_else(|| "current page is not cached".to_string())
     }
 
-    fn push_reading_anchor(&mut self, offset: u64) {
-        self.page_offsets.push(offset);
-        self.current_page = self.page_offsets.len() - 1;
-        while self.page_offsets.len() > READER_EPUB_READING_WINDOW {
-            self.page_offsets.remove(0);
-            self.page_number_base = self.page_number_base.saturating_add(1);
-            self.current_page = self.current_page.saturating_sub(1);
-        }
-    }
-
-    fn index_epub_batch(&mut self, budget: usize) -> Result<usize, String> {
-        if self.epub_anchor_index.is_none() {
-            return Ok(0);
-        }
-        let layout = self.layout;
-        let mut added = 0_usize;
-        let mut dirty = false;
-        while added < budget {
-            let step = {
-                let index = self.epub_anchor_index.as_ref().unwrap();
-                if index.is_finished() {
-                    None
-                } else {
-                    let document = self
-                        .epub_document
-                        .as_ref()
-                        .ok_or_else(|| "EPUB document is unavailable".to_string())?;
-                    let source_size = document.text_size_bytes();
-                    let start = index.next_anchor();
-                    if start >= source_size {
-                        Some(None)
-                    } else {
-                        let chapter_end = document
-                            .chapter_for_offset(start)
-                            .map_or(source_size, |chapter| chapter.text_end_offset);
-                        let page = read_epub_page_until(document, layout, start, 0, chapter_end)?;
-                        Some(Some((start, page.next_byte_offset)))
-                    }
-                }
-            };
-            let Some(step) = step else {
-                break;
-            };
-            let Some((start, next)) = step else {
-                if let Some(index) = self.epub_anchor_index.as_mut() {
-                    index.mark_complete();
-                    dirty = true;
-                }
-                break;
-            };
-            if next <= start {
-                let source_size = self.source_size_bytes();
-                if let Some(index) = self.epub_anchor_index.as_mut() {
-                    if next >= source_size {
-                        index.mark_complete();
-                    } else {
-                        index.mark_truncated();
-                    }
-                    dirty = true;
-                }
-                break;
-            }
-            let status = self
-                .epub_anchor_index
-                .as_mut()
-                .unwrap()
-                .append(start, next)?;
-            dirty = true;
-            added += 1;
-            if matches!(
-                status,
-                crate::epub_page_index::AppendStatus::Complete
-                    | crate::epub_page_index::AppendStatus::Truncated
-            ) {
-                break;
-            }
-            if added % READER_EPUB_INDEX_YIELD_EVERY_PAGES == 0 {
-                std::thread::sleep(Duration::from_millis(READER_EPUB_INDEX_YIELD_MILLIS));
-            }
-        }
-        if dirty {
-            let sync = self
-                .epub_anchor_index
-                .as_ref()
-                .is_some_and(|index| index.is_finished() || index.page_count() % 64 == 0);
-            if let Some(index) = self.epub_anchor_index.as_mut() {
-                if let Err(error) = index.flush(sync) {
-                    index.mark_truncated();
-                    index.warning = Some(error);
-                }
-            }
-        }
-        self.sync_epub_index_flags();
-        self.reconcile_epub_reading_page();
-        Ok(added)
-    }
-
-    fn sync_epub_index_flags(&mut self) {
-        let Some(index) = self.epub_anchor_index.as_ref() else {
-            return;
-        };
-        self.indexed_through = index.next_anchor();
-        self.index_complete = index.is_complete();
-        self.index_truncated = index.is_truncated();
-        self.epub_chapter_pages = index
-            .chapters()
-            .iter()
-            .map(|chapter| ReaderEpubChapterPages {
-                chapter_number: chapter.chapter_number,
-                text_offset: chapter.text_offset,
-                text_end_offset: chapter.text_end_offset,
-                first_page: chapter.first_page,
-                indexed_pages: chapter.page_count,
-                complete: chapter.complete,
-            })
-            .collect();
-    }
-
-    fn reconcile_epub_reading_page(&mut self) {
-        let Some(front) = self.page_offsets.first().copied() else {
-            return;
-        };
-        let Some(page) = self
-            .epub_anchor_index
-            .as_ref()
-            .and_then(|index| index.page_containing(front))
-        else {
-            return;
-        };
-        let Some(anchor) = self
-            .epub_anchor_index
-            .as_ref()
-            .and_then(|index| index.anchor(page))
-        else {
-            return;
-        };
-        if anchor != front {
-            return;
-        }
-        let old_base = self.page_number_base;
-        if old_base != page {
-            let delta = page as isize - old_base as isize;
-            for cached in &mut self.cache {
-                let adjusted = cached.page_index as isize + delta;
-                if adjusted >= 0 {
-                    cached.page_index = adjusted as usize;
-                }
-            }
-            self.page_number_base = page;
-        }
-        self.epub_page_numbers_exact = true;
-    }
-
-    #[must_use]
     fn anchor_cache(&self) -> Option<ReaderAnchorCache> {
         if self.book.format != BookFormat::Text {
             return None;
@@ -1590,6 +1970,8 @@ pub enum ReaderTickOutcome {
     LoadingStageChanged,
     FirstPageReady,
     BackgroundCacheAdvanced,
+    /// A deferred chapter boundary finished and the visible page changed.
+    ReadingPositionChanged,
     Failed,
 }
 
@@ -1723,7 +2105,7 @@ impl ReaderUiState {
     #[cfg(test)]
     fn set_epub_index_limits(&mut self, pages: usize, bytes: usize) {
         self.epub_page_anchor_limit = pages.max(1);
-        self.epub_index_bytes_limit = bytes.max(crate::epub_page_index::ANCHOR_BASE + 8);
+        self.epub_index_bytes_limit = bytes.max(crate::epub_page_index::HEADER_LEN + 8);
     }
 
     /// Load persisted state without making startup dependent on removable
@@ -1991,14 +2373,24 @@ impl ReaderUiState {
         self.loading.as_ref().map(|loading| loading.stage)
     }
 
-    /// True while a book is still opening or the nearby-page index is incomplete.
+    /// True while a book is opening, the current EPUB chapter is still being
+    /// laid out, or a TXT nearby-page cache is incomplete.
     #[must_use]
     pub fn needs_background_tick(&self) -> bool {
         if self.loading.is_some() {
             return true;
         }
         self.session.as_ref().is_some_and(|session| {
-            session.cache.len() < READER_NEARBY_PAGE_CACHE && !session.index_complete
+            session.epub_preparing.is_some()
+                || session.pending_show_last
+                || session.pending_rewind_offset.is_some()
+                || session
+                    .epub_chapter
+                    .as_ref()
+                    .is_some_and(|chapter| !chapter.complete && !chapter.truncated)
+                || (session.epub_chapter.is_none()
+                    && session.cache.len() < READER_NEARBY_PAGE_CACHE
+                    && !session.index_complete)
         })
     }
 
@@ -2103,8 +2495,9 @@ impl ReaderUiState {
                     match session {
                         Ok(session) => {
                             self.session = Some(session);
-                            self.last_message =
-                                Some("Saved position ready; caching continues lazily".into());
+                            self.last_message = Some(
+                                "Saved position ready; this chapter lays out on demand".into(),
+                            );
                             self.persist_current_session_best_effort();
                             ReaderTickOutcome::FirstPageReady
                         }
@@ -2130,21 +2523,45 @@ impl ReaderUiState {
         }
 
         let (outcome, checkpoint) = if let Some(session) = self.session.as_mut() {
-            if session.epub_anchor_index.is_some() {
-                match session.index_epub_batch(READER_EPUB_BACKGROUND_INDEX_PAGES) {
-                    Ok(0) => (ReaderTickOutcome::None, false),
-                    Ok(_) => {
-                        let checkpoint = session.index_complete
-                            || session.index_truncated
-                            || session.indexed_page_count() % 64 == 0;
-                        (ReaderTickOutcome::BackgroundCacheAdvanced, checkpoint)
+            if session.epub_chapter.is_some() {
+                match session.layout_epub_batch(READER_EPUB_BACKGROUND_INDEX_PAGES) {
+                    Ok(added) => {
+                        let moved = match session.resolve_epub_edge() {
+                            Ok(moved) => moved,
+                            Err(error) => {
+                                if let Some(layout) = session.epub_chapter.as_mut() {
+                                    layout.truncated = true;
+                                    layout.warning = Some(error.clone());
+                                }
+                                session.sync_epub_flags();
+                                self.last_message = Some(error);
+                                false
+                            }
+                        };
+                        session.reconcile_view_page_number();
+                        let checkpoint = session
+                            .epub_chapter
+                            .as_ref()
+                            .is_some_and(|layout| layout.dirty)
+                            || session
+                                .epub_preparing
+                                .as_ref()
+                                .is_some_and(|layout| layout.dirty);
+                        let outcome = if moved {
+                            ReaderTickOutcome::ReadingPositionChanged
+                        } else if added > 0 {
+                            ReaderTickOutcome::BackgroundCacheAdvanced
+                        } else {
+                            ReaderTickOutcome::None
+                        };
+                        (outcome, checkpoint)
                     }
                     Err(error) => {
-                        if let Some(index) = session.epub_anchor_index.as_mut() {
-                            index.mark_truncated();
-                            let _ = index.flush(false);
+                        if let Some(layout) = session.epub_chapter.as_mut() {
+                            layout.truncated = true;
+                            layout.warning = Some(error.clone());
                         }
-                        session.sync_epub_index_flags();
+                        session.sync_epub_flags();
                         self.last_message = Some(error);
                         (ReaderTickOutcome::None, true)
                     }
@@ -2219,12 +2636,10 @@ impl ReaderUiState {
             .as_ref()
             .filter(|session| bookmark.matches_book(&session.book))
             .and_then(|session| {
-                if let Some(page) = session
-                    .epub_anchor_index
-                    .as_ref()
-                    .and_then(|index| index.page_containing(bookmark.byte_offset))
+                if let Some(label) =
+                    session.epub_chapter_page_label_for_offset(bookmark.byte_offset)
                 {
-                    return Some(page.saturating_add(1));
+                    return Some(label.page_number);
                 }
                 session
                     .page_offsets
@@ -2303,30 +2718,25 @@ impl ReaderUiState {
         else {
             return false;
         };
-        let page = {
-            let Some(document) = session.epub_document.as_ref() else {
-                return false;
-            };
-            read_epub_page(document, session.layout, entry.text_offset, 0)
-                .map(|page| (page, document.text_size_bytes()))
+        let Some(document) = session.epub_document.as_ref() else {
+            return false;
         };
-        session.current_page = 0;
-        session.page_number_base = 0;
-        session.page_offsets = vec![entry.text_offset];
-        session.epub_page_numbers_exact = false;
-        session.cache.clear();
-        session.reconcile_epub_reading_page();
-        match page {
-            Ok((mut page, _source_size)) => {
-                if session.page_offsets.first().copied() != Some(page.byte_offset) {
-                    session.page_offsets = vec![page.byte_offset];
-                    session.current_page = 0;
-                    session.page_number_base = 0;
-                    session.epub_page_numbers_exact = false;
-                    session.reconcile_epub_reading_page();
-                }
-                page.page_index = session.current_absolute_page();
-                session.push_cached_page(page);
+        let index = document
+            .chapters
+            .iter()
+            .position(|chapter| {
+                entry.text_offset >= chapter.text_offset
+                    && entry.text_offset < chapter.text_end_offset
+            })
+            .or_else(|| {
+                document
+                    .chapters
+                    .iter()
+                    .position(|chapter| chapter.spine_index == entry.spine_index)
+            })
+            .unwrap_or(0);
+        match session.jump_to_chapter(index, entry.text_offset) {
+            Ok(()) => {
                 self.last_message = Some(format!("TOC: {}", entry.label));
                 self.persist_current_session_best_effort();
                 true
@@ -2734,7 +3144,13 @@ impl ReaderUiState {
             epub_page_numbers_exact: false,
             cache: vec![page],
             epub_chapter_pages: Vec::new(),
-            epub_anchor_index: None,
+            epub_chapter: None,
+            epub_preparing: None,
+            pending_show_last: false,
+            pending_rewind_offset: None,
+            epub_cache_dir: PathBuf::new(),
+            epub_anchor_limit: self.epub_page_anchor_limit,
+            epub_byte_limit: self.epub_index_bytes_limit,
         })
     }
 
@@ -2749,81 +3165,73 @@ impl ReaderUiState {
             return Err("EPUB chapter pagination produced no readable pages".into());
         }
         let layout = self.preferences.layout();
+        // Byte offset is the resume anchor. A saved page index from the old
+        // whole-book index is not a chapter-local page, so it is not used to seek.
         let requested = requested.filter(|location| location.matches_book(book));
-        let saved_page = requested.map_or(0, |location| location.page_index);
         let requested_offset = requested
             .map(|location| location.byte_offset.min(source_size))
             .unwrap_or(0);
-        let shells: Vec<crate::epub_page_index::IndexedChapter> = document
+        let chapter_index = document
             .chapters
             .iter()
-            .map(|chapter| crate::epub_page_index::IndexedChapter {
-                chapter_number: chapter.number,
-                text_offset: chapter.text_offset,
-                text_end_offset: chapter.text_end_offset,
-                first_page: None,
-                page_count: 0,
-                complete: false,
+            .position(|chapter| {
+                requested_offset >= chapter.text_offset
+                    && (requested_offset < chapter.text_end_offset
+                        || (requested_offset == chapter.text_end_offset
+                            && chapter.text_end_offset == source_size))
             })
-            .collect();
-        let mut index = crate::epub_page_index::EpubAnchorIndex::open_or_create(
-            &self.epub_index_path_for(book, layout),
-            book_fingerprint(book, layout),
-            source_size,
-            &shells,
-            crate::epub_page_index::IndexLimits {
-                page_limit: self.epub_page_anchor_limit,
-                bytes_limit: self.epub_index_bytes_limit,
-                ram_fallback_limit: READER_EPUB_RAM_FALLBACK_ANCHORS,
-            },
-        );
-        if let Some(warning) = index.warning.clone() {
-            self.persistence_warning = Some(format!("EPUB page index: {warning}"));
-        }
-        let located = index.page_containing(requested_offset);
-        let (page_number_base, offset, exact) = if let Some(page_index) = located {
-            let anchor = index.anchor(page_index).unwrap_or(requested_offset);
-            (page_index, anchor, index.anchor(page_index) == Some(anchor))
-        } else {
-            (saved_page, requested_offset, false)
-        };
-        let page = read_epub_page(&document, layout, offset, page_number_base)?;
+            .unwrap_or(0);
         let mut session_book = book.clone();
         if !document.title.trim().is_empty() {
             session_book.title = document.title.clone();
         }
-        let _ = index.flush(false);
-        log::info!(
-            "rustmix-wave=epub-open status=first-page-ready indexed-pages={} complete={} truncated={} offset={}",
-            index.page_count(),
-            index.is_complete(),
-            index.is_truncated(),
-            page.byte_offset
-        );
         let mut session = ReaderSession {
             book: session_book,
             encoding: TextEncoding::Utf8,
             epub_document: Some(document),
             layout,
             current_page: 0,
-            page_number_base,
-            page_offsets: vec![page.byte_offset],
-            indexed_through: index.next_anchor(),
-            index_complete: index.is_complete(),
-            index_truncated: index.is_truncated(),
-            epub_page_numbers_exact: exact,
-            cache: vec![page],
+            page_number_base: 0,
+            page_offsets: vec![0],
+            indexed_through: 0,
+            index_complete: false,
+            index_truncated: false,
+            epub_page_numbers_exact: false,
+            cache: Vec::new(),
             epub_chapter_pages: Vec::new(),
-            epub_anchor_index: Some(index),
+            epub_chapter: None,
+            epub_preparing: None,
+            pending_show_last: false,
+            pending_rewind_offset: None,
+            epub_cache_dir: self.cache_directory(),
+            epub_anchor_limit: self.epub_page_anchor_limit,
+            epub_byte_limit: self.epub_index_bytes_limit,
         };
-        session.sync_epub_index_flags();
+        session.jump_to_chapter(chapter_index, requested_offset)?;
+        if let Some(warning) = session
+            .epub_chapter
+            .as_ref()
+            .and_then(|chapter| chapter.warning.clone())
+        {
+            self.persistence_warning = Some(format!("EPUB chapter cache: {warning}"));
+        }
+        log::info!(
+            "rustmix-wave=epub-open status=first-page-ready chapter={}/{} indexed-pages={} complete={} offset={}",
+            session
+                .epub_chapter
+                .as_ref()
+                .map(|chapter| chapter.chapter_number)
+                .unwrap_or(0),
+            session
+                .epub_chapter
+                .as_ref()
+                .map(|chapter| chapter.chapter_count)
+                .unwrap_or(0),
+            session.indexed_page_count(),
+            session.index_complete,
+            session.view_offset()
+        );
         Ok(session)
-    }
-
-    #[must_use]
-    fn epub_index_path_for(&self, book: &ReaderBook, layout: ReaderLayout) -> PathBuf {
-        self.cache_directory()
-            .join(format!("{:08X}.EPI", book_fingerprint(book, layout) as u32))
     }
 
     fn persist_current_session_best_effort(&mut self) {
@@ -2883,9 +3291,7 @@ impl ReaderUiState {
 
     fn persist_anchor_cache(&mut self) -> Result<(), String> {
         if let Some(session) = self.session.as_mut() {
-            if let Some(index) = session.epub_anchor_index.as_mut() {
-                index.flush(true)?;
-            }
+            session.store_epub_caches()?;
         }
         let Some(session) = self.session.as_ref() else {
             return Ok(());
@@ -3018,28 +3424,6 @@ fn read_reader_page(
             page_index,
         ),
     }
-}
-
-fn estimate_chapter_pages(
-    text_offset: u64,
-    text_end_offset: u64,
-    offset: u64,
-    indexed_pages: usize,
-    indexed_through: u64,
-) -> (usize, usize) {
-    let chapter_len = text_end_offset.saturating_sub(text_offset).max(1);
-    let into_chapter = offset.saturating_sub(text_offset).min(chapter_len);
-    if indexed_pages == 0 || indexed_through == 0 {
-        return (1, 0);
-    }
-    let pages = (chapter_len.saturating_mul(indexed_pages as u64) / indexed_through).max(1);
-    let number = (into_chapter.saturating_mul(indexed_pages as u64) / indexed_through)
-        .saturating_add(1)
-        .min(pages);
-    (
-        usize::try_from(number).unwrap_or(usize::MAX),
-        usize::try_from(pages).unwrap_or(usize::MAX),
-    )
 }
 
 fn read_epub_page(
@@ -3391,7 +3775,7 @@ fn book_fingerprint(book: &ReaderBook, layout: ReaderLayout) -> u64 {
 
 fn serialize_location(location: &ReaderLocation) -> String {
     format!(
-        "version={}\npath={}\ntitle={}\nformat={}\nsize={}\nmodified={}\npage={}\noffset={}\nchapter={}\nchapter_page={}\nchapter_pages={}\n",
+        "version={}\npath={}\ntitle={}\nformat={}\nsize={}\nmodified={}\npage={}\noffset={}\nchapter={}\nchapter_page={}\nchapter_pages={}\nchapter_count={}\n",
         READER_PERSISTENCE_VERSION,
         escape_field(&location.path),
         escape_field(&location.title),
@@ -3402,7 +3786,8 @@ fn serialize_location(location: &ReaderLocation) -> String {
         location.byte_offset,
         optional_usize(location.epub_chapter.as_ref().map(|chapter| chapter.chapter_number)),
         optional_usize(location.epub_chapter.as_ref().map(|chapter| chapter.page_number)),
-        optional_usize(location.epub_chapter.as_ref().map(|chapter| chapter.page_count))
+        optional_usize(location.epub_chapter.as_ref().map(|chapter| chapter.page_count)),
+        optional_usize(location.epub_chapter.as_ref().map(|chapter| chapter.chapter_count))
     )
 }
 
@@ -3418,6 +3803,7 @@ fn parse_location_record(text: &str) -> Result<ReaderLocation, String> {
     let mut chapter = None;
     let mut chapter_page = None;
     let mut chapter_pages = None;
+    let mut chapter_count = None;
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -3434,6 +3820,7 @@ fn parse_location_record(text: &str) -> Result<ReaderLocation, String> {
             "chapter" => chapter = parse_optional_usize(value),
             "chapter_page" => chapter_page = parse_optional_usize(value),
             "chapter_pages" => chapter_pages = parse_optional_usize(value),
+            "chapter_count" => chapter_count = parse_optional_usize(value),
             _ => {}
         }
     }
@@ -3448,7 +3835,7 @@ fn parse_location_record(text: &str) -> Result<ReaderLocation, String> {
         modified_seconds: modified.unwrap_or(0),
         page_index: page.ok_or_else(|| "missing page".to_string())?,
         byte_offset: offset.ok_or_else(|| "missing offset".to_string())?,
-        epub_chapter: chapter_page_label(chapter, chapter_page, chapter_pages),
+        epub_chapter: chapter_page_label(chapter, chapter_page, chapter_pages, chapter_count),
     })
 }
 
@@ -3489,20 +3876,30 @@ fn serialize_location_fields(location: &ReaderLocation) -> String {
                 .as_ref()
                 .map(|chapter| chapter.page_count),
         ),
+        optional_usize(
+            location
+                .epub_chapter
+                .as_ref()
+                .map(|chapter| chapter.chapter_count),
+        ),
     ]
     .join("\t")
 }
 
 fn parse_location_fields(value: &str) -> Result<ReaderLocation, String> {
     let fields = split_escaped_tabs(value)?;
-    if fields.len() != 7 && fields.len() != 10 {
+    // 7 fields: original TXT/EPUB offset record.
+    // 10 fields: chapter page metadata without a chapter total.
+    // 11 fields: chapter i/N plus the page within the chapter.
+    if fields.len() != 7 && fields.len() != 10 && fields.len() != 11 {
         return Err("invalid location field count".into());
     }
-    let epub_chapter = if fields.len() == 10 {
+    let epub_chapter = if fields.len() >= 10 {
         chapter_page_label(
             parse_optional_usize(&fields[7]),
             parse_optional_usize(&fields[8]),
             parse_optional_usize(&fields[9]),
+            fields.get(10).and_then(|value| parse_optional_usize(value)),
         )
     } else {
         None
@@ -3539,9 +3936,11 @@ fn chapter_page_label(
     chapter_number: Option<usize>,
     page_number: Option<usize>,
     page_count: Option<usize>,
+    chapter_count: Option<usize>,
 ) -> Option<ReaderChapterPageLabel> {
     Some(ReaderChapterPageLabel {
         chapter_number: chapter_number?,
+        chapter_count: chapter_count.unwrap_or(0),
         page_number: page_number?,
         page_count: page_count?,
         approximate: false,
@@ -3556,7 +3955,14 @@ fn parse_location_list(text: &str, limit: usize) -> Result<Vec<ReaderLocation>, 
             version = Some(value);
         } else if let Some(value) = line.strip_prefix("entry=") {
             if output.len() < limit {
-                output.push(parse_location_fields(value)?);
+                match parse_location_fields(value) {
+                    Ok(location) => output.push(location),
+                    Err(error) => {
+                        log::info!(
+                            "rustmix-wave=reader-progress status=ignored-entry error={error}"
+                        );
+                    }
+                }
             }
         }
     }
@@ -3831,13 +4237,14 @@ mod tests {
         atomic_replace_text, book_format_from_path, detect_txt_encoding, is_fat83_safe_file_name,
         load_location_record, normalize_decoded, paginate_decoded, parse_location_fields,
         parse_location_record, scan_txt_library, serialize_location, serialize_location_fields,
-        BookFont, BookFontSize, BookFormat, ParagraphAlignment, ReaderBook, ReaderChapterPageLabel,
-        ReaderLoadingStage, ReaderLocation, ReaderOrientation, ReaderPreferences, ReaderSession,
-        ReaderTickOutcome, ReaderUiState, ReadingPreference, ReadingTheme, TextEncoding,
-        LEGACY_READER_POSITIONS_FILE, READER_BOOKMARKS_FILE, READER_CACHE_OFFSET_LIMIT,
-        READER_EPUB_ANCHOR_INDEX_BYTES_LIMIT, READER_EPUB_INDEX_YIELD_EVERY_PAGES,
-        READER_EPUB_INDEX_YIELD_MILLIS, READER_EPUB_PAGE_ANCHOR_LIMIT, READER_EPUB_READING_WINDOW,
-        READER_POSITIONS_FILE, READER_PREFS_FILE, READER_RECENT_FILE, READER_STATE_FILE,
+        with_layout_button_poll, BookFont, BookFontSize, BookFormat, ParagraphAlignment,
+        ReaderBook, ReaderChapterPageLabel, ReaderLoadingStage, ReaderLocation, ReaderOrientation,
+        ReaderPreferences, ReaderSession, ReaderTickOutcome, ReaderUiState, ReadingPreference,
+        ReadingTheme, TextEncoding, LEGACY_READER_POSITIONS_FILE, READER_BOOKMARKS_FILE,
+        READER_CACHE_OFFSET_LIMIT, READER_EPUB_ANCHOR_INDEX_BYTES_LIMIT,
+        READER_EPUB_INDEX_YIELD_EVERY_PAGES, READER_EPUB_INDEX_YIELD_MILLIS,
+        READER_EPUB_PAGE_ANCHOR_LIMIT, READER_POSITIONS_FILE, READER_PREFS_FILE,
+        READER_RECENT_FILE, READER_STATE_FILE,
     };
     use crate::buttons::ButtonEvent;
 
@@ -4387,7 +4794,13 @@ mod tests {
             epub_page_numbers_exact: false,
             cache: Vec::new(),
             epub_chapter_pages: Vec::new(),
-            epub_anchor_index: None,
+            epub_chapter: None,
+            epub_preparing: None,
+            pending_show_last: false,
+            pending_rewind_offset: None,
+            epub_cache_dir: PathBuf::new(),
+            epub_anchor_limit: READER_EPUB_PAGE_ANCHOR_LIMIT,
+            epub_byte_limit: READER_EPUB_ANCHOR_INDEX_BYTES_LIMIT,
         });
         assert_eq!(reader.bookmark_display_page(&bookmark), 3);
     }
@@ -4396,6 +4809,7 @@ mod tests {
     fn epub_chapter_labels_use_chapter_relative_page_totals_and_persist() {
         let label = ReaderChapterPageLabel {
             chapter_number: 3,
+            chapter_count: 12,
             page_number: 2,
             page_count: 9,
             approximate: false,
@@ -4418,6 +4832,7 @@ mod tests {
             parse_location_fields(&serialize_location_fields(&location)).unwrap(),
             location
         );
+        assert_eq!(label.chapter_text(), "3/12");
         assert_eq!(label.page_text(), "2/9");
     }
 
@@ -4426,6 +4841,30 @@ mod tests {
         let location = parse_location_fields("book.txt\tBook\ttxt\t10\t0\t2\t5").unwrap();
         assert_eq!(location.format, BookFormat::Text);
         assert_eq!(location.epub_chapter, None);
+        let chapter = parse_location_fields("book.epub\tBook\tepub\t10\t0\t2\t5\t4\t3\t12")
+            .unwrap()
+            .epub_chapter
+            .unwrap();
+        assert_eq!(chapter.chapter_number, 4);
+        assert_eq!(chapter.chapter_count, 0);
+        assert_eq!(chapter.chapter_text(), "4");
+        assert_eq!(chapter.page_text(), "3/12");
+    }
+
+    #[test]
+    fn corrupt_progress_entries_are_skipped() {
+        let list = super::parse_location_list(
+            "version=1\nentry=bad\nentry=book.txt\tBook\ttxt\t10\t0\t2\t5\n",
+            10,
+        )
+        .unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].byte_offset, 5);
+        assert!(super::parse_location_list(
+            "version=99\nentry=book.txt\tBook\ttxt\t1\t0\t0\t0\n",
+            10
+        )
+        .is_err());
     }
 
     #[test]
@@ -4592,12 +5031,7 @@ mod tests {
     }
 
     #[test]
-    fn long_cjk_epub_opens_before_full_indexing_and_passes_the_old_anchor_cap() {
-        assert!(READER_EPUB_PAGE_ANCHOR_LIMIT >= 200_000);
-        assert!(
-            READER_EPUB_ANCHOR_INDEX_BYTES_LIMIT
-                >= crate::epub_page_index::ANCHOR_BASE + READER_EPUB_PAGE_ANCHOR_LIMIT * 8
-        );
+    fn long_cjk_epub_opens_the_current_chapter_without_indexing_the_rest() {
         let root = temp_dir("long-cjk-books");
         let state = temp_dir("long-cjk-state");
         let mut probe = ReaderUiState::with_roots(
@@ -4607,8 +5041,7 @@ mod tests {
         probe.preferences.font_size = BookFontSize::Px16;
         probe.preferences.book_font = BookFont::CjkUnifont;
         let lines = probe.preferences.layout().lines_per_page.max(2);
-        let long_paragraphs = lines * 2_200;
-        write_cjk_epub(&root, 2, long_paragraphs);
+        write_cjk_epub(&root, 2, lines * 2_200);
 
         let mut reader = ReaderUiState::with_roots(
             root.to_string_lossy().into_owned(),
@@ -4625,71 +5058,70 @@ mod tests {
             .clone();
         reader.request_open_book(book, None);
         open_until_ready(&mut reader);
-        let session = reader.session.as_ref().unwrap();
-        assert!(!session.index_complete);
-        assert_eq!(session.indexed_page_count(), 0);
-        assert!(session.page_offsets.len() <= READER_EPUB_READING_WINDOW);
-        let page_text: String = session
-            .current_cached_page()
-            .unwrap()
-            .lines
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect();
-        assert!(
-            page_text.chars().any(|character| !character.is_ascii()),
-            "{page_text}"
-        );
-        assert!(!session.display_page_label().contains("Unable"));
-
-        for _ in 0..3 {
-            assert_ne!(reader.tick(), ReaderTickOutcome::Failed);
-        }
-        assert!(reader.session.as_ref().unwrap().indexed_page_count() > 0);
-        assert!(!reader.session.as_ref().unwrap().index_complete);
-
         {
-            let session = reader.session.as_mut().unwrap();
-            while session.indexed_page_count() <= 4096
-                && !session.index_complete
-                && !session.index_truncated
+            let session = reader.session.as_ref().unwrap();
+            let chapter = session.epub_chapter.as_ref().unwrap();
+            assert_eq!(chapter.chapter_number, 1);
+            assert_eq!(chapter.index, 0);
+            assert!(session.display_page_label().contains("CH 1/2"));
+            let page_text: String = session
+                .current_cached_page()
+                .unwrap()
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect();
+            assert!(
+                page_text.chars().any(|character| !character.is_ascii()),
+                "{page_text}"
+            );
+        }
+        for _ in 0..8 {
+            assert_ne!(reader.tick(), ReaderTickOutcome::Failed);
+            assert_eq!(
+                reader
+                    .session
+                    .as_ref()
+                    .unwrap()
+                    .epub_chapter
+                    .as_ref()
+                    .unwrap()
+                    .index,
+                0
+            );
+        }
+        for _ in 0..12 {
+            if reader
+                .session
+                .as_ref()
+                .unwrap()
+                .epub_chapter
+                .as_ref()
+                .unwrap()
+                .index
+                == 1
             {
-                session.index_epub_batch(128).unwrap();
+                break;
+            }
+            if reader.session.as_ref().unwrap().index_complete {
+                reader.next_page();
+            } else {
+                reader.tick();
             }
         }
         let session = reader.session.as_ref().unwrap();
-        assert!(session.indexed_page_count() > 4096);
-        assert!(!session.index_truncated);
-        assert!(session.epub_index_on_sd());
-        assert!(session.page_offsets.len() <= READER_EPUB_READING_WINDOW);
-        assert!(session.epub_chapter_pages.len() >= 2);
-        assert!(session.epub_chapter_pages[0].complete);
-        assert!(session.epub_chapter_pages[0].indexed_pages < 32);
-        assert!(session.epub_chapter_pages[1].indexed_pages > 4096);
-        let index_path = session
-            .epub_anchor_index
-            .as_ref()
-            .and_then(|index| index.path())
-            .unwrap()
-            .to_path_buf();
-        let index_len = fs::metadata(&index_path).unwrap().len();
-        assert!(index_len > 4096 * 8);
-        assert!(index_len <= READER_EPUB_ANCHOR_INDEX_BYTES_LIMIT as u64);
-        assert!(is_fat83_safe_file_name(&index_path));
-        reader.next_page();
-        assert!(reader.session.is_some());
-        assert!(!reader
-            .last_message
-            .as_deref()
-            .unwrap_or("")
-            .contains("4096"));
+        assert_eq!(session.epub_chapter.as_ref().unwrap().chapter_number, 2);
+        assert!(session.indexed_page_count() < 64);
+        assert!(!session.index_complete);
+        assert!(session.display_page_label().contains("CH 2/2"));
+        assert!(READER_EPUB_PAGE_ANCHOR_LIMIT >= 200_000);
     }
 
     #[test]
-    fn epub_anchor_cap_keeps_the_book_open_with_approximate_progress() {
+    fn epub_chapter_cap_keeps_the_book_open_with_approximate_progress() {
         let root = temp_dir("cap-cjk-books");
         let state = temp_dir("cap-cjk-state");
-        write_cjk_epub(&root, 1, 80);
+        write_cjk_epub(&root, 80, 1);
         let mut reader = ReaderUiState::with_roots(
             root.to_string_lossy().into_owned(),
             state.to_string_lossy().into_owned(),
@@ -4701,14 +5133,11 @@ mod tests {
         let book = reader.books[0].clone();
         reader.request_open_book(book, None);
         open_until_ready(&mut reader);
-        {
-            let session = reader.session.as_mut().unwrap();
-            for _ in 0..8 {
-                if session.index_truncated {
-                    break;
-                }
-                session.index_epub_batch(4).unwrap();
+        for _ in 0..8 {
+            if reader.session.as_ref().unwrap().index_truncated {
+                break;
             }
+            assert_ne!(reader.tick(), ReaderTickOutcome::Failed);
         }
         let session = reader.session.as_ref().unwrap();
         assert!(session.index_truncated);
@@ -4726,7 +5155,7 @@ mod tests {
     }
 
     #[test]
-    fn indexed_epub_reopens_from_the_sd_page_index() {
+    fn laid_out_epub_chapter_reopens_from_its_cache_and_byte_offset() {
         let root = temp_dir("reopen-cjk-books");
         let state = temp_dir("reopen-cjk-state");
         write_cjk_epub(&root, 4, 8);
@@ -4740,18 +5169,24 @@ mod tests {
         let book = reader.books[0].clone();
         reader.request_open_book(book.clone(), None);
         open_until_ready(&mut reader);
-        {
-            let session = reader.session.as_mut().unwrap();
-            for _ in 0..40 {
-                if session.index_complete {
-                    break;
-                }
-                session.index_epub_batch(32).unwrap();
+        for _ in 0..40 {
+            let session = reader.session.as_ref().unwrap();
+            if session.epub_chapter.as_ref().unwrap().index == 1 && session.index_complete {
+                break;
+            }
+            if session.index_complete {
+                reader.next_page();
+            } else {
+                reader.tick();
             }
         }
-        let pages = reader.session.as_ref().unwrap().indexed_page_count();
-        assert!(pages > 1);
-        assert!(reader.session.as_ref().unwrap().index_complete);
+        let session = reader.session.as_ref().unwrap();
+        assert_eq!(session.epub_chapter.as_ref().unwrap().chapter_number, 2);
+        assert!(session.index_complete);
+        assert!(session.epub_index_on_sd());
+        let mut saved = session.current_location();
+        let offset = saved.byte_offset;
+        saved.page_index = 50_000;
 
         let mut restored = ReaderUiState::with_roots(
             root.to_string_lossy().into_owned(),
@@ -4759,14 +5194,71 @@ mod tests {
         );
         restored.preferences.font_size = BookFontSize::Px32;
         restored.preferences.book_font = BookFont::CjkUnifont;
-        restored.refresh_library();
-        restored.request_open_book(book, None);
+        restored.request_open_book(book, Some(saved));
         open_until_ready(&mut restored);
         let session = restored.session.as_ref().unwrap();
-        assert_eq!(session.indexed_page_count(), pages);
+        assert_eq!(session.view_offset(), offset);
+        assert_eq!(session.epub_chapter.as_ref().unwrap().chapter_number, 2);
         assert!(session.index_complete);
-        assert!(session.display_page_label().contains('/'));
-        assert!(!session.display_page_label().contains('+'));
+        assert!(session.epub_chapter.as_ref().unwrap().index == 1);
+        let label = session.display_page_label();
+        assert!(label.contains("CH 2/2"));
+        assert!(label.contains('/'));
+        assert!(!label.contains('+'));
+    }
+
+    #[test]
+    fn epub_layout_polls_buttons_between_batches() {
+        let root = temp_dir("poll-cjk-books");
+        let state = temp_dir("poll-cjk-state");
+        write_cjk_epub(&root, 800, 1);
+        let mut reader = ReaderUiState::with_roots(
+            root.to_string_lossy().into_owned(),
+            state.to_string_lossy().into_owned(),
+        );
+        reader.preferences.font_size = BookFontSize::Px16;
+        reader.preferences.book_font = BookFont::CjkUnifont;
+        reader.refresh_library();
+        let book = reader.books[0].clone();
+        reader.request_open_book(book, None);
+        open_until_ready(&mut reader);
+
+        let mut polls = 0_usize;
+        let added = with_layout_button_poll(
+            &mut || {
+                polls += 1;
+                false
+            },
+            || {
+                reader
+                    .session
+                    .as_mut()
+                    .unwrap()
+                    .layout_epub_batch(16)
+                    .unwrap()
+            },
+        );
+        assert_eq!(added, 16);
+        assert!(polls >= 3, "polls={polls}");
+
+        polls = 0;
+        let added = with_layout_button_poll(
+            &mut || {
+                polls += 1;
+                true
+            },
+            || {
+                reader
+                    .session
+                    .as_mut()
+                    .unwrap()
+                    .layout_epub_batch(64)
+                    .unwrap()
+            },
+        );
+        assert_eq!(polls, 1);
+        assert!(added <= READER_EPUB_INDEX_YIELD_EVERY_PAGES);
+        assert!(added > 0);
     }
 
     #[test]

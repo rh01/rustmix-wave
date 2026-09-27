@@ -69,6 +69,14 @@ where
         Ok(Some(event))
     }
 
+    /// True when any reader key is held down. Layout batches use this so a
+    /// press is noticed before the next page of a long chapter is built.
+    pub fn any_pressed(&mut self) -> Result<bool> {
+        Ok(self.is_pressed(ButtonEvent::Up)?
+            || self.is_pressed(ButtonEvent::Select)?
+            || self.is_pressed(ButtonEvent::Down)?)
+    }
+
     pub fn up_mut(&mut self) -> &mut UP {
         &mut self.up
     }

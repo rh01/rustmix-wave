@@ -94,7 +94,7 @@ mod firmware {
             alarm_wake_plan, classify_wake_cause, configure_dynamic_frequency_and_light_sleep,
             deep_sleep_blocked, keep_retained_frame, load_resume, load_rtc_resume, mcu_mode,
             next_block_ms, panel_sleep_follow_up, plan_panel_transport, power_key_poll_ms,
-            save_resume, sd_clock_khz, store_rtc_resume, AlarmWakePlan, McuWake,
+            save_resume, sd_clock_khz, sd_host_can_idle, store_rtc_resume, AlarmWakePlan, McuWake,
             PanelSleepFollowUp, PanelTransport, PowerDebugSnapshot, PowerView, RadioIdle, RadioJob,
             RefreshCause, SleepResume, WaitInput, CPU_FREQ_MAX_MHZ, CPU_FREQ_MIN_MHZ,
             RADIO_IDLE_TIMEOUT_SECS, RADIO_NTP_HOLD_SECS, SD_ACTIVE_CLOCK_KHZ,
@@ -2249,8 +2249,12 @@ mod firmware {
                 }
             }
 
-            let sd_can_idle =
-                _mounted_sd.is_some() && !voice_busy && !reader_busy && !weread_jobs.busy();
+            let sd_can_idle = sd_host_can_idle(
+                _mounted_sd.is_some(),
+                voice_busy,
+                reader_busy,
+                weread_needs_radio,
+            );
             if state.panel_rail_on
                 && !sleep_mode.is_sleeping()
                 && !voice_busy

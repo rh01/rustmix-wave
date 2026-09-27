@@ -993,7 +993,7 @@ impl WereadUi {
         else {
             return false;
         };
-        self.download_images = offline::chapter_image_refs(&sd_root(), &self.book_id, index);
+        self.download_images = store::chapter_image_refs(&sd_root(), &self.book_id, index);
         self.download_image_pos = 0;
         self.download_image_attempts = 0;
         if self.queue_pending_image(due_ms) {
@@ -1534,7 +1534,7 @@ impl WereadUi {
                 }
                 if mounted {
                     if let Some(chapter) = self.chapters.get(self.chapter_pos) {
-                        if let Err(error) = store::save_chapter(
+                        let saved = store::save_chapter(
                             &sd_root(),
                             &self.book_id,
                             &CachedChapter {
@@ -1543,7 +1543,9 @@ impl WereadUi {
                                 title: chapter.title.clone(),
                                 text,
                             },
-                        ) {
+                        );
+                        crate::runtime_memory::log_main_stack_high_water("weread-chapter-commit");
+                        if let Err(error) = saved {
                             if downloading {
                                 self.retry_or_skip_download(now_ms, mounted, &error);
                                 return ServiceOutcome {

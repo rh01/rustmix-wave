@@ -67,6 +67,18 @@ pub fn log_runtime_memory(boundary: &str) {
     );
 }
 
+/// Main-task stack budget (`CONFIG_ESP_MAIN_TASK_STACK_SIZE`).
+pub const MAIN_TASK_STACK_BYTES: usize = 16 * 1024;
+
+/// One line with the main task's minimum unused stack. Call from the main task.
+pub fn log_main_stack_high_water(boundary: &str) {
+    let free = RuntimeMemorySnapshot::capture().task_stack_free_bytes;
+    log::info!(
+        "rustmix-wave=main-stack boundary={} high-water-free-bytes={free} stack-bytes={MAIN_TASK_STACK_BYTES}",
+        sanitize_marker(boundary)
+    );
+}
+
 /// Heap snapshot plus the calling worker's stack high-water mark.
 ///
 /// `stack_bytes` is the stack given to that thread. FreeRTOS reports the

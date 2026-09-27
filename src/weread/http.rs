@@ -143,6 +143,7 @@ fn poll_report(job: &mut Inflight) -> Option<Report> {
                         report.result = Err(JobError::Message(error));
                     }
                 }
+                crate::runtime_memory::log_main_stack_high_water("weread-chapter-commit");
             }
             Some(report)
         }

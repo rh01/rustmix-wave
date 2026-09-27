@@ -9,6 +9,7 @@ use std::{
     io,
     sync::mpsc,
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
 #[derive(Debug)]
@@ -30,6 +31,33 @@ impl<E: Display> Display for NamedWorkerError<E> {
 
 impl<E: Display + fmt::Debug> std::error::Error for NamedWorkerError<E> {}
 
+/// Longest a blocking caller waits for a named worker. The jobs behind it
+/// (weather HTTP, lexicon open, Lua load, image decode) carry shorter limits.
+const NAMED_WORKER_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Start `task` on a detached thread that reports through a channel.
+///
+/// `JoinHandle::join` is never called. On ESP-IDF a thread that dies without
+/// storing its result makes `std` run `expect("threads should not terminate
+/// unexpectedly")` in the joining task, which aborts the main loop. A dropped
+/// sender is reported as [`NamedWorkerError::Panicked`] instead.
+fn spawn_reporting<T, F>(
+    name: &'static str,
+    stack_bytes: usize,
+    task: F,
+) -> io::Result<mpsc::Receiver<T>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (reply, inbox) = mpsc::sync_channel(1);
+    let thread = spawn_thread(name, stack_bytes, move || {
+        let _ = reply.send(task());
+    })?;
+    detach(thread);
+    Ok(inbox)
+}
+
 pub fn run_named_worker<T, E, F>(
     name: &'static str,
     stack_bytes: usize,
@@ -40,35 +68,25 @@ where
     E: Display + Send + 'static,
     F: FnOnce() -> Result<T, E> + Send + 'static,
 {
-    log::info!(
-        "rustmix-wave=worker-boundary name={name} status=starting stack-bytes={stack_bytes}"
-    );
-    crate::runtime_memory::log_runtime_memory(&format!("before-worker-{name}"));
-    let worker = std::thread::Builder::new()
-        .name(name.into())
-        .stack_size(stack_bytes)
-        .spawn(task)
+    NamedWorkerHandle::spawn(name, stack_bytes, task)
         .map_err(|error| {
             log::warn!(
                 "rustmix-wave=worker-boundary name={name} status=start-failed error={error}"
             );
             NamedWorkerError::Start(error)
-        })?;
-    let result = worker.join().map_err(|_| {
-        log::warn!("rustmix-wave=worker-boundary name={name} status=panicked");
-        NamedWorkerError::Panicked
-    })?;
-    crate::runtime_memory::log_runtime_memory(&format!("after-worker-{name}"));
-    finish_worker(name, result)
+        })?
+        .join()
 }
 
-/// A named worker the caller can poll without joining for the whole task.
+/// A named worker the caller can poll without blocking for the whole task.
 ///
-/// `try_join` returns `None` until the thread has finished, so the main loop
-/// can keep reading buttons and the idle-sleep timer.
+/// `try_join` returns `None` until the thread has reported, so the main loop
+/// can keep reading buttons and the idle-sleep timer. Nothing here calls
+/// `JoinHandle::join`.
 pub struct NamedWorkerHandle<T, E> {
     name: &'static str,
-    handle: Option<std::thread::JoinHandle<Result<T, E>>>,
+    inbox: Option<mpsc::Receiver<Result<T, E>>>,
+    ready: Option<Result<T, NamedWorkerError<E>>>,
 }
 
 impl<T, E> NamedWorkerHandle<T, E>
@@ -84,55 +102,65 @@ where
             "rustmix-wave=worker-boundary name={name} status=starting stack-bytes={stack_bytes}"
         );
         crate::runtime_memory::log_runtime_memory(&format!("before-worker-{name}"));
-        let handle = std::thread::Builder::new()
-            .name(name.into())
-            .stack_size(stack_bytes)
-            .spawn(task)?;
+        let inbox = spawn_reporting(name, stack_bytes, task)?;
         Ok(Self {
             name,
-            handle: Some(handle),
+            inbox: Some(inbox),
+            ready: None,
         })
     }
 
+    fn settle(&mut self, received: Result<Result<T, E>, NamedWorkerError<E>>) {
+        let name = self.name;
+        self.inbox = None;
+        crate::runtime_memory::log_runtime_memory(&format!("after-worker-{name}"));
+        self.ready = Some(match received {
+            Ok(result) => finish_worker(name, result),
+            Err(error) => {
+                log::warn!("rustmix-wave=worker-boundary name={name} status=panicked");
+                Err(error)
+            }
+        });
+    }
+
+    fn poll(&mut self) {
+        if self.ready.is_some() {
+            return;
+        }
+        let Some(inbox) = self.inbox.as_ref() else {
+            return;
+        };
+        match inbox.try_recv() {
+            Ok(result) => self.settle(Ok(result)),
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.settle(Err(NamedWorkerError::Panicked)),
+        }
+    }
+
     #[must_use]
-    pub fn is_finished(&self) -> bool {
-        self.handle
-            .as_ref()
-            .is_none_or(|handle| handle.is_finished())
+    pub fn is_finished(&mut self) -> bool {
+        self.poll();
+        self.inbox.is_none()
     }
 
     /// `None` while the worker is still running.
     pub fn try_join(&mut self) -> Option<Result<T, NamedWorkerError<E>>> {
-        let handle = self.handle.as_ref()?;
-        if !handle.is_finished() {
-            return None;
-        }
-        let handle = self.handle.take()?;
-        let name = self.name;
-        crate::runtime_memory::log_runtime_memory(&format!("after-worker-{name}"));
-        Some(match handle.join() {
-            Ok(result) => finish_worker(name, result),
-            Err(_) => {
-                log::warn!("rustmix-wave=worker-boundary name={name} status=panicked");
-                Err(NamedWorkerError::Panicked)
-            }
-        })
+        self.poll();
+        self.ready.take()
     }
 
-    /// Block until the worker finishes. The caller is not the 16 KiB main task.
+    /// Block until the worker reports, it dies, or the wait times out.
     pub fn join(mut self) -> Result<T, NamedWorkerError<E>> {
-        let Some(handle) = self.handle.take() else {
-            return Err(NamedWorkerError::Panicked);
-        };
-        let name = self.name;
-        crate::runtime_memory::log_runtime_memory(&format!("after-worker-{name}"));
-        match handle.join() {
-            Ok(result) => finish_worker(name, result),
-            Err(_) => {
-                log::warn!("rustmix-wave=worker-boundary name={name} status=panicked");
-                Err(NamedWorkerError::Panicked)
-            }
+        if self.ready.is_none() {
+            let received = match self.inbox.as_ref() {
+                Some(inbox) => inbox
+                    .recv_timeout(NAMED_WORKER_TIMEOUT)
+                    .map_err(|_| NamedWorkerError::Panicked),
+                None => Err(NamedWorkerError::Panicked),
+            };
+            self.settle(received);
         }
+        self.ready.take().unwrap_or(Err(NamedWorkerError::Panicked))
     }
 }
 
@@ -250,6 +278,29 @@ mod tests {
         };
         assert_eq!(value, 7);
         assert!(worker.try_join().is_none());
+    }
+
+    #[test]
+    fn a_dead_named_worker_is_an_error_not_a_caller_panic() {
+        let blocking = run_named_worker::<u32, String, _>("unit-dead", 16 * 1024, || {
+            panic!("worker died before storing a result")
+        });
+        assert!(matches!(blocking, Err(super::NamedWorkerError::Panicked)));
+
+        let mut polled =
+            NamedWorkerHandle::<u32, String>::spawn("unit-dead-poll", 16 * 1024, || {
+                panic!("worker died before storing a result")
+            })
+            .unwrap();
+        let started = std::time::Instant::now();
+        let outcome = loop {
+            if let Some(outcome) = polled.try_join() {
+                break outcome;
+            }
+            assert!(started.elapsed() < Duration::from_secs(2));
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(matches!(outcome, Err(super::NamedWorkerError::Panicked)));
     }
 
     #[test]

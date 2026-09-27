@@ -489,6 +489,7 @@ trait DownloadFile {
     fn abort(self);
 }
 
+#[inline(never)]
 pub fn save_chapter(root: &Path, book_id: &str, chapter: &CachedChapter) -> Result<(), String> {
     let dir = book_dir(root, book_id);
     fs::create_dir_all(&dir).map_err(|error| explain_storage_error(&error.to_string()))?;
@@ -777,6 +778,7 @@ fn load_plain_chapter(path: &Path, index: u32) -> Option<CachedChapter> {
 ///
 /// The shard is assembled only here, when the chapter is opened. A successful
 /// decode is rewritten as plain `WRCH1` text so the next open skips the shard.
+#[inline(never)]
 fn load_raw_chapter(root: &Path, book_id: &str, index: u32, path: &Path) -> Option<CachedChapter> {
     let (header, parts) = read_raw_file(path)?;
     let uid = field(&header, "uid");
@@ -796,6 +798,7 @@ fn read_raw_parts(path: &Path) -> Option<Vec<Vec<u8>>> {
     read_raw_file(path).map(|(_, parts)| parts)
 }
 
+#[inline(never)]
 fn read_raw_file(path: &Path) -> Option<(String, Vec<Vec<u8>>)> {
     let mut file = File::open(path).ok()?;
     let header = read_through_separator(&mut file, 1024)?;

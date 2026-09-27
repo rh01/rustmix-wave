@@ -21,8 +21,8 @@ use crate::{
     reader::ReaderLayout,
     runtime_worker::LongLivedWorker,
     weread::{
-        offline::{self, CachedChapter, ChapterDownload},
-        text,
+        offline::{self, CachedChapter, CardDownload},
+        text::{self, ImageRef},
     },
 };
 
@@ -41,11 +41,16 @@ enum StoreJob {
         chapter: CachedChapter,
     },
     Commit {
-        download: ChapterDownload,
+        download: CardDownload,
         succeeded: bool,
         write_error: Option<String>,
     },
     Load {
+        root: PathBuf,
+        book_id: String,
+        index: u32,
+    },
+    ImageRefs {
         root: PathBuf,
         book_id: String,
         index: u32,
@@ -59,6 +64,7 @@ enum StoreReply {
     Save(Result<(), String>),
     Commit(Result<(), String>),
     Load(Option<CachedChapter>),
+    ImageRefs(Vec<ImageRef>),
     #[cfg(test)]
     ThreadId(ThreadId),
 }
@@ -96,8 +102,9 @@ fn handle_job(job: StoreJob) -> StoreReply {
         StoreJob::Save { .. } => 1,
         StoreJob::Commit { .. } => 2,
         StoreJob::Load { .. } => 3,
+        StoreJob::ImageRefs { .. } => 4,
         #[cfg(test)]
-        StoreJob::ThreadId => 4,
+        StoreJob::ThreadId => 5,
     };
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| match job {
         StoreJob::Pages {
@@ -123,6 +130,11 @@ fn handle_job(job: StoreJob) -> StoreReply {
             book_id,
             index,
         } => StoreReply::Load(offline::load_chapter(&root, &book_id, index)),
+        StoreJob::ImageRefs {
+            root,
+            book_id,
+            index,
+        } => StoreReply::ImageRefs(offline::chapter_image_refs(&root, &book_id, index)),
         #[cfg(test)]
         StoreJob::ThreadId => StoreReply::ThreadId(std::thread::current().id()),
     }));
@@ -134,6 +146,7 @@ fn handle_job(job: StoreJob) -> StoreReply {
                 1 => StoreReply::Save(Err("WeRead store worker panicked".into())),
                 2 => StoreReply::Commit(Err("WeRead store worker panicked".into())),
                 3 => StoreReply::Load(None),
+                4 => StoreReply::ImageRefs(Vec::new()),
                 _ => StoreReply::Pages(Vec::new()),
             }
         }
@@ -189,12 +202,12 @@ pub fn save_chapter(root: &Path, book_id: &str, chapter: &CachedChapter) -> Resu
 }
 
 pub fn complete_download(
-    download: ChapterDownload,
+    download: impl Into<CardDownload>,
     succeeded: bool,
     write_error: Option<String>,
 ) -> Result<(), String> {
     match submit(StoreJob::Commit {
-        download,
+        download: download.into(),
         succeeded,
         write_error,
     })? {
@@ -211,6 +224,17 @@ pub fn load_chapter(root: &Path, book_id: &str, index: u32) -> Option<CachedChap
     }) {
         Ok(StoreReply::Load(chapter)) => chapter,
         _ => None,
+    }
+}
+
+pub fn chapter_image_refs(root: &Path, book_id: &str, index: u32) -> Vec<ImageRef> {
+    match submit(StoreJob::ImageRefs {
+        root: root.to_path_buf(),
+        book_id: book_id.to_string(),
+        index,
+    }) {
+        Ok(StoreReply::ImageRefs(refs)) => refs,
+        _ => Vec::new(),
     }
 }
 

@@ -3270,6 +3270,7 @@ impl ReaderUiState {
             }
         }
         self.library_selected = 0;
+        crate::runtime_memory::log_main_stack_high_water("library-refresh");
     }
 
     #[must_use]

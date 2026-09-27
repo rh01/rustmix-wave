@@ -128,7 +128,7 @@ fn load_espidf(prefs: &mut ReaderPreferences) -> bool {
             return false;
         }
         let prefs_key = CString::new(KEY_PREFS_DOCUMENT).expect("nvs prefs key");
-        let mut document = [0u8; NVS_DOCUMENT_BYTES];
+        let mut document = vec![0u8; NVS_DOCUMENT_BYTES];
         let mut document_len = document.len();
         if nvs_get_str(
             handle,

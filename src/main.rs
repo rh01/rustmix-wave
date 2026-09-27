@@ -47,7 +47,7 @@ mod firmware {
             display::{DisplayPreferences, DISPLAY_CONFIG_PATH},
             render_current_screen, AppState, ScreenRoute, ALARM_POLL_SECONDS,
             IMU_EVENT_SCREEN_REFRESH_SECONDS, MOTION_LIVE_REFRESH_SECONDS,
-            NETWORK_LIVE_REFRESH_SECONDS, NETWORK_LOG_HEARTBEAT_SECONDS,
+            NETWORK_LIVE_REFRESH_SECONDS, NETWORK_LOG_HEARTBEAT_SECONDS, PANEL_IDLE_SLEEP_SECONDS,
             SAMPLE_LIVE_REFRESH_SECONDS, VOICE_RECORD_SCREEN_REFRESH_SECONDS,
         },
         audio::{
@@ -91,10 +91,11 @@ mod firmware {
             POWER_KEY_WAKE_GUARD_QUIET_MS,
         },
         power_policy::{
-            classify_wake_cause, configure_dynamic_frequency_and_light_sleep, deep_sleep_blocked,
-            load_resume, load_rtc_resume, mcu_mode, next_block_ms, power_key_poll_ms, save_resume,
-            sd_clock_khz, seconds_until, store_rtc_resume, McuWake, PowerDebugSnapshot, PowerView,
-            RadioIdle, RadioJob, SleepResume, WaitInput, CPU_FREQ_MAX_MHZ, CPU_FREQ_MIN_MHZ,
+            alarm_wake_plan, classify_wake_cause, configure_dynamic_frequency_and_light_sleep,
+            deep_sleep_blocked, load_resume, load_rtc_resume, mcu_mode, next_block_ms,
+            plan_panel_transport, power_key_poll_ms, save_resume, sd_clock_khz, store_rtc_resume,
+            AlarmWakePlan, McuWake, PanelTransport, PowerDebugSnapshot, PowerView, RadioIdle,
+            RadioJob, RefreshCause, SleepResume, WaitInput, CPU_FREQ_MAX_MHZ, CPU_FREQ_MIN_MHZ,
             RADIO_IDLE_TIMEOUT_SECS, RADIO_NTP_HOLD_SECS, SD_ACTIVE_CLOCK_KHZ,
         },
         reader::ReaderTickOutcome,
@@ -103,7 +104,10 @@ mod firmware {
         rtc_alarm_interrupt::{espidf::RtcAlarmInterruptMonitor, RTC_ALARM_INTERRUPT_GPIO},
         runtime_memory::log_runtime_memory,
         shared_i2c::SharedI2cBus,
-        sleep_images::{SleepImageCatalog, SleepImageSelection, SLEEP_IMAGE_DIRECTORY},
+        sleep_images::{
+            stamp_deep_sleep_wake_hint, SleepImageCatalog, SleepImageSelection,
+            SLEEP_IMAGE_DIRECTORY,
+        },
         sleep_mode::{SleepModeState, SleepWakeCause},
         sleep_network::SleepNetworkState,
         storage::{
@@ -456,6 +460,7 @@ mod firmware {
         let input_wake = Notification::new();
         let _ = INPUT_NOTIFIER.set(input_wake.notifier());
         let input_irq = arm_input_irqs(&mut buttons, &mut back_button, &mut rtc_alarm_interrupt);
+        enable_light_sleep_gpio_wakeup();
         let mut button_delay = FreeRtosDelay;
         let mut service_delay = FreeRtosDelay;
         let mut frame = FrameBuffer::new_white();
@@ -593,12 +598,8 @@ mod firmware {
         state.panel_rail_on = true;
         render_current_screen(&mut frame, &state)?;
         panel.show_base(frame.as_bytes())?;
-        if let Err(error) = panel.sleep() {
-            warn!("rustmix-wave=epd-rail status=sleep-failed stage=boot error={error:#}");
-        } else {
-            state.panel_rail_on = false;
-            info!("rustmix-wave=epd-rail status=off reason=after-boot-refresh");
-        }
+        let mut previous_panel_frame = Some(frame.clone());
+        info!("rustmix-wave=epd-rail status=on reason=hold-for-partial");
         panel_refresh.reset_after_external_global(PanelGlobalReason::InitialBoot);
         sync_panel_refresh_diagnostics(&mut state, &panel_refresh);
         info!(
@@ -673,6 +674,7 @@ mod firmware {
                 &mut frame,
                 &mut state,
                 &mut panel_refresh,
+                &mut previous_panel_frame,
                 RefreshRequest::Normal,
             )?;
             info!("rustmix-wave=wifi-setup status=shown route=wifi-setup ap={WIFI_SETUP_AP_SSID} url=http://192.168.4.1/");
@@ -695,7 +697,7 @@ mod firmware {
         );
         info!("rustmix-wave=rtc-alarm-int-readiness-ready gpio={RTC_ALARM_INTERRUPT_GPIO} active-low=true");
         info!("rustmix-wave=power-key-sleep-image-mode-ready path={SLEEP_IMAGE_DIRECTORY} format=native-800x480-1bpp-bmp mcu-sleep=deep wake=ext1-gpio0-4-5-6");
-        info!("rustmix-wave=power-key-short-menu-long-sleep-ready short-press=display-maintenance-menu long-press=sleep-image wake=power-key menu-action=manual-global-refresh");
+        info!("rustmix-wave=power-key-short-menu-long-sleep-ready short-press=display-maintenance-menu long-press=sleep-image wake=ext1-gpio0-4-5-6 power-key=cannot-wake menu-action=manual-global-refresh");
         info!("rustmix-wave=release-flash-workflow-safety-ready docs=consolidated workflow=ci release-artifact=elf supported-flash=espflash-flash factory-image=deferred");
         info!("rustmix-wave=text-editor-layout-alignment-ready voice-title-editor=shared-grid-keyboard calendar-editor-status=compact-date keyboard=boot-hv-axis footer=width-safe");
         info!("rustmix-wave=sleep-image-directory-classification-fix-ready policy=fat-metadata-fallback");
@@ -807,13 +809,20 @@ mod firmware {
             .checked_sub(Duration::from_secs(30))
             .unwrap_or_else(Instant::now);
         loop {
+            if sd_clock_idle && _mounted_sd.is_some() {
+                set_sd_host_clock(false);
+                sd_clock_idle = false;
+                info!("rustmix-wave=sdmmc-clock status=active khz={SD_ACTIVE_CLOCK_KHZ}");
+            }
             if input_irq {
                 rearm_input_irqs(&mut buttons, &mut back_button, &mut rtc_alarm_interrupt);
             }
             if let Some(minutes) = state.take_auto_sleep_minutes_update() {
                 let _ = minutes;
                 let resume = sleep_resume(&state);
-                save_resume(resume);
+                if !save_resume(resume) {
+                    warn!("rustmix-wave=power-nvs status=resume-not-durable");
+                }
                 store_rtc_resume(resume);
                 info!(
                     "rustmix-wave=power-auto-sleep status=saved minutes={}",
@@ -899,6 +908,7 @@ mod firmware {
                     &mut frame,
                     &mut state,
                     &mut panel_refresh,
+                    &mut previous_panel_frame,
                     RefreshRequest::Normal,
                 )?;
                 last_activity = Instant::now();
@@ -966,6 +976,7 @@ mod firmware {
                         &mut frame,
                         &mut state,
                         &mut panel_refresh,
+                        &mut previous_panel_frame,
                         RefreshRequest::Normal,
                     )?;
                     last_voice_record_refresh = Instant::now();
@@ -1038,6 +1049,7 @@ mod firmware {
                         &mut frame,
                         &mut state,
                         &mut panel_refresh,
+                        &mut previous_panel_frame,
                         RefreshRequest::Normal,
                     )?;
                 }
@@ -1057,6 +1069,7 @@ mod firmware {
                         &mut frame,
                         &mut state,
                         &mut panel_refresh,
+                        &mut previous_panel_frame,
                         RefreshRequest::Normal,
                     )?;
                 }
@@ -1106,6 +1119,7 @@ mod firmware {
                                         &mut frame,
                                         &mut state,
                                         &mut panel_refresh,
+                                        &mut previous_panel_frame,
                                         RefreshRequest::Normal,
                                     )?;
                                 }
@@ -1266,6 +1280,7 @@ mod firmware {
                                 &mut frame,
                                 &mut state,
                                 &mut panel_refresh,
+                                &mut previous_panel_frame,
                                 if woke_from_sleep {
                                     RefreshRequest::ForceGlobalAfterWake
                                 } else {
@@ -1341,11 +1356,8 @@ mod firmware {
                             state.router.navigate_to(restore_route);
                             render_current_screen(&mut frame, &state)?;
                             panel.show_base(frame.as_bytes())?;
-                            if let Err(error) = panel.sleep() {
-                                warn!("rustmix-wave=epd-rail status=sleep-failed stage=wake error={error:#}");
-                            } else {
-                                state.panel_rail_on = false;
-                            }
+                            previous_panel_frame = Some(frame.clone());
+                            info!("rustmix-wave=epd-rail status=on reason=after-wake");
                             panel_refresh.reset_after_external_global(PanelGlobalReason::AfterWake);
                             sync_panel_refresh_diagnostics(&mut state, &panel_refresh);
                             info!("rustmix-wave=panel-refresh plan=global-base reason=after-wake transport=global-base");
@@ -1384,6 +1396,7 @@ mod firmware {
                                     &mut frame,
                                     &mut state,
                                     &mut panel_refresh,
+                                    &mut previous_panel_frame,
                                     RefreshRequest::Normal,
                                 )?;
                                 info!(
@@ -1463,7 +1476,9 @@ mod firmware {
                             }
                             let restore_route = state.power_key_sleep_restore_route();
                             frame = selection.frame;
+                            stamp_deep_sleep_wake_hint(&mut frame);
                             panel.show_base(frame.as_bytes())?;
+                            previous_panel_frame = Some(frame.clone());
                             panel_refresh
                                 .reset_after_external_global(PanelGlobalReason::SleepImage);
                             sync_panel_refresh_diagnostics(&mut state, &panel_refresh);
@@ -1563,6 +1578,7 @@ mod firmware {
                                     &mut frame,
                                     &mut state,
                                     &mut panel_refresh,
+                                    &mut previous_panel_frame,
                                     RefreshRequest::Normal,
                                 )?;
                             }
@@ -1580,6 +1596,7 @@ mod firmware {
                                     &mut frame,
                                     &mut state,
                                     &mut panel_refresh,
+                                    &mut previous_panel_frame,
                                     RefreshRequest::Normal,
                                 )?;
                             }
@@ -1601,6 +1618,7 @@ mod firmware {
                             &mut frame,
                             &mut state,
                             &mut panel_refresh,
+                            &mut previous_panel_frame,
                             RefreshRequest::Normal,
                         )?;
                     }
@@ -1636,6 +1654,7 @@ mod firmware {
                         &mut frame,
                         &mut state,
                         &mut panel_refresh,
+                        &mut previous_panel_frame,
                         RefreshRequest::Normal,
                     )?;
                 }
@@ -1709,6 +1728,7 @@ mod firmware {
                         &mut frame,
                         &mut state,
                         &mut panel_refresh,
+                        &mut previous_panel_frame,
                         RefreshRequest::Normal,
                     )?;
                     last_activity = Instant::now();
@@ -1745,6 +1765,7 @@ mod firmware {
                                 &mut frame,
                                 &mut state,
                                 &mut panel_refresh,
+                                &mut previous_panel_frame,
                                 RefreshRequest::Normal,
                             )?;
                             last_imu_event_screen_refresh = Instant::now();
@@ -1776,6 +1797,7 @@ mod firmware {
                     &mut frame,
                     &mut state,
                     &mut panel_refresh,
+                    &mut previous_panel_frame,
                     RefreshRequest::Normal,
                 )?;
                 info!(
@@ -1860,6 +1882,7 @@ mod firmware {
                             &mut frame,
                             &mut state,
                             &mut panel_refresh,
+                            &mut previous_panel_frame,
                             request,
                         )?;
                     }
@@ -1944,6 +1967,7 @@ mod firmware {
                             &mut frame,
                             &mut state,
                             &mut panel_refresh,
+                            &mut previous_panel_frame,
                             request,
                         )?;
                         last_activity = Instant::now();
@@ -2087,6 +2111,7 @@ mod firmware {
                     &mut frame,
                     &mut state,
                     &mut panel_refresh,
+                    &mut previous_panel_frame,
                     request,
                 )?;
                 last_activity = Instant::now();
@@ -2143,7 +2168,9 @@ mod firmware {
                     log_sleep_image_selection(&selection);
                     let restore_route = state.power_key_sleep_restore_route();
                     frame = selection.frame;
+                    stamp_deep_sleep_wake_hint(&mut frame);
                     panel.show_base(frame.as_bytes())?;
+                    previous_panel_frame = Some(frame.clone());
                     panel_refresh.reset_after_external_global(PanelGlobalReason::SleepImage);
                     sync_panel_refresh_diagnostics(&mut state, &panel_refresh);
                     sleep_mode.enter(restore_route, selection.file_name.clone());
@@ -2169,6 +2196,26 @@ mod firmware {
 
             let sd_can_idle =
                 _mounted_sd.is_some() && !voice_busy && !reader_busy && !weread_jobs.busy();
+            if state.panel_rail_on
+                && !sleep_mode.is_sleeping()
+                && !voice_busy
+                && last_activity.elapsed() >= Duration::from_secs(PANEL_IDLE_SLEEP_SECONDS)
+            {
+                match panel.sleep() {
+                    Ok(()) => {
+                        state.panel_rail_on = false;
+                        info!(
+                            "rustmix-wave=epd-rail status=off reason=idle-seconds={}",
+                            PANEL_IDLE_SLEEP_SECONDS
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            "rustmix-wave=epd-rail status=sleep-failed stage=idle error={error:#}"
+                        );
+                    }
+                }
+            }
             if sd_can_idle && !sd_clock_idle {
                 set_sd_host_clock(true);
                 sd_clock_idle = true;
@@ -2176,10 +2223,6 @@ mod firmware {
                     "rustmix-wave=sdmmc-clock status=idle khz={}",
                     sd_clock_khz(true)
                 );
-            } else if !sd_can_idle && sd_clock_idle {
-                set_sd_host_clock(false);
-                sd_clock_idle = false;
-                info!("rustmix-wave=sdmmc-clock status=active khz={SD_ACTIVE_CLOCK_KHZ}");
             }
 
             let idle_ms = last_activity.elapsed().as_millis() as u64;
@@ -2306,19 +2349,26 @@ mod firmware {
             state.update_audio_snapshot(runtime.snapshot());
         }
         let resume = sleep_resume(state);
-        save_resume(resume);
+        if !save_resume(resume) {
+            warn!("rustmix-wave=power-nvs status=resume-not-durable");
+        }
         store_rtc_resume(resume);
         info!(
             "rustmix-wave=mcu-deep-sleep status=persisted route-code={} reader={} minutes={}",
             resume.route_code, resume.restore_reader, resume.auto_sleep_minutes
         );
-        if let (Some(now), Some(alarm_at)) = (rtc_now, alarm_at) {
-            if let Some(seconds) = seconds_until(now, alarm_at) {
+        match alarm_wake_plan(rtc_now, alarm_at) {
+            AlarmWakePlan::Timer { seconds } => {
                 let status = unsafe {
                     sys::esp_sleep_enable_timer_wakeup(seconds.saturating_mul(1_000_000))
                 };
                 info!("rustmix-wave=mcu-deep-sleep timer-seconds={seconds} status={status}");
             }
+            AlarmWakePlan::RefuseMissingClock => {
+                warn!("rustmix-wave=mcu-deep-sleep status=rejected reason=alarm-pending-without-rtc fallback=mcu-awake");
+                return;
+            }
+            AlarmWakePlan::None => {}
         }
         if let Err(reason) = enable_button_ext1_wakeup() {
             warn!("rustmix-wave=mcu-deep-sleep status=rejected reason={reason} fallback=mcu-awake");
@@ -2351,6 +2401,7 @@ mod firmware {
                 let _ = sys::rtc_gpio_pulldown_dis(gpio);
             }
             let mask = (1_u64 << 0) | (1_u64 << 4) | (1_u64 << 5) | (1_u64 << 6);
+            // AXP2101 IRQ is not wired to an RTC GPIO (Power key is I2C-only).
             if sys::esp_sleep_enable_ext1_wakeup(
                 mask,
                 sys::esp_sleep_ext1_wakeup_mode_t_ESP_EXT1_WAKEUP_ANY_LOW,
@@ -2450,6 +2501,29 @@ mod firmware {
         let status = unsafe { sys::sdmmc_host_set_card_clk(0, khz) };
         if status != 0 {
             warn!("rustmix-wave=sdmmc-clock status=set-failed khz={khz} code={status}");
+        }
+    }
+
+    fn enable_light_sleep_gpio_wakeup() {
+        let pins = [0_i32, 4, 5, 6, 45];
+        unsafe {
+            for pin in pins {
+                let status = sys::gpio_wakeup_enable(
+                    pin as sys::gpio_num_t,
+                    sys::gpio_int_type_t_GPIO_INTR_LOW_LEVEL,
+                );
+                if status != 0 {
+                    warn!(
+                        "rustmix-wave=light-sleep-wake status=gpio-failed pin={pin} code={status}"
+                    );
+                }
+            }
+            let status = sys::esp_sleep_enable_gpio_wakeup();
+            if status == 0 {
+                info!("rustmix-wave=light-sleep-wake status=ready pins=0,4,5,6,45 level=low");
+            } else {
+                warn!("rustmix-wave=light-sleep-wake status=enable-failed code={status}");
+            }
         }
     }
 
@@ -3827,6 +3901,7 @@ mod firmware {
         frame: &mut FrameBuffer,
         state: &mut AppState,
         coordinator: &mut PanelRefreshCoordinator,
+        previous_frame: &mut Option<FrameBuffer>,
         request: RefreshRequest,
     ) -> Result<()>
     where
@@ -3843,10 +3918,18 @@ mod firmware {
         DELAY: DelayNs,
         POWER: waveshare_epd397_rust_app::power::PanelPower,
     {
-        if !state.panel_rail_on {
+        let rail_was_cut = !state.panel_rail_on;
+        if rail_was_cut {
             panel.initialize()?;
             state.panel_rail_on = true;
         }
+        let cause = match request {
+            RefreshRequest::ForceGlobalAfterWake => RefreshCause::McuWake,
+            RefreshRequest::Normal if rail_was_cut => RefreshCause::PanelRailWasCut,
+            RefreshRequest::Normal
+            | RefreshRequest::ForceGlobalManual
+            | RefreshRequest::ForceGlobalSafetyFallback => RefreshCause::UserNavigation,
+        };
         let coordinator_request = match request {
             RefreshRequest::Normal => PanelRefreshRequest::Normal,
             RefreshRequest::ForceGlobalAfterWake => PanelRefreshRequest::AfterWake,
@@ -3856,45 +3939,60 @@ mod firmware {
         let plan = coordinator.plan(coordinator_request);
         sync_panel_refresh_diagnostics(state, coordinator);
         render_current_screen(frame, state)?;
+        let coordinator_global = matches!(plan, PanelRefreshPlan::GlobalBase { .. });
+        let transport = plan_panel_transport(cause, coordinator_global, previous_frame.is_some());
 
-        match plan {
-            PanelRefreshPlan::GlobalBase { reason } => {
+        match transport {
+            PanelTransport::GlobalBase => {
                 panel.show_base(frame.as_bytes())?;
-                info!(
-                    "rustmix-wave=panel-refresh plan=global-base reason={} transport=global-base",
-                    reason.marker()
-                );
-                match reason {
-                    PanelGlobalReason::AfterWake => info!("rustmix-wave=wake-global-refresh"),
-                    PanelGlobalReason::ManualGhostCleanup => {
-                        info!("rustmix-wave=reader-clear-ghosting refresh=global-base");
-                        info!("rustmix-wave=power-key-clear-ghosting refresh=global-base")
+                if let PanelRefreshPlan::GlobalBase { reason } = plan {
+                    info!(
+                        "rustmix-wave=panel-refresh plan=global-base reason={} transport={}",
+                        reason.marker(),
+                        transport.marker()
+                    );
+                    match reason {
+                        PanelGlobalReason::AfterWake => info!("rustmix-wave=wake-global-refresh"),
+                        PanelGlobalReason::ManualGhostCleanup => {
+                            info!("rustmix-wave=reader-clear-ghosting refresh=global-base");
+                            info!("rustmix-wave=power-key-clear-ghosting refresh=global-base")
+                        }
+                        PanelGlobalReason::PeriodicCleanup => {
+                            info!("rustmix-wave=global-refresh-after-partials")
+                        }
+                        PanelGlobalReason::SafetyFallback => {
+                            warn!("rustmix-wave=panel-refresh safety-fallback refresh=global-base")
+                        }
+                        PanelGlobalReason::InitialBoot | PanelGlobalReason::SleepImage => {}
                     }
-                    PanelGlobalReason::PeriodicCleanup => {
-                        info!("rustmix-wave=global-refresh-after-partials")
-                    }
-                    PanelGlobalReason::SafetyFallback => {
-                        warn!("rustmix-wave=panel-refresh safety-fallback refresh=global-base")
-                    }
-                    PanelGlobalReason::InitialBoot | PanelGlobalReason::SleepImage => {}
+                } else {
+                    info!(
+                        "rustmix-wave=panel-refresh plan=global-base reason=rail-cut-without-previous transport={}",
+                        transport.marker()
+                    );
                 }
             }
-            PanelRefreshPlan::PartialFullscreen { partial_count } => {
+            PanelTransport::PartialLive => {
                 panel.show_partial_fullscreen(frame.as_bytes())?;
+                if let PanelRefreshPlan::PartialFullscreen { partial_count } = plan {
+                    info!(
+                        "rustmix-wave=panel-refresh plan=partial-fullscreen reason=normal partial-count={partial_count} partial-limit={PANEL_PARTIAL_REFRESH_LIMIT} transport={}",
+                        transport.marker()
+                    );
+                }
+            }
+            PanelTransport::RestoreOldPlaneThenPartial => {
+                let previous = previous_frame
+                    .as_ref()
+                    .expect("old-plane restore requires the previous frame");
+                panel.show_partial_restoring_old_plane(previous.as_bytes(), frame.as_bytes())?;
                 info!(
-                    "rustmix-wave=panel-refresh plan=partial-fullscreen reason=normal partial-count={partial_count} partial-limit={PANEL_PARTIAL_REFRESH_LIMIT} transport=fast-fullscreen-partial"
+                    "rustmix-wave=panel-refresh plan=partial-fullscreen reason=rail-was-cut transport={}",
+                    transport.marker()
                 );
             }
         }
-        match panel.sleep() {
-            Ok(()) => {
-                state.panel_rail_on = false;
-                info!("rustmix-wave=epd-rail status=off reason=after-refresh");
-            }
-            Err(error) => {
-                warn!("rustmix-wave=epd-rail status=sleep-failed error={error:#}");
-            }
-        }
+        *previous_frame = Some(frame.clone());
         Ok(())
     }
 

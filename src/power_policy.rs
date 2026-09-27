@@ -39,10 +39,9 @@ pub const RESUME_MAGIC: u32 = 0x5257_4B31;
 /// Why the next e-paper frame should or should not use a full GC waveform.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RefreshCause {
-    /// Ordinary navigation or a page turn.
+    /// Ordinary navigation or a page turn while the controller RAM is still valid.
     UserNavigation,
-    /// The SSD1677 rail was cut after the previous frame. RAM is reloaded,
-    /// but the fast partial waveform is still the right plan.
+    /// The SSD1677 was powered off, so both RAM planes were lost.
     PanelRailWasCut,
     /// Leaving the sleep image.
     SleepImageExit,
@@ -54,6 +53,83 @@ impl RefreshCause {
     #[must_use]
     pub const fn wants_global_refresh(self) -> bool {
         matches!(self, Self::SleepImageExit | Self::McuWake)
+    }
+}
+
+/// How `refresh_screen` must drive the SSD1677 for one frame.
+///
+/// A partial that writes only `0x24` is valid while the controller still holds
+/// the previous image in `0x26`. After a rail cut that plane is empty, and a
+/// bare partial leaves unchanged pixels blank.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PanelTransport {
+    /// `0x24` = new frame, `0xFF`. The old plane is still in the controller.
+    PartialLive,
+    /// `0x26` = previous frame, `0x24` = new frame, `0xFF`.
+    RestoreOldPlaneThenPartial,
+    /// `0x24` and `0x26` = new frame, `0xF7`.
+    GlobalBase,
+}
+
+impl PanelTransport {
+    #[must_use]
+    pub const fn marker(self) -> &'static str {
+        match self {
+            Self::PartialLive => "partial-live",
+            Self::RestoreOldPlaneThenPartial => "partial-restore-old-plane",
+            Self::GlobalBase => "global-base",
+        }
+    }
+
+    #[must_use]
+    pub const fn writes_previous_frame_to_old_plane(self) -> bool {
+        matches!(self, Self::RestoreOldPlaneThenPartial)
+    }
+}
+
+/// Decide the panel command sequence. `refresh_screen` must use this and must
+/// not send a live partial after the rail was cut.
+#[must_use]
+pub const fn plan_panel_transport(
+    cause: RefreshCause,
+    coordinator_wants_global: bool,
+    has_previous_frame: bool,
+) -> PanelTransport {
+    if cause.wants_global_refresh() || coordinator_wants_global {
+        PanelTransport::GlobalBase
+    } else if matches!(cause, RefreshCause::PanelRailWasCut) {
+        if has_previous_frame {
+            PanelTransport::RestoreOldPlaneThenPartial
+        } else {
+            PanelTransport::GlobalBase
+        }
+    } else {
+        PanelTransport::PartialLive
+    }
+}
+
+/// What to do with a pending alarm at deep-sleep entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AlarmWakePlan {
+    None,
+    Timer {
+        seconds: u64,
+    },
+    /// An alarm is scheduled but the clock is missing, so a timer cannot be armed.
+    RefuseMissingClock,
+}
+
+#[must_use]
+pub fn alarm_wake_plan(now: Option<RtcDateTime>, alarm_at: Option<RtcDateTime>) -> AlarmWakePlan {
+    let Some(alarm_at) = alarm_at else {
+        return AlarmWakePlan::None;
+    };
+    let Some(now) = now else {
+        return AlarmWakePlan::RefuseMissingClock;
+    };
+    match seconds_until(now, alarm_at) {
+        Some(seconds) => AlarmWakePlan::Timer { seconds },
+        None => AlarmWakePlan::None,
     }
 }
 
@@ -540,8 +616,8 @@ pub const CURRENT_DRAW_ESTIMATES: &[CurrentDrawEstimate] = &[
     CurrentDrawEstimate {
         state: "Reading, between page turns",
         before_ma: "70-140",
-        after_ma: "2-8",
-        basis: "Same as idle UI. RAM and PSRAM stay retained in light sleep",
+        after_ma: "8-25",
+        basis: "Rail stays on so the old RAM plane survives. CPU light-sleeps. The controller sleeps after 60 s idle",
     },
     CurrentDrawEstimate {
         state: "WeRead / NTP / weather job",
@@ -610,7 +686,7 @@ pub fn configure_dynamic_frequency_and_light_sleep() -> Result<(), i32> {
 const NVS_NAMESPACE: &str = "rw_pwr";
 
 #[cfg(target_os = "espidf")]
-pub fn save_resume(resume: SleepResume) {
+pub fn save_resume(resume: SleepResume) -> bool {
     use esp_idf_svc::sys::{
         nvs_close, nvs_commit, nvs_handle_t, nvs_open, nvs_open_mode_t_NVS_READWRITE, nvs_set_blob,
         ESP_OK,
@@ -623,12 +699,22 @@ pub fn save_resume(resume: SleepResume) {
         let ns = CString::new(NVS_NAMESPACE).unwrap();
         if nvs_open(ns.as_ptr(), nvs_open_mode_t_NVS_READWRITE, &mut handle) != ESP_OK {
             log::warn!("rustmix-wave=power-nvs status=open-failed");
-            return;
+            return false;
         }
         let key = CString::new("resume").unwrap();
-        let _ = nvs_set_blob(handle, key.as_ptr(), bytes.as_ptr().cast(), bytes.len());
-        let _ = nvs_commit(handle);
+        let set_status = nvs_set_blob(handle, key.as_ptr(), bytes.as_ptr().cast(), bytes.len());
+        if set_status != ESP_OK {
+            log::warn!("rustmix-wave=power-nvs status=set-blob-failed code={set_status}");
+            nvs_close(handle);
+            return false;
+        }
+        let commit_status = nvs_commit(handle);
         nvs_close(handle);
+        if commit_status != ESP_OK {
+            log::warn!("rustmix-wave=power-nvs status=commit-failed code={commit_status}");
+            return false;
+        }
+        true
     }
 }
 
@@ -686,9 +772,10 @@ pub fn load_rtc_resume() -> Option<SleepResume> {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_auto_sleep_minutes, classify_wake_cause, cycle_auto_deep_sleep_minutes,
-        days_from_civil, deep_sleep_blocked, format_battery, mcu_mode, next_block_ms,
-        power_key_poll_ms, sd_clock_khz, seconds_until, McuPowerMode, McuWake, PowerDebugSnapshot,
+        alarm_wake_plan, clamp_auto_sleep_minutes, classify_wake_cause,
+        cycle_auto_deep_sleep_minutes, days_from_civil, deep_sleep_blocked, format_battery,
+        mcu_mode, next_block_ms, plan_panel_transport, power_key_poll_ms, sd_clock_khz,
+        seconds_until, AlarmWakePlan, McuPowerMode, McuWake, PanelTransport, PowerDebugSnapshot,
         RadioIdle, RadioJob, RefreshCause, SleepResume, WaitInput, CURRENT_DRAW_ESTIMATES,
         DEFAULT_AUTO_DEEP_SLEEP_MINUTES, RADIO_IDLE_TIMEOUT_SECS, SD_IDLE_CLOCK_KHZ,
     };
@@ -707,11 +794,51 @@ mod tests {
     }
 
     #[test]
-    fn cutting_the_panel_rail_does_not_force_a_full_refresh() {
+    fn refresh_screen_honors_a_rail_cut_by_restoring_the_old_plane() {
+        assert_eq!(
+            plan_panel_transport(RefreshCause::UserNavigation, false, true),
+            PanelTransport::PartialLive
+        );
+        assert_eq!(
+            plan_panel_transport(RefreshCause::PanelRailWasCut, false, true),
+            PanelTransport::RestoreOldPlaneThenPartial
+        );
+        assert!(PanelTransport::RestoreOldPlaneThenPartial.writes_previous_frame_to_old_plane());
+        assert!(!PanelTransport::PartialLive.writes_previous_frame_to_old_plane());
+        assert_eq!(
+            plan_panel_transport(RefreshCause::PanelRailWasCut, false, false),
+            PanelTransport::GlobalBase
+        );
+        assert_eq!(
+            plan_panel_transport(RefreshCause::PanelRailWasCut, true, true),
+            PanelTransport::GlobalBase
+        );
+        assert_eq!(
+            plan_panel_transport(RefreshCause::McuWake, false, true),
+            PanelTransport::GlobalBase
+        );
+        assert_eq!(
+            plan_panel_transport(RefreshCause::SleepImageExit, false, true),
+            PanelTransport::GlobalBase
+        );
         assert!(!RefreshCause::PanelRailWasCut.wants_global_refresh());
-        assert!(!RefreshCause::UserNavigation.wants_global_refresh());
-        assert!(RefreshCause::SleepImageExit.wants_global_refresh());
         assert!(RefreshCause::McuWake.wants_global_refresh());
+    }
+
+    #[test]
+    fn missing_clock_refuses_deep_sleep_when_an_alarm_is_pending() {
+        let now = sample_time(8, 0, 0);
+        let later = sample_time(8, 30, 0);
+        assert_eq!(alarm_wake_plan(None, None), AlarmWakePlan::None);
+        assert_eq!(
+            alarm_wake_plan(None, Some(later)),
+            AlarmWakePlan::RefuseMissingClock
+        );
+        assert_eq!(
+            alarm_wake_plan(Some(now), Some(later)),
+            AlarmWakePlan::Timer { seconds: 1_800 }
+        );
+        assert_eq!(alarm_wake_plan(Some(later), Some(now)), AlarmWakePlan::None);
     }
 
     #[test]

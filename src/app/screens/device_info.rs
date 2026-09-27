@@ -205,7 +205,7 @@ pub fn render_device_info_power(
     line(display, 492, "Battery", &battery, body)?;
     line(display, 532, "Auto sleep", &minutes, body)?;
     line(display, 572, "Idle", &idle, body)?;
-    Text::new("Estimates, not a meter.", Point::new(22, 640), detail).draw(display)?;
+    Text::new("Wake: UP SELECT DOWN BOOT", Point::new(22, 640), detail).draw(display)?;
     draw_footer(display, state.display, "SELECT TIMEOUT  HOLD BOOT BACK")?;
     Ok(())
 }

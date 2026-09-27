@@ -10,12 +10,29 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
-use embedded_graphics::prelude::Point;
+use embedded_graphics::{
+    mono_font::{ascii::FONT_6X10, MonoTextStyle},
+    pixelcolor::BinaryColor,
+    prelude::{Drawable, Point, Primitive, Size},
+    primitives::{PrimitiveStyle, Rectangle},
+    text::Text,
+};
 
 use crate::framebuffer::{FrameBuffer, FRAMEBUFFER_SIZE, HEIGHT, ROW_BYTES, WIDTH};
 
 /// Runtime directory containing removable-SD sleep images.
 pub const SLEEP_IMAGE_DIRECTORY: &str = "/sdcard/RUSTMIX/SLEEP";
+/// Painted on the sleep image. The AXP2101 Power key is not an RTC GPIO.
+pub const DEEP_SLEEP_WAKE_HINT: &str = "WAKE: UP SELECT DOWN BOOT. POWER KEY CANNOT WAKE.";
+
+/// Stamp the keys that can wake deep sleep onto the native sleep frame.
+pub fn stamp_deep_sleep_wake_hint(frame: &mut FrameBuffer) {
+    let _ = Rectangle::new(Point::new(0, 456), Size::new(WIDTH, 24))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
+        .draw(frame);
+    let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
+    let _ = Text::new(DEEP_SLEEP_WAKE_HINT, Point::new(8, 472), style).draw(frame);
+}
 /// Bounded number of files examined on each entry to sleep mode.
 pub const MAX_SLEEP_IMAGE_CANDIDATES: usize = 32;
 const BMP_FILE_HEADER_BYTES: usize = 14;
@@ -401,8 +418,10 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{decode_sleep_bmp, SleepImageCatalog};
-    use crate::framebuffer::{FRAMEBUFFER_SIZE, HEIGHT, ROW_BYTES, WIDTH};
+    use super::{
+        decode_sleep_bmp, stamp_deep_sleep_wake_hint, SleepImageCatalog, DEEP_SLEEP_WAKE_HINT,
+    };
+    use crate::framebuffer::{FrameBuffer, FRAMEBUFFER_SIZE, HEIGHT, ROW_BYTES, WIDTH};
 
     fn fixture() -> Vec<u8> {
         include_bytes!("../examples/sd-card/RUSTMIX/SLEEP/SLEEP.BMP").to_vec()
@@ -500,6 +519,15 @@ mod tests {
             .scan_error
             .as_deref()
             .is_some_and(|error| error.contains("directory scan failed")));
+    }
+
+    #[test]
+    fn sleep_frame_names_the_keys_that_wake_deep_sleep() {
+        let mut frame = FrameBuffer::new_white();
+        stamp_deep_sleep_wake_hint(&mut frame);
+        assert!(DEEP_SLEEP_WAKE_HINT.contains("POWER KEY CANNOT WAKE"));
+        assert!(DEEP_SLEEP_WAKE_HINT.contains("BOOT"));
+        assert!(frame.as_bytes().iter().any(|byte| *byte != 0xFF));
     }
 
     #[test]

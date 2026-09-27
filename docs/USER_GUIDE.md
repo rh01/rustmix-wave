@@ -560,7 +560,7 @@ A long Power press enters sleep-image mode:
 
 <img src="../screenshots/sleep.jpg" width="360" alt="Sleep image mode">
 
-The firmware selects a random image from `/sdcard/RUSTMIX/SLEEP`, suspends network activity, puts the panel controller into deep sleep, and then deep-sleeps the ESP32-S3. UP, SELECT, DOWN, and BOOT wake it. The open book position is saved first. The same deep sleep also runs after the auto-sleep timeout (10 minutes by default; Device Info → Power can select 5, 10, 30, or 60). Between page turns the CPU uses tickless light sleep instead, so the chapter stays in memory. Device Info page 4 shows the estimated power state and the AXP2101 battery voltage.
+The firmware selects a random image from `/sdcard/RUSTMIX/SLEEP`, suspends network activity, puts the panel controller into deep sleep, and then deep-sleeps the ESP32-S3. The image is labeled with the wake keys: UP, SELECT, DOWN, and BOOT. The Power key cannot wake the SoC, because it is an AXP2101 status bit rather than an RTC GPIO. The open book position is saved first. The same deep sleep also runs after the auto-sleep timeout (10 minutes by default; Device Info → Power can select 5, 10, 30, or 60). Between page turns the panel rail stays on and the CPU uses tickless light sleep, so page turns stay partial refreshes and the chapter stays in memory. After 60 seconds with no input the controller sleeps; the next partial restores the previous frame into the old RAM plane. Device Info page 4 shows the estimated power state and the AXP2101 battery voltage.
 
 ## 8. Screenshot index
 

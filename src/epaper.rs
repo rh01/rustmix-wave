@@ -150,6 +150,29 @@ where
         self.turn_on_display(0xFF)
     }
 
+    /// Partial update after the controller RAM was lost.
+    ///
+    /// `previous` is the frame still visible on the glass. It is written to the
+    /// old plane (`0x26`) before `next` is written to `0x24`, so the `0xFF`
+    /// waveform diffs against the real image instead of an empty buffer.
+    pub fn show_partial_restoring_old_plane(&mut self, previous: &[u8], next: &[u8]) -> Result<()> {
+        validate_frame(previous)?;
+        validate_frame(next)?;
+        info!("epd397: partial refresh restoring old plane");
+        self.hardware_reset_fast()?;
+        self.command_data(0x18, &[0x80])?;
+        self.command_data(0x3C, &[0x80])?;
+        self.command_data(0x44, &[0x00, 0x00, 0x18, 0x03])?;
+        self.command_data(0x45, &[0xDF, 0x01, 0x00, 0x00])?;
+        self.command_data(0x4E, &[0x00, 0x00])?;
+        self.command_data(0x4F, &[0x00, 0x00])?;
+        self.command(0x26)?;
+        self.data(previous)?;
+        self.command(0x24)?;
+        self.data(next)?;
+        self.turn_on_display(0xFF)
+    }
+
     /// Put the panel controller into deep sleep and disable its PMIC rail.
     pub fn sleep(&mut self) -> Result<()> {
         info!("epd397: deep sleep and disable ALDO3");

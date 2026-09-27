@@ -335,7 +335,19 @@ pub fn atomic_write(
         let _ = fs::rename(path, backup);
     }
     fs::rename(temporary, path).map_err(|error| error.to_string())?;
-    Ok(())
+    fsync_parent_directory(path)
+}
+
+fn fsync_parent_directory(path: &Path) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let dir = File::open(parent).map_err(|error| format!("open {}: {error}", parent.display()))?;
+    dir.sync_all()
+        .map_err(|error| format!("fsync {}: {error}", parent.display()))
 }
 
 fn push_cookie(parts: &mut Vec<String>, name: &str, value: &str) {

@@ -29,7 +29,8 @@ Power-key product behavior:
 ```text
 Short Power press   Open display-maintenance menu
 Long Power press    Enter random sleep-image mode
-Wake Power press    Restore retained route after quiet guard
+Deep-sleep wake     UP, SELECT, DOWN, or BOOT (GPIO4, GPIO5, GPIO6, GPIO0)
+Power key           Cannot wake deep sleep; AXP2101 PEK is I2C-only, not an RTC GPIO
 ```
 
 ## Storage

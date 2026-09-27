@@ -112,6 +112,46 @@ pub fn worker_read(
     Ok(BodyRead::Bytes)
 }
 
+/// Returned when a body read makes no progress. Not `"cancelled"`, so a
+/// download retries and then skips.
+pub const HTTP_STALL_ERROR: &str = "HTTP response stalled";
+/// Returned when one job's body reads run past [`crate::weread::limits::HTTP_CHAPTER_LIMIT_MS`].
+pub const HTTP_CHAPTER_TIMEOUT_ERROR: &str = "HTTP chapter timed out";
+
+/// Idle and total limits for the body reads of one WeRead job.
+///
+/// The device feeds `esp_timer_get_time`. Host tests pass synthetic timestamps.
+/// `last_bytes_ms` moves only when a read returns payload bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BodyClock {
+    started_ms: u64,
+    last_bytes_ms: u64,
+}
+
+impl BodyClock {
+    #[must_use]
+    pub fn start(now_ms: u64) -> Self {
+        Self {
+            started_ms: now_ms,
+            last_bytes_ms: now_ms,
+        }
+    }
+
+    /// `got_bytes` resets the idle window. A timeout passes `false`.
+    pub fn observe(&mut self, now_ms: u64, got_bytes: bool) -> Result<(), &'static str> {
+        if got_bytes {
+            self.last_bytes_ms = now_ms;
+        }
+        if now_ms.saturating_sub(self.started_ms) >= crate::weread::limits::HTTP_CHAPTER_LIMIT_MS {
+            return Err(HTTP_CHAPTER_TIMEOUT_ERROR);
+        }
+        if now_ms.saturating_sub(self.last_bytes_ms) >= crate::weread::limits::HTTP_IDLE_LIMIT_MS {
+            return Err(HTTP_STALL_ERROR);
+        }
+        Ok(())
+    }
+}
+
 pub trait Transport {
     fn idle(&mut self);
     fn call(&mut self, request: &Request) -> Result<Response, String>;
@@ -1927,6 +1967,39 @@ mod tests {
             super::worker_read(false, 0, EAGAIN, &mut || session.close_on_worker()),
             Ok(super::BodyRead::Ended)
         );
+    }
+
+    #[test]
+    fn stalled_or_trickling_reads_fail_into_retry_skip() {
+        let mut clock = super::BodyClock::start(0);
+        clock.observe(3_000, false).expect("one short read");
+        clock
+            .observe(18_000, false)
+            .expect("still inside the idle window");
+        clock.observe(19_000, true).expect("bytes reset idle time");
+        clock
+            .observe(38_000, false)
+            .expect("19s since the last byte");
+        assert_eq!(clock.observe(39_000, false), Err(super::HTTP_STALL_ERROR));
+
+        let mut clock = super::BodyClock::start(1_000);
+        for now in (6_000..121_000).step_by(5_000) {
+            clock
+                .observe(now, true)
+                .expect("a trickle stays under the chapter cap");
+        }
+        assert_eq!(
+            clock.observe(121_000, true),
+            Err(super::HTTP_CHAPTER_TIMEOUT_ERROR)
+        );
+
+        for error in [super::HTTP_STALL_ERROR, super::HTTP_CHAPTER_TIMEOUT_ERROR] {
+            assert_ne!(error, "cancelled");
+            assert!(matches!(
+                super::transport_job_error(error.into()),
+                super::JobError::Message(message) if message == error
+            ));
+        }
     }
 
     #[test]

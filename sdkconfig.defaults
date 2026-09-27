@@ -29,21 +29,21 @@ CONFIG_APP_PROJECT_VER="1.0.0"
 CONFIG_LWIP_SNTP_MAX_SERVERS=1
 CONFIG_LWIP_SNTP_UPDATE_DELAY=3600000
 
-# HTTPS weather retrieval uses the ESP-IDF certificate bundle.
+# HTTPS uses the ESP-IDF certificate bundle. The full bundle is already the
+# Kconfig default (CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL).
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
-CONFIG_MBEDTLS_DEFAULT_CERTIFICATE_BUNDLE=y
 
 # Embedded browser requests commonly exceed the ESP-IDF 512-byte default.
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 
-# Dynamic frequency scaling 80-240 MHz and tickless automatic light sleep.
-# 80 MHz is the floor that keeps octal PSRAM valid. Bluetooth stays off in
-# this Wi-Fi firmware; the modem is only started for a station or SoftAP job.
+# Dynamic frequency scaling and tickless automatic light sleep.
+# The 80 MHz floor that keeps octal PSRAM valid is set at runtime in
+# power_policy via esp_pm_configure. Bluetooth stays off in this Wi-Fi
+# firmware; the modem is only started for a station or SoftAP job.
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 # CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160 is not set
 CONFIG_PM_ENABLE=y
 CONFIG_PM_DFS_INIT_AUTO=y
-CONFIG_PM_DFS_MIN_FREQ_MHZ=80
 CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
 CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP=y
 CONFIG_PM_SLP_IRAM_OPT=y

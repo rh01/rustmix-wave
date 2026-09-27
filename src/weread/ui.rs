@@ -1463,7 +1463,7 @@ mod tests {
         buttons::ButtonEvent,
         reader::{BookFontSize, ReaderPreferences},
         weread::{
-            client::{Job, JobError, JobOutput, Report},
+            client::{Job, JobError, JobOutput, Report, HTTP_STALL_ERROR},
             limits::DOWNLOAD_ATTEMPTS,
             offline::{self, CachedChapter, ChapterDownload, DownloadEvent},
             parse::{BookDetail, ChapterMeta, ReadingProgress},
@@ -1890,6 +1890,41 @@ mod tests {
         match ui.pending {
             Some(Job::Chapter { chapter_idx, .. }) => assert_eq!(chapter_idx, 2),
             other => panic!("expected the next chapter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stalled_chapter_download_is_retried() {
+        let mut ui = signed_in();
+        ui.phase = super::Phase::Download;
+        ui.chapters = vec![chapter("1", 1, "One"), chapter("2", 2, "Two")];
+        ui.chapter_pos = 0;
+        ui.generation = 4;
+        let layout = ReaderPreferences::default().layout();
+        ui.apply_report(
+            Report {
+                generation: 4,
+                job: Job::Chapter {
+                    book_id: "b".into(),
+                    chapter_uid: "1".into(),
+                    chapter_idx: 1,
+                    psvts: String::new(),
+                    fetch_images: false,
+                },
+                session: ui.session.clone(),
+                result: Err(JobError::Message(HTTP_STALL_ERROR.into())),
+            },
+            layout,
+            true,
+            1_000,
+        );
+        assert!(!ui.download_cancel);
+        assert!(ui.status.contains("Retrying"));
+        assert!(ui.status.contains(HTTP_STALL_ERROR));
+        assert!(ui.download_skip.is_empty());
+        match &ui.pending {
+            Some(Job::Chapter { chapter_idx, .. }) => assert_eq!(*chapter_idx, 1),
+            other => panic!("expected a retry of chapter 1, got {other:?}"),
         }
     }
 

@@ -314,6 +314,7 @@ fn start_worker() -> Result<LongLivedWorker<QueuedJob, Report>, std::io::Error> 
                     gap: true,
                     cancel: job.cancel,
                     download: job.download_tx,
+                    clock: client::BodyClock::start(mono_ms()),
                 };
                 let report =
                     client::perform_with_seed(&mut transport, job.work, job.unix, job.seed);
@@ -384,6 +385,8 @@ struct EspTransport {
     gap: bool,
     cancel: Arc<AtomicBool>,
     download: Option<mpsc::SyncSender<DownloadEvent>>,
+    /// Idle and total limits shared by every body read of this job.
+    clock: client::BodyClock,
 }
 
 impl Transport for EspTransport {
@@ -411,7 +414,7 @@ impl Transport for EspTransport {
         if self.cancelled() {
             return Err("cancelled".into());
         }
-        http_call(request, &self.cancel)
+        http_call(request, &self.cancel, &mut self.clock)
     }
 
     fn streaming_download(&self) -> bool {
@@ -429,9 +432,9 @@ impl Transport for EspTransport {
         }
         let tx = self
             .download
-            .as_ref()
+            .clone()
             .ok_or("streaming download is not available")?;
-        http_call_stream(request, &self.cancel, tx, part)
+        http_call_stream(request, &self.cancel, &mut self.clock, &tx, part)
     }
 }
 
@@ -530,7 +533,24 @@ fn read_body_chunk(
     Ok((step, read))
 }
 
-fn http_call(request: &Request, cancel: &AtomicBool) -> Result<Response, String> {
+fn mono_ms() -> u64 {
+    unsafe { sys::esp_timer_get_time() as u64 / 1_000 }
+}
+
+fn note_body_time(clock: &mut client::BodyClock, step: client::BodyRead) -> Result<(), String> {
+    if matches!(step, client::BodyRead::Ended) {
+        return Ok(());
+    }
+    clock
+        .observe(mono_ms(), matches!(step, client::BodyRead::Bytes))
+        .map_err(str::to_string)
+}
+
+fn http_call(
+    request: &Request,
+    cancel: &AtomicBool,
+    clock: &mut client::BodyClock,
+) -> Result<Response, String> {
     let url = CString::new(request.url.as_str()).map_err(|_| "URL is not a C string")?;
     let mut cookies = CookieList {
         text: String::new(),
@@ -608,6 +628,7 @@ fn http_call(request: &Request, cancel: &AtomicBool) -> Result<Response, String>
     arm_body_timeout(client.raw);
     loop {
         let (step, read) = read_body_chunk(&mut client, cancel, &mut chunk)?;
+        note_body_time(clock, step)?;
         match step {
             client::BodyRead::Timeout => continue,
             client::BodyRead::Ended => {
@@ -635,6 +656,7 @@ fn http_call(request: &Request, cancel: &AtomicBool) -> Result<Response, String>
 fn http_call_stream(
     request: &Request,
     cancel: &AtomicBool,
+    clock: &mut client::BodyClock,
     tx: &mpsc::SyncSender<DownloadEvent>,
     part: &'static str,
 ) -> Result<client::StreamedPart, String> {
@@ -714,6 +736,7 @@ fn http_call_stream(
     arm_body_timeout(client.raw);
     loop {
         let (step, read) = read_body_chunk(&mut client, cancel, &mut chunk)?;
+        note_body_time(clock, step)?;
         match step {
             client::BodyRead::Timeout => continue,
             client::BodyRead::Ended => {

@@ -12,7 +12,10 @@ use std::{
 
 use anyhow::{anyhow, Result};
 
-use super::adpcm::{decode_clip, AdpcmDecoder, ClipHeader, CLIP_HEADER_LEN, CLIP_SAMPLE_RATE_HZ};
+use super::adpcm::{
+    clip_span_bytes, decode_clip, AdpcmDecoder, ClipHeader, CLIP_HEADER_LEN, CLIP_MAX_BYTES,
+    CLIP_SAMPLE_RATE_HZ,
+};
 use crate::lexicon::crc32;
 
 pub const INDEX_MAGIC: &[u8; 8] = b"RMXAUD1\0";
@@ -23,6 +26,54 @@ pub const INDEX_RECORD_LEN: usize = 12;
 pub const INDEX_MAX_BYTES: usize = 256 * 1024;
 pub const INDEX_NAME: &str = "AUDIO.IDX";
 pub const PACK_NAME: &str = "AUDIO.PAK";
+
+/// Total `AUDIO.IDX` length for `count` records, or `None` when the product
+/// does not fit in an unsigned integer of `width_bits` (32 on the ESP32).
+#[must_use]
+pub fn index_span_bytes(count: u32, width_bits: u32) -> Option<u64> {
+    let records = u64::from(count).checked_mul(INDEX_RECORD_LEN as u64)?;
+    let body = records.checked_add(INDEX_HEADER_LEN as u64)?;
+    let total = body.checked_add(4)?;
+    let limit = if width_bits >= 64 {
+        u64::MAX
+    } else {
+        u64::from(u32::MAX)
+    };
+    if records > limit || body > limit || total > limit {
+        None
+    } else {
+        Some(total)
+    }
+}
+
+/// `true` when a file length must not be read into memory.
+///
+/// Compare in `u64`. Narrowing to `usize` first accepts `cap + 2^32` on a
+/// 32-bit target because that value truncates back to the cap.
+#[must_use]
+pub fn index_len_exceeds_cap(len: u64) -> bool {
+    len > INDEX_MAX_BYTES as u64
+}
+
+/// End offset of one packed clip, or `None` when `length` is outside the clip
+/// cap or `offset + length` does not fit in `width_bits`.
+#[must_use]
+pub fn packed_clip_end(offset: u32, length: u32, width_bits: u32) -> Option<u64> {
+    if u64::from(length) < CLIP_HEADER_LEN as u64 || length > CLIP_MAX_BYTES {
+        return None;
+    }
+    let end = u64::from(offset).checked_add(u64::from(length))?;
+    let limit = if width_bits >= 64 {
+        u64::MAX
+    } else {
+        u64::from(u32::MAX)
+    };
+    if end > limit {
+        None
+    } else {
+        Some(end)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClipLoc {
@@ -122,8 +173,10 @@ pub fn lookup_clip(lexicon_root: &Path, dict_id: &str, entry_id: u32) -> Result<
     };
     match std::fs::metadata(&pak) {
         Ok(meta) => {
-            let end = u64::from(loc.offset).saturating_add(u64::from(loc.length));
-            if meta.len() < end || loc.length < CLIP_HEADER_LEN as u32 {
+            let Some(end) = packed_clip_end(loc.offset, loc.length, 32) else {
+                return Err(anyhow!("pronunciation clip is outside the pack"));
+            };
+            if meta.len() < end {
                 return Err(anyhow!("pronunciation clip is outside the pack"));
             }
             Ok(Some(*loc))
@@ -143,31 +196,31 @@ pub fn parse_index(bytes: &[u8]) -> Result<AudioIndex> {
         return Err(anyhow!("unsupported pronunciation index"));
     }
     let sample_rate = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
-    let count = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+    let count_u32 = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
     if sample_rate != CLIP_SAMPLE_RATE_HZ {
         return Err(anyhow!("pronunciation index sample rate"));
     }
-    let body = bytes.len() - 4;
-    let expected = INDEX_HEADER_LEN
-        .checked_add(
-            count
-                .checked_mul(INDEX_RECORD_LEN)
-                .ok_or_else(|| anyhow!("pronunciation index count"))?,
-        )
-        .ok_or_else(|| anyhow!("pronunciation index count"))?;
-    if expected != body || bytes.len() > INDEX_MAX_BYTES {
+    let Some(total) = index_span_bytes(count_u32, usize::BITS) else {
+        return Err(anyhow!("pronunciation index count"));
+    };
+    if index_len_exceeds_cap(total) || bytes.len() as u64 != total {
         return Err(anyhow!("pronunciation index length"));
     }
+    let body = usize::try_from(total - 4).map_err(|_| anyhow!("pronunciation index count"))?;
     let actual = u32::from_le_bytes(bytes[body..body + 4].try_into().unwrap());
     if crc32(&bytes[..body]) != actual {
         return Err(anyhow!("pronunciation index crc"));
     }
+    let count = count_u32 as usize;
     let mut records: Vec<ClipLoc> = Vec::with_capacity(count);
     for index in 0..count {
         let start = INDEX_HEADER_LEN + index * INDEX_RECORD_LEN;
         let entry_id = u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap());
         let offset = u32::from_le_bytes(bytes[start + 4..start + 8].try_into().unwrap());
         let length = u32::from_le_bytes(bytes[start + 8..start + 12].try_into().unwrap());
+        if packed_clip_end(offset, length, 32).is_none() {
+            return Err(anyhow!("pronunciation clip is outside the pack"));
+        }
         if let Some(previous) = records.last() {
             if entry_id <= previous.entry_id {
                 return Err(anyhow!("pronunciation index is not sorted"));
@@ -213,12 +266,12 @@ fn read_index(path: &Path) -> Result<Option<AudioIndex>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let len = file.metadata()?.len() as usize;
-    if len > INDEX_MAX_BYTES {
+    let len = file.metadata()?.len();
+    if index_len_exceeds_cap(len) {
         return Err(anyhow!("pronunciation index is too large"));
     }
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    Read::take(&mut file, INDEX_MAX_BYTES as u64).read_to_end(&mut bytes)?;
     if bytes.is_empty() {
         return Ok(None);
     }
@@ -246,15 +299,13 @@ fn parse_clip_header_prefix(header: &[u8; CLIP_HEADER_LEN], clip_len: u32) -> Re
     let sample_count = u32::from_le_bytes(header[16..20].try_into().unwrap());
     let predictor = i16::from_le_bytes([header[20], header[21]]);
     let step_index = header[22];
-    if sample_rate != CLIP_SAMPLE_RATE_HZ
-        || sample_count == 0
-        || sample_count > super::adpcm::CLIP_MAX_SAMPLES
-        || step_index > 88
-    {
+    if sample_rate != CLIP_SAMPLE_RATE_HZ || step_index > 88 {
         return Err(anyhow!("pronunciation clip length"));
     }
-    let expected = CLIP_HEADER_LEN as u32 + sample_count.div_ceil(2);
-    if clip_len != expected {
+    let Some(expected) = clip_span_bytes(sample_count, 32) else {
+        return Err(anyhow!("pronunciation clip length"));
+    };
+    if u64::from(clip_len) != expected {
         return Err(anyhow!("pronunciation clip truncated"));
     }
     Ok(ClipHeader {
@@ -301,10 +352,11 @@ fn fat_dict_id(dict_id: &str) -> Option<&str> {
 
 /// Decode a whole clip. Used by host tests; the device session streams.
 pub fn decode_packed_clip(pak: &[u8], loc: ClipLoc) -> Result<Vec<i16>> {
-    let start = loc.offset as usize;
-    let end = start
-        .checked_add(loc.length as usize)
-        .ok_or_else(|| anyhow!("pronunciation clip length"))?;
+    let Some(end) = packed_clip_end(loc.offset, loc.length, 32) else {
+        return Err(anyhow!("pronunciation clip length"));
+    };
+    let start = usize::try_from(loc.offset).map_err(|_| anyhow!("pronunciation clip length"))?;
+    let end = usize::try_from(end).map_err(|_| anyhow!("pronunciation clip length"))?;
     let bytes = pak
         .get(start..end)
         .ok_or_else(|| anyhow!("pronunciation clip"))?;
@@ -314,10 +366,11 @@ pub fn decode_packed_clip(pak: &[u8], loc: ClipLoc) -> Result<Vec<i16>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        encode_index, lookup_clip, parse_index, pronounce_available, ClipLoc, PronounceSession,
-        INDEX_NAME, PACK_NAME,
+        encode_index, index_len_exceeds_cap, index_span_bytes, lookup_clip, packed_clip_end,
+        parse_index, pronounce_available, ClipLoc, PronounceSession, INDEX_HEADER_LEN, INDEX_MAGIC,
+        INDEX_MAX_BYTES, INDEX_NAME, PACK_NAME,
     };
-    use crate::audio::adpcm::{encode_clip, CLIP_SAMPLE_RATE_HZ};
+    use crate::audio::adpcm::{encode_clip, CLIP_HEADER_LEN, CLIP_SAMPLE_RATE_HZ};
     use std::fs;
     use std::path::Path;
 
@@ -402,6 +455,63 @@ mod tests {
         }
         assert_eq!(pcm.len(), samples.len() * 2);
         assert_eq!(session.read_pcm16_mono(&mut buffer).unwrap(), 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hostile_index_count_and_truncated_files_are_rejected() {
+        assert_eq!(index_span_bytes(u32::MAX, 32), None);
+        let wide = index_span_bytes(u32::MAX, 64).unwrap();
+        assert!(wide > INDEX_MAX_BYTES as u64);
+        let hostile_len = (INDEX_MAX_BYTES as u64).wrapping_add(1_u64 << 32);
+        assert_eq!(hostile_len as u32, INDEX_MAX_BYTES as u32);
+        assert!(index_len_exceeds_cap(hostile_len));
+        assert_eq!(packed_clip_end(u32::MAX, CLIP_HEADER_LEN as u32, 32), None);
+        assert!(packed_clip_end(u32::MAX, CLIP_HEADER_LEN as u32, 64).is_some());
+        assert_eq!(packed_clip_end(0, u32::MAX, 32), None);
+
+        let mut header = vec![0_u8; INDEX_HEADER_LEN + 4];
+        header[..8].copy_from_slice(INDEX_MAGIC);
+        header[8..10].copy_from_slice(&1_u16.to_le_bytes());
+        header[10..12].copy_from_slice(&1_u16.to_le_bytes());
+        header[12..16].copy_from_slice(&CLIP_SAMPLE_RATE_HZ.to_le_bytes());
+        header[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        let error = parse_index(&header).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("count") || message.contains("length"),
+            "{message}"
+        );
+
+        let root = std::env::temp_dir().join(format!("rmx-aud-hostile-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        write_pack(&root.join("ECDICT"), &[(1, &[0, 100])]);
+        let index_path = root.join("ECDICT").join(INDEX_NAME);
+        let mut truncated = fs::read(&index_path).unwrap();
+        truncated.pop();
+        assert!(parse_index(&truncated).is_err());
+        fs::write(&index_path, &header).unwrap();
+        assert!(lookup_clip(&root, "ECDICT", 1).is_err());
+        assert!(!pronounce_available(&root, "ECDICT", 1));
+
+        write_pack(&root.join("ECDICT"), &[(1, &[0, 100])]);
+        let mut records = parse_index(&fs::read(&index_path).unwrap())
+            .unwrap()
+            .records;
+        records[0].length = u32::MAX;
+        fs::write(
+            &index_path,
+            encode_index(CLIP_SAMPLE_RATE_HZ, &records).unwrap(),
+        )
+        .unwrap();
+        assert!(parse_index(&fs::read(&index_path).unwrap()).is_err());
+
+        write_pack(&root.join("ECDICT"), &[(1, &[0, 100, 200, -200])]);
+        let pak_path = root.join("ECDICT").join(PACK_NAME);
+        let mut pak = fs::read(&pak_path).unwrap();
+        pak.truncate(CLIP_HEADER_LEN);
+        fs::write(&pak_path, pak).unwrap();
+        assert!(PronounceSession::open(&root, "ECDICT", 1).is_err());
         let _ = fs::remove_dir_all(&root);
     }
 

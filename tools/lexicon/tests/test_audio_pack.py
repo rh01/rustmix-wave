@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import struct
 import subprocess
 import sys
 import tempfile
@@ -99,6 +100,27 @@ class AudioPackTests(unittest.TestCase):
             resolve_voice("en_US-lessac-medium")
         self.assertEqual(resolve_voice("melo-jp").license, "MIT")
         self.assertEqual(resolve_voice("melo-zh").license, "MIT")
+
+    def test_hostile_counts_and_truncated_files(self) -> None:
+        header = bytearray(24)
+        header[:8] = b"RMXADP1\x00"
+        struct.pack_into("<HHII", header, 8, 1, 1, 16000, 0xFFFFFFFF)
+        with self.assertRaises(FormatError):
+            decode_clip_samples(bytes(header))
+        short = bytearray(encode_clip([0, 1000, -1000, 0]))
+        with self.assertRaises(FormatError):
+            decode_clip_samples(bytes(short[:-1]))
+        index = bytearray(24)
+        index[:8] = b"RMXAUD1\x00"
+        struct.pack_into("<HHII", index, 8, 1, 1, 16000, 0xFFFFFFFF)
+        with self.assertRaises(FormatError) as raised:
+            parse_index(bytes(index))
+        self.assertIn("count", str(raised.exception))
+        good = encode_index([(1, 0, len(short))])
+        with self.assertRaises(FormatError):
+            parse_index(good[:-1])
+        with self.assertRaises(FormatError):
+            parse_index(encode_index([(1, 0, 0xFFFFFFFF)]))
 
     def test_bad_clip_and_index(self) -> None:
         blob = bytearray(encode_clip([0, 1000, -1000, 0]))

@@ -40,6 +40,10 @@ INDEX_MAGIC = b"RMXAUD1\x00"
 CLIP_MAGIC = b"RMXADP1\x00"
 SAMPLE_RATE = 16_000
 CLIP_HEADER_LEN = 24
+CLIP_MAX_SAMPLES = SAMPLE_RATE * 12
+CLIP_MAX_BYTES = CLIP_HEADER_LEN + (CLIP_MAX_SAMPLES + 1) // 2
+INDEX_MAX_BYTES = 256 * 1024
+INDEX_RECORD_LEN = 12
 
 STEP_TABLE = [
     7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
@@ -191,8 +195,8 @@ def estimate_sd_bytes(words: int, seconds: float = 0.9) -> int:
 
 
 def encode_clip(samples: list[int]) -> bytes:
-    if not samples:
-        raise FormatError("empty clip")
+    if not samples or len(samples) > CLIP_MAX_SAMPLES:
+        raise FormatError("empty clip" if not samples else "pronunciation clip length")
     predictor = 0
     step_index = 0
     adpcm = bytearray()
@@ -232,8 +236,10 @@ def decode_clip_samples(blob: bytes) -> list[int]:
     )
     if version != 1 or channels != 1 or rate != SAMPLE_RATE or step_index > 88:
         raise FormatError("unsupported pronunciation clip")
+    if count <= 0 or count > CLIP_MAX_SAMPLES:
+        raise FormatError("pronunciation clip length")
     expected = (count + 1) // 2
-    if count <= 0 or len(blob) - CLIP_HEADER_LEN != expected:
+    if len(blob) > CLIP_MAX_BYTES or len(blob) - CLIP_HEADER_LEN != expected:
         raise FormatError("pronunciation clip truncated")
     predictor = int(struct.unpack_from("<h", blob, 20)[0])
     step = int(blob[22])
@@ -266,11 +272,16 @@ def encode_index(records: list[tuple[int, int, int]]) -> bytes:
 def parse_index(blob: bytes) -> list[tuple[int, int, int]]:
     if len(blob) < 24 or blob[:8] != INDEX_MAGIC:
         raise FormatError("bad pronunciation index")
+    if len(blob) > INDEX_MAX_BYTES:
+        raise FormatError("pronunciation index length")
     version, codec, rate, count = struct.unpack_from("<HHII", blob, 8)
     if version != 1 or codec != 1 or rate != SAMPLE_RATE:
         raise FormatError("unsupported pronunciation index")
+    max_count = (INDEX_MAX_BYTES - 24) // INDEX_RECORD_LEN
+    if count > max_count:
+        raise FormatError("pronunciation index count")
     body_end = len(blob) - 4
-    if body_end != 20 + count * 12:
+    if body_end != 20 + count * INDEX_RECORD_LEN:
         raise FormatError("pronunciation index length")
     expect = zlib.crc32(blob[:body_end]) & 0xFFFFFFFF
     actual = struct.unpack_from("<I", blob, body_end)[0]
@@ -281,6 +292,10 @@ def parse_index(blob: bytes) -> list[tuple[int, int, int]]:
     previous = -1
     for _ in range(count):
         entry_id, pak_off, length = struct.unpack_from("<III", blob, offset)
+        if length < CLIP_HEADER_LEN or length > CLIP_MAX_BYTES:
+            raise FormatError("pronunciation clip length")
+        if pak_off > 0xFFFFFFFF - length:
+            raise FormatError("pronunciation clip length")
         if entry_id <= previous:
             raise FormatError("pronunciation index is not sorted")
         previous = entry_id

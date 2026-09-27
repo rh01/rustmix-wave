@@ -11,6 +11,31 @@ pub const CLIP_SAMPLE_RATE_HZ: u32 = 16_000;
 /// Twelve seconds at 16 kHz. Longer headers are rejected so a corrupt
 /// length cannot stall the main loop.
 pub const CLIP_MAX_SAMPLES: u32 = CLIP_SAMPLE_RATE_HZ * 12;
+/// Header plus one nibble pair per two samples. A clip longer than this is
+/// rejected before any PCM buffer is allocated.
+pub const CLIP_MAX_BYTES: u32 = (CLIP_HEADER_LEN as u32) + ((CLIP_MAX_SAMPLES + 1) / 2);
+
+/// On-disk size of one clip, or `None` when `sample_count` is outside the
+/// cap or the byte length does not fit in an unsigned integer of `width_bits`
+/// (32 on the ESP32).
+#[must_use]
+pub fn clip_span_bytes(sample_count: u32, width_bits: u32) -> Option<u64> {
+    if sample_count == 0 || sample_count > CLIP_MAX_SAMPLES {
+        return None;
+    }
+    let payload = u64::from(sample_count).div_ceil(2);
+    let total = u64::from(CLIP_HEADER_LEN as u32).checked_add(payload)?;
+    let limit = if width_bits >= 64 {
+        u64::MAX
+    } else {
+        u64::from(u32::MAX)
+    };
+    if payload > limit || total > limit {
+        None
+    } else {
+        Some(total)
+    }
+}
 
 const STEP_TABLE: [i32; 89] = [
     7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66,
@@ -93,9 +118,10 @@ pub fn parse_clip_header(bytes: &[u8]) -> Result<ClipHeader, &'static str> {
     if step_index > 88 {
         return Err("pronunciation clip step");
     }
-    let adpcm_len = bytes.len() - CLIP_HEADER_LEN;
-    let expected = (sample_count as usize).div_ceil(2);
-    if adpcm_len != expected {
+    let Some(total) = clip_span_bytes(sample_count, 32) else {
+        return Err("pronunciation clip length");
+    };
+    if bytes.len() as u64 != total {
         return Err("pronunciation clip truncated");
     }
     Ok(ClipHeader {
@@ -108,14 +134,20 @@ pub fn parse_clip_header(bytes: &[u8]) -> Result<ClipHeader, &'static str> {
 
 pub fn decode_clip(bytes: &[u8]) -> Result<Vec<i16>, &'static str> {
     let header = parse_clip_header(bytes)?;
+    let Some(sample_count) = usize::try_from(header.sample_count).ok() else {
+        return Err("pronunciation clip length");
+    };
+    if sample_count > CLIP_MAX_SAMPLES as usize {
+        return Err("pronunciation clip length");
+    }
     let mut decoder = AdpcmDecoder::from_header(&header);
-    let mut pcm = Vec::with_capacity(header.sample_count as usize);
+    let mut pcm = Vec::with_capacity(sample_count);
     for byte in &bytes[CLIP_HEADER_LEN..] {
         let mut pair = [0_i16; 2];
         let count = decoder.pull_byte(*byte, &mut pair);
         pcm.extend_from_slice(&pair[..count]);
     }
-    if !decoder.is_done() || pcm.len() != header.sample_count as usize {
+    if !decoder.is_done() || pcm.len() != sample_count {
         return Err("pronunciation clip decode");
     }
     Ok(pcm)
@@ -206,7 +238,8 @@ fn encode_nibble(sample: i16, predictor: &mut i32, step_index: &mut i32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_clip, encode_clip, parse_clip_header, CLIP_HEADER_LEN, CLIP_SAMPLE_RATE_HZ,
+        clip_span_bytes, decode_clip, encode_clip, parse_clip_header, CLIP_HEADER_LEN,
+        CLIP_MAX_SAMPLES, CLIP_SAMPLE_RATE_HZ,
     };
 
     #[test]
@@ -245,5 +278,32 @@ mod tests {
         bytes = encode_clip(&[0, 1000], CLIP_SAMPLE_RATE_HZ).unwrap();
         bytes[0] = b'X';
         assert!(decode_clip(&bytes).is_err());
+    }
+
+    #[test]
+    fn hostile_sample_count_is_rejected_before_allocation() {
+        assert_eq!(clip_span_bytes(u32::MAX, 32), None);
+        assert_eq!(clip_span_bytes(u32::MAX, 64), None);
+        assert_eq!(clip_span_bytes(0, 32), None);
+        assert_eq!(clip_span_bytes(CLIP_MAX_SAMPLES + 1, 32), None);
+        assert_eq!(
+            clip_span_bytes(4, 32),
+            Some(u64::from(CLIP_HEADER_LEN as u32) + 2)
+        );
+        let mut header = [0_u8; CLIP_HEADER_LEN];
+        header[..8].copy_from_slice(b"RMXADP1\0");
+        header[8..10].copy_from_slice(&1_u16.to_le_bytes());
+        header[10..12].copy_from_slice(&1_u16.to_le_bytes());
+        header[12..16].copy_from_slice(&CLIP_SAMPLE_RATE_HZ.to_le_bytes());
+        header[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        let error = parse_clip_header(&header).unwrap_err();
+        assert!(
+            error.contains("length") || error.contains("truncated"),
+            "{error}"
+        );
+        assert!(decode_clip(&header).is_err());
+        let mut bytes = encode_clip(&[0, 1000, -1000, 0], CLIP_SAMPLE_RATE_HZ).unwrap();
+        bytes.truncate(CLIP_HEADER_LEN);
+        assert!(parse_clip_header(&bytes).unwrap_err().contains("truncated"));
     }
 }

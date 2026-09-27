@@ -8,7 +8,11 @@ use super::{RasterGlyph, SdFontFace};
 /// product tree copy is convenient for the Wi-Fi transfer portal.
 pub const SD_FONT_DIRECTORIES: [&str; 2] = ["/sdcard/fonts", "/sdcard/RUSTMIX/FONTS"];
 const MAX_SD_FACES: usize = 4;
-const MAX_SD_FONT_BYTES: usize = 2 * 1024 * 1024;
+/// File-size cap. fontdue parses every outline up front and keeps them after
+/// the file buffer is dropped, so the resident face is larger than this.
+pub const MAX_SD_FONT_BYTES: usize = 2 * 1024 * 1024;
+/// Planning budget for one loaded face: the file cap, doubled for outlines.
+pub const SD_FONT_RESIDENT_BUDGET_BYTES: usize = MAX_SD_FONT_BYTES * 2;
 
 pub struct LoadedSdFace {
     pub info: SdFontFace,

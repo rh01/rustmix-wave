@@ -66,9 +66,8 @@ pub struct WereadUi {
     pub qr_url: String,
     /// Plain chapter text kept so a font change can repaginate without a refetch.
     pub chapter_source: String,
-    /// Reading-view font and size editor. Uses the TXT/EPUB preference values.
-    pub text_prefs: bool,
-    pub text_pref_cursor: usize,
+    /// Layout last used to build `pages`. A later font or size change rebuilds.
+    paginated_layout: Option<ReaderLayout>,
     pending: Option<Job>,
     next_due_ms: u64,
     generation: u64,
@@ -113,8 +112,7 @@ impl Default for WereadUi {
             download_done: 0,
             qr_url: String::new(),
             chapter_source: String::new(),
-            text_prefs: false,
-            text_pref_cursor: 0,
+            paginated_layout: None,
             pending: None,
             next_due_ms: 0,
             generation: 0,
@@ -245,10 +243,9 @@ impl WereadUi {
                 self.pending = None;
             }
         }
-        if current != ScreenRoute::WeReadRead {
-            self.text_prefs = false;
-        }
-        if !current.is_weread() {
+        // Reading Preferences is the shared TXT/EPUB screen. Keep the open
+        // chapter so BOOT can return to it and repaginate.
+        if !current.is_weread() && current != ScreenRoute::ReaderPreferences {
             self.pending = None;
             self.progress_arm = false;
             self.download_cancel = true;
@@ -259,7 +256,9 @@ impl WereadUi {
             }
             return;
         }
-        self.phase = phase_from_route(current);
+        if current.is_weread() {
+            self.phase = phase_from_route(current);
+        }
     }
 
     #[must_use]
@@ -494,11 +493,7 @@ impl WereadUi {
                 }
                 None
             }
-            ButtonEvent::Select => {
-                self.text_prefs = true;
-                self.text_pref_cursor = 0;
-                None
-            }
+            ButtonEvent::Select => Some(ScreenRoute::ReaderPreferences),
         }
     }
 
@@ -604,6 +599,7 @@ impl WereadUi {
             self.status = "This book has no chapters yet.".into();
             self.pages.clear();
             self.chapter_source.clear();
+            self.paginated_layout = None;
             return false;
         }
         self.chapter_pos = self.chapter_pos.min(self.chapters.len() - 1);
@@ -648,6 +644,7 @@ impl WereadUi {
         let blocks = text::blocks_from_markup(text);
         self.chapter_source = text.to_string();
         self.pages = text::paginate_blocks(&blocks, layout);
+        self.paginated_layout = Some(layout);
         self.images.clear();
         if self.page_index == usize::MAX {
             self.page_index = self.pages.len().saturating_sub(1);
@@ -658,6 +655,7 @@ impl WereadUi {
     /// Rebuild the open chapter after the shared reader font or size changes.
     pub fn repaginate(&mut self, layout: ReaderLayout) {
         if self.chapter_source.is_empty() {
+            self.paginated_layout = None;
             return;
         }
         let page = self.page_index;
@@ -669,6 +667,20 @@ impl WereadUi {
         } else {
             self.page_index = page.min(self.pages.len() - 1);
         }
+    }
+
+    /// Rebuild when Reading Preferences changed the layout after the chapter loaded.
+    #[must_use]
+    pub fn sync_layout(&mut self, layout: ReaderLayout) -> bool {
+        if self.chapter_source.is_empty() {
+            self.paginated_layout = None;
+            return false;
+        }
+        if self.paginated_layout == Some(layout) {
+            return false;
+        }
+        self.repaginate(layout);
+        true
     }
 
     fn arm_progress(&mut self, now_ms: u64) {
@@ -1099,6 +1111,7 @@ impl WereadUi {
                     self.pages = Vec::new();
                     self.images = Vec::new();
                     self.chapter_source = String::new();
+                    self.paginated_layout = None;
                     drop(blocks);
                     drop(images);
                 } else {
@@ -1847,14 +1860,27 @@ mod tests {
     }
 
     #[test]
-    fn select_on_the_chapter_opens_text_settings() {
+    fn select_on_the_chapter_opens_reading_preferences() {
         let mut ui = signed_in();
         let layout = ReaderPreferences::default().layout();
         assert_eq!(
             ui.on_button(ScreenRoute::WeReadRead, ButtonEvent::Select, layout, false),
-            None
+            Some(ScreenRoute::ReaderPreferences)
         );
-        assert!(ui.text_prefs);
-        assert_eq!(ui.text_pref_cursor, 0);
+    }
+
+    #[test]
+    fn sync_layout_rebuilds_only_when_the_font_metrics_change() {
+        let mut ui = signed_in();
+        let text = "abcd ".repeat(40);
+        let small = ReaderPreferences::default().layout();
+        ui.show_text(&text, small);
+        let pages = ui.pages.len();
+        assert!(!ui.sync_layout(small));
+        assert_eq!(ui.pages.len(), pages);
+        let mut large = ReaderPreferences::default();
+        large.font_size = BookFontSize::Px72;
+        assert!(ui.sync_layout(large.layout()));
+        assert!(ui.pages.len() > pages);
     }
 }

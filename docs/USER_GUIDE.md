@@ -150,7 +150,7 @@ Book rows are **Read**, **Contents**, **Notes**, **Download**, and **Refresh**.
 
 **Read** opens the saved chapter, or chapter 1 when progress has no chapter yet. If the contents are not loaded, Read fetches them first (the footer says WORKING) and then opens the book. A failed fetch stays on the book screen with the error text.
 
-Reading uses the same font, size, and CJK faces as the TXT/EPUB reader, including faces installed under `/RUSTMIX/FONTS`. SELECT on a chapter opens that font and size editor. BOOT long closes it and returns to the chapter; BOOT long again returns to the book menu. Rotate up and down to change pages. At the ends of a chapter the control moves to the previous or next chapter. After a page turn the device waits a few seconds, then uploads progress to WeRead when a web session is present.
+Reading uses the same font, size, and CJK faces as the TXT/EPUB reader, including faces installed under `/RUSTMIX/FONTS`. SELECT on a chapter opens Reading Preferences, the same screen the local reader uses. BOOT long returns to the chapter. If the font or size changed, the open chapter is repaginated in place. BOOT long again returns to the book menu. Rotate up and down to change pages. At the ends of a chapter the control moves to the previous or next chapter. After a page turn the device waits a few seconds, then uploads progress to WeRead when a web session is present.
 
 While a request is running the footer says WORKING. SELECT cancels it. Buttons and the idle timer keep running; a slow request does not put the panel to sleep the moment it returns.
 

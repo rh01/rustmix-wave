@@ -31,7 +31,8 @@ mod cache;
 mod sd_ttf;
 mod unifont;
 
-pub use sd_ttf::SD_FONT_DIRECTORIES;
+pub use cache::GLYPH_CACHE_BUDGET_BYTES;
+pub use sd_ttf::{MAX_SD_FONT_BYTES, SD_FONT_DIRECTORIES, SD_FONT_RESIDENT_BUDGET_BYTES};
 pub use unifont::pack_glyph_count;
 
 use cache::{CacheKey, GlyphCache};
@@ -90,6 +91,9 @@ pub struct FontEngineStatus {
     pub unifont_glyphs: usize,
     pub unifont_bytes: usize,
     pub sd_faces: usize,
+    /// Sum of the TTF/OTF file sizes. Outline storage is larger; the heap log
+    /// after `init_from_sd` is the resident measurement.
+    pub sd_font_file_bytes: usize,
     pub cache_entries: usize,
     pub cache_bytes: usize,
 }
@@ -168,6 +172,7 @@ fn status_locked(engine: &FontEngine) -> FontEngineStatus {
         unifont_glyphs: unifont::pack_glyph_count(),
         unifont_bytes: unifont::pack_glyph_count() * 32 + 8,
         sd_faces: engine.sd_faces.len(),
+        sd_font_file_bytes: engine.sd_faces.iter().map(|face| face.info.bytes).sum(),
         cache_entries: engine.cache.len(),
         cache_bytes: engine.cache.bytes(),
     }

@@ -8,7 +8,6 @@ use embedded_graphics::{
     primitives::{PrimitiveStyle, Rectangle},
 };
 
-use super::reader::render_weread_font_settings;
 use crate::{
     app::{
         reader_typography::reader_body_style,
@@ -233,9 +232,6 @@ pub fn render_read(
     display: &mut OrientedFrameBuffer<'_>,
     state: &AppState,
 ) -> Result<(), Infallible> {
-    if state.weread.text_prefs {
-        return render_weread_font_settings(display, state);
-    }
     let weread = &state.weread;
     let title = weread
         .chapters
@@ -290,7 +286,7 @@ pub fn render_read(
     draw_footer(
         display,
         state.display,
-        footer(weread.busy, "MOVE PAGE  SELECT TEXT  HOLD BOOT BOOK"),
+        footer(weread.busy, "MOVE PAGE  SELECT PREFS  HOLD BOOT BOOK"),
     )
 }
 

@@ -37,15 +37,19 @@ use crate::{
     weread::{
         body::BoundedBody,
         client::{self, Job, JobError, Report, Request, Response, Transport, Work},
-        limits::{HTTP_TIMEOUT_SECS, MIN_REQUEST_GAP_MS},
+        limits::{HTTP_IO_BUFFER_BYTES, HTTP_TIMEOUT_SECS, MIN_REQUEST_GAP_MS},
         session,
         ui::{self, ServiceOutcome, WereadUi},
     },
 };
 
+pub use crate::weread::limits::WEREAD_HTTP_WORKER_STACK_BYTES;
+
 /// PSRAM stack for the one `weread-http` thread. Large enough for one mbedTLS
 /// handshake, and not taken from the ~334 KiB internal heap on every chapter.
-pub const WEREAD_HTTP_WORKER_STACK_BYTES: usize = 32 * 1024;
+/// A ~2 MiB SD face parsed by fontdue already occupies more than 2 MiB of
+/// PSRAM; this stack and the chapter body stay in what remains. The 2 KiB TLS
+/// I/O buffers stay in internal RAM.
 const MAX_SET_COOKIE_BYTES: usize = 4 * 1024;
 
 pub struct HttpJobs {
@@ -347,8 +351,8 @@ fn http_call(request: &Request, cancel: &AtomicBool) -> Result<Response, String>
     let mut config = esp_http_client_config_t::default();
     config.url = url.as_ptr();
     config.timeout_ms = (HTTP_TIMEOUT_SECS * 1000) as i32;
-    config.buffer_size = 2048;
-    config.buffer_size_tx = 2048;
+    config.buffer_size = HTTP_IO_BUFFER_BYTES as _;
+    config.buffer_size_tx = HTTP_IO_BUFFER_BYTES as _;
     config.event_handler = Some(on_http_event);
     config.user_data = &mut cookies as *mut CookieList as *mut core::ffi::c_void;
     config.crt_bundle_attach = Some(sys::esp_crt_bundle_attach);

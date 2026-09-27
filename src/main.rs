@@ -103,7 +103,7 @@ mod firmware {
         regional::RegionalPreferences,
         rtc::RtcDateTime,
         rtc_alarm_interrupt::{espidf::RtcAlarmInterruptMonitor, RTC_ALARM_INTERRUPT_GPIO},
-        runtime_memory::log_runtime_memory,
+        runtime_memory::{log_runtime_memory, RuntimeMemorySnapshot},
         shared_i2c::SharedI2cBus,
         sleep_images::{
             stamp_deep_sleep_wake_hint, SleepImageCatalog, SleepImageSelection,
@@ -473,17 +473,37 @@ mod firmware {
         let mut panel_refresh = PanelRefreshCoordinator::default();
         sync_panel_refresh_diagnostics(&mut state, &panel_refresh);
         state.display = display_preferences;
+        log_runtime_memory("before-sd-font");
         let font_status = fonts::init_from_sd(&[]);
         for note in fonts::load_notes() {
             info!("rustmix-wave=cjk-sd-font {note}");
         }
+        log_runtime_memory("sd-font-loaded");
+        let font_heap = RuntimeMemorySnapshot::capture();
+        let weread_psram_need =
+            weread::limits::MAX_SHARD_BYTES + weread::limits::WEREAD_HTTP_WORKER_STACK_BYTES;
         info!(
-            "rustmix-wave=cjk-font-engine-ready fallback=unifont-gb2312 unifont-glyphs={} unifont-bytes={} sd-faces={} sd-dirs={} cache-budget-bytes=524288 psram=spiram-malloc flash-impact=unifont-subset+fontdue",
+            "rustmix-wave=cjk-font-engine-ready fallback=unifont-gb2312 unifont-glyphs={} unifont-bytes={} sd-faces={} sd-font-file-bytes={} sd-dirs={} cache-budget-bytes={} psram=spiram-malloc flash-impact=unifont-subset+fontdue heap-free-psram-bytes={} heap-largest-psram-block-bytes={}",
             font_status.unifont_glyphs,
             font_status.unifont_bytes,
             font_status.sd_faces,
-            SD_FONT_DIRECTORIES.join(",")
+            font_status.sd_font_file_bytes,
+            SD_FONT_DIRECTORIES.join(","),
+            fonts::GLYPH_CACHE_BUDGET_BYTES,
+            font_heap.heap_free_psram_bytes,
+            font_heap.heap_largest_psram_block_bytes
         );
+        if font_heap.heap_largest_psram_block_bytes > 0
+            && font_heap.heap_largest_psram_block_bytes < weread_psram_need
+        {
+            warn!(
+                "rustmix-wave=weread-heap status=psram-tight largest-psram-block-bytes={} need-bytes={} shard-cap-bytes={} worker-stack-bytes={} cause=sd-font-outlines",
+                font_heap.heap_largest_psram_block_bytes,
+                weread_psram_need,
+                weread::limits::MAX_SHARD_BYTES,
+                weread::limits::WEREAD_HTTP_WORKER_STACK_BYTES
+            );
+        }
         let reader_persistence = state.reader.load_persistent_state();
         state.reader.refresh_library();
         if _mounted_sd.is_some() {
@@ -784,7 +804,7 @@ mod firmware {
         info!("rustmix-wave=voice-notes-organizer-controls-export-ready gain-persistence=SETTINGS.TXT metadata=META.TXT titles=friendly-sidecar filenames=fat83-wav recording-date-time=rtc-local storage=esp-vfs-fat-info delete-confirmation=true pause-resume=rx-discard export=wifi-transfer-shortcut");
         info!("rustmix-wave=offline-dictionary-x4-pack-native-foundation-ready root={DICTIONARY_ROOT} index=INDEX.TXT shards=DATA/*.JSN shard-max-bytes={DICTIONARY_SHARD_MAX_BYTES} lookup=exact-prefix-fallback wildcard=true ui=native-rust");
         info!("rustmix-wave=lexicon-vocab-ready root=/sdcard/RUSTMIX/LEXICON format=RMXLEX1 lists=RMXWLS1 vocab=/sdcard/RUSTMIX/VOCAB scheduler=fsrs6,sm2");
-        info!("rustmix-wave=weread-reader-ready root=/sdcard/RUSTMIX/WEREAD login=qr-web chapter=signed-e progress=web-upload offline=sd-text notes=official-gateway worker=weread-http-long-lived stack-bytes={WEREAD_HTTP_WORKER_STACK_BYTES} stack-caps=psram download-retry=chapter font=reader-prefs");
+        info!("rustmix-wave=weread-reader-ready root=/sdcard/RUSTMIX/WEREAD login=qr-web chapter=signed-e progress=web-upload offline=sd-text notes=official-gateway worker=weread-http-long-lived stack-bytes={WEREAD_HTTP_WORKER_STACK_BYTES} stack-caps=psram download-retry=chapter font=reading-preferences repaginate=on-layout-change");
         info!("rustmix-wave=dictionary-keyboard-boot-axis-navigation-ready short-press=boot toggle=horizontal,vertical default-axis=horizontal selected-key=preserved long-press=hierarchical-back helper=keyboard-grid-navigation");
         info!(
             "rustmix-wave=voice-notes-catalog status=completed notes={} root={VOICE_NOTES_ROOT}",
@@ -1647,6 +1667,15 @@ mod firmware {
                 let unix = state.board.rtc.and_then(unix_from_rtc_storage);
                 let now_ms = weread_clock.elapsed().as_millis() as u64;
                 let layout = state.reader.preferences.layout();
+                if state.active_route().is_weread() && state.weread.sync_layout(layout) {
+                    refresh_screen(
+                        &mut panel,
+                        &mut frame,
+                        &mut state,
+                        &mut panel_refresh,
+                        RefreshRequest::Normal,
+                    )?;
+                }
                 let previous = state.active_route();
                 let outcome = weread_jobs.poll(
                     &mut state.weread,

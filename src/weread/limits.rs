@@ -41,9 +41,46 @@ pub const HTTP_TIMEOUT_SECS: u64 = 20;
 /// First try plus two retries. A failed chapter does not cancel the book.
 pub const DOWNLOAD_ATTEMPTS: u8 = 3;
 pub const DOWNLOAD_RETRY_MS: u64 = 1_000;
+/// One long-lived `weread-http` pthread stack, allocated from PSRAM.
+pub const WEREAD_HTTP_WORKER_STACK_BYTES: usize = 32 * 1024;
+/// `esp_http_client` RX and TX buffers. Each stays under
+/// `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` so TLS I/O uses internal RAM.
+pub const HTTP_IO_BUFFER_BYTES: usize = 2 * 1024;
+/// Waveshare ESP32-S3-WROOM-1-N16R8 octal PSRAM.
+pub const MODULE_PSRAM_BYTES: usize = 8 * 1024 * 1024;
 
 pub const WEREAD_ROOT: &str = "/sdcard/RUSTMIX/WEREAD";
 pub const WEREAD_CONFIG_PATH: &str = "/sdcard/RUSTMIX/WEREAD.TXT";
 pub const SESSION_FILE: &str = "SESS.TXT";
 pub const SESSION_TMP: &str = "SESS.TMP";
 pub const SESSION_BAK: &str = "SESS.BAK";
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        HTTP_IO_BUFFER_BYTES, MAX_CHAPTER_TEXT, MAX_SHARD_BYTES, MODULE_PSRAM_BYTES,
+        WEREAD_HTTP_WORKER_STACK_BYTES,
+    };
+    use crate::fonts::{
+        GLYPH_CACHE_BUDGET_BYTES, MAX_SD_FONT_BYTES, SD_FONT_RESIDENT_BUDGET_BYTES,
+    };
+
+    #[test]
+    fn sd_font_worker_and_tls_fit_beside_a_chapter() {
+        assert_eq!(MAX_SD_FONT_BYTES, 2 * 1024 * 1024);
+        assert!(SD_FONT_RESIDENT_BUDGET_BYTES > MAX_SD_FONT_BYTES);
+        let psram = SD_FONT_RESIDENT_BUDGET_BYTES
+            + WEREAD_HTTP_WORKER_STACK_BYTES
+            + MAX_SHARD_BYTES
+            + MAX_CHAPTER_TEXT
+            + GLYPH_CACHE_BUDGET_BYTES;
+        assert!(
+            psram < MODULE_PSRAM_BYTES,
+            "psram budget {psram} exceeds {MODULE_PSRAM_BYTES}"
+        );
+        // TLS I/O stays under the internal-malloc threshold, so it does not
+        // need a PSRAM hole next to the font outlines.
+        assert!(HTTP_IO_BUFFER_BYTES * 2 <= 16 * 1024);
+        assert!(WEREAD_HTTP_WORKER_STACK_BYTES <= 32 * 1024);
+    }
+}

@@ -3,7 +3,8 @@
 
 use super::{FaceId, RasterGlyph};
 
-const DEFAULT_MAX_BYTES: usize = 512 * 1024;
+pub const GLYPH_CACHE_BUDGET_BYTES: usize = 512 * 1024;
+const DEFAULT_MAX_BYTES: usize = GLYPH_CACHE_BUDGET_BYTES;
 const DEFAULT_MAX_ENTRIES: usize = 768;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

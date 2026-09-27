@@ -218,9 +218,15 @@ pub fn render_wifi_setup(
     )?;
 
     Text::new("Join this network", Point::new(22, 164), heading).draw(display)?;
+    let password = if setup.ap_password.is_empty() {
+        "--"
+    } else {
+        setup.ap_password.as_str()
+    };
     line(display, 212, "AP SSID", setup.ap_ssid.as_str(), body)?;
-    line(display, 252, "Open", setup.url_label(), detail)?;
-    line(display, 292, "Scanned", &scanned, body)?;
+    line(display, 252, "Password", password, heading)?;
+    line(display, 292, "Open", setup.url_label(), detail)?;
+    line(display, 332, "Scanned", &scanned, body)?;
 
     if setup.state == WifiSetupState::TimedOut {
         Text::new("Setup network stopped", Point::new(22, 372), heading).draw(display)?;
@@ -230,7 +236,7 @@ pub fn render_wifi_setup(
         Text::new(WIFI_SETUP_RESTART_HINT, Point::new(22, 548), detail).draw(display)?;
     } else {
         Text::new("Phone steps", Point::new(22, 372), heading).draw(display)?;
-        Text::new("1. Join Rustmix-Setup", Point::new(22, 420), body).draw(display)?;
+        Text::new("1. Join with the password", Point::new(22, 420), body).draw(display)?;
         Text::new("2. Open http://192.168.4.1", Point::new(22, 460), body).draw(display)?;
         Text::new("3. Pick SSID, save password", Point::new(22, 500), body).draw(display)?;
         Text::new(&setup.last_action, Point::new(22, 548), detail).draw(display)?;

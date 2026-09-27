@@ -6,13 +6,14 @@
 //! when the card is present, writes `WIFI.TXT` back. The LAN transfer portal
 //! stays a separate STA-only service.
 //!
-//! The open AP has the same 10-minute budget as the transfer portal, both as an
+//! The WPA2 AP uses a fresh 8-character password per session, shown on the
+//! e-paper. It has the same 10-minute budget as the transfer portal, both as an
 //! idle timeout and as a total timeout. Every exit stops the HTTP server and
 //! the SoftAP radio together.
 
 use crate::network_config::{NetworkConfig, DEFAULT_NTP_SERVER, DEFAULT_TIMEZONE};
 
-/// Open setup network shown on the e-paper while provisioning.
+/// Setup network shown on the e-paper while provisioning.
 pub const WIFI_SETUP_AP_SSID: &str = "Rustmix-Setup";
 /// ESP-IDF SoftAP default IPv4. Phones open this URL after joining the AP.
 pub const WIFI_SETUP_AP_IP: &str = "192.168.4.1";
@@ -34,6 +35,19 @@ pub const WIFI_SETUP_IDLE_TIMEOUT_SECONDS: u64 = 10 * 60;
 pub const WIFI_SETUP_TOTAL_TIMEOUT_SECONDS: u64 = 10 * 60;
 /// Shown on e-paper after the setup AP stops on its own.
 pub const WIFI_SETUP_RESTART_HINT: &str = "Settings > Network > Configure Wi-Fi";
+/// WPA2 minimum. Long enough for WPA2, short enough to type from the e-paper.
+pub const WIFI_SETUP_AP_PASSWORD_LEN: usize = 8;
+/// No 0/O, 1/I/L, so the e-paper password is unambiguous.
+const WIFI_SETUP_AP_PASSWORD_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+
+/// Per-session SoftAP password from hardware random words.
+#[must_use]
+pub fn setup_ap_password(mut next_random: impl FnMut() -> u32) -> String {
+    let alphabet = WIFI_SETUP_AP_PASSWORD_ALPHABET;
+    (0..WIFI_SETUP_AP_PASSWORD_LEN)
+        .map(|_| char::from(alphabet[next_random() as usize % alphabet.len()]))
+        .collect()
+}
 
 /// Why a running setup session must stop.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -307,11 +321,13 @@ pub struct ScannedNetwork {
     pub open: bool,
 }
 
-/// Password-free snapshot rendered on the e-paper setup screen.
+/// Snapshot rendered on the e-paper setup screen. It never holds the station
+/// password; `ap_password` is the setup AP's own password, meant to be shown.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WifiSetupSnapshot {
     pub state: WifiSetupState,
     pub ap_ssid: String,
+    pub ap_password: String,
     pub url: String,
     pub network_count: usize,
     pub last_action: String,
@@ -323,6 +339,7 @@ impl Default for WifiSetupSnapshot {
         Self {
             state: WifiSetupState::Off,
             ap_ssid: WIFI_SETUP_AP_SSID.into(),
+            ap_password: String::new(),
             url: setup_url().into(),
             network_count: 0,
             last_action: "SoftAP setup is off".into(),
@@ -730,6 +747,10 @@ pub mod espidf {
             lock(&self.shared).snapshot.clone()
         }
 
+        pub fn set_ap_password(&self, password: &str) {
+            lock(&self.shared).snapshot.ap_password = password.into();
+        }
+
         pub fn set_networks(&self, networks: Vec<ScannedNetwork>) {
             let mut locked = lock(&self.shared);
             let count = networks.len();
@@ -815,6 +836,21 @@ mod tests {
         assert!(!snapshot.is_active());
         assert_eq!(setup_url(), "http://192.168.4.1/");
         assert_eq!(WIFI_SETUP_AP_SSID, "Rustmix-Setup");
+    }
+
+    #[test]
+    fn setup_ap_password_is_wpa2_length_and_unambiguous() {
+        let mut seed = 0_u32;
+        let password = super::setup_ap_password(|| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            seed
+        });
+        assert_eq!(password.len(), super::WIFI_SETUP_AP_PASSWORD_LEN);
+        assert!(password.len() >= 8);
+        assert!(password
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() && !"01ILO".contains(c)));
+        assert!(WifiSetupSnapshot::default().ap_password.is_empty());
     }
 
     #[test]

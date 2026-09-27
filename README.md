@@ -155,7 +155,7 @@ Use the Wi-Fi firmware release for normal Wi-Fi transfer, weather, NTP/time sync
 - WeRead, under Reader, signs in with a WeChat QR code, reads shelf chapters with the existing CJK reader, uploads progress, and can keep a whole book on the SD card.
 - Native Calendar loads personal events and the U.S.-only 2026 pack, renders a daily agenda, and supports recovery-safe personal-event creation, editing, and deletion.
 - Wi-Fi transfer portal provides explicit LAN-only SD access with protected configuration paths and atomic file replacement.
-- SoftAP captive setup (`Rustmix-Setup`, `http://192.168.4.1`) provisions Wi-Fi from a phone when `WIFI.TXT` is missing or STA join fails, while SD `WIFI.TXT` remains a first-class manual path.
+- SoftAP captive setup (`Rustmix-Setup`, WPA2 password shown on the e-paper, `http://192.168.4.1`) provisions Wi-Fi from a phone. Without credentials the device still boots to Home and works offline; WeRead, weather, the clock, and the transfer portal offer setup when they need Wi-Fi. SD `WIFI.TXT` remains a first-class manual path.
 - RTC alarms, weather, unit conversion, file browsing, audio diagnostics, sensors, Lua apps, and native motion games remain available.
 
 ## Hardware target

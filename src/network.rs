@@ -31,6 +31,24 @@ impl WifiConnectionState {
     }
 }
 
+/// Wait before the next background station retry: 15 s, doubling to a 5 min cap.
+#[must_use]
+pub const fn station_retry_delay_secs(failed_attempts: u32) -> u64 {
+    const FIRST: u64 = 15;
+    const CAP: u64 = 5 * 60;
+    let shift = if failed_attempts > 5 {
+        5
+    } else {
+        failed_attempts
+    };
+    let delay = FIRST << shift;
+    if delay > CAP {
+        CAP
+    } else {
+        delay
+    }
+}
+
 /// Product-facing SNTP synchronization state.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum NtpSyncState {
@@ -469,12 +487,20 @@ pub mod espidf {
         }
 
         /// Open `Rustmix-Setup` in APSTA so phones can join and the STA radio can scan.
-        pub fn start_softap(&mut self) -> Result<()> {
-            self.station_attempt = None;
+        ///
+        /// Returns without waiting for the AP start event or DHCP, so the main
+        /// loop keeps reading buttons. A pending station join is cancelled first.
+        pub fn start_softap(&mut self, password: &str) -> Result<()> {
+            if let Some(attempt) = self.station_attempt.take() {
+                log::info!(
+                    "rustmix-wave=wifi-connect status=cancelled ssid={} reason=softap-setup",
+                    attempt.config.ssid
+                );
+            }
             let wifi = self.wifi.as_mut().context("Wi-Fi runtime is unavailable")?;
             let _ = self.sntp.take();
-            let _ = wifi.disconnect();
-            let _ = wifi.stop();
+            let _ = WifiApi::disconnect(wifi.wifi_mut());
+            let _ = WifiApi::stop(wifi.wifi_mut());
             wifi.set_configuration(&Configuration::Mixed(
                 ClientConfiguration::default(),
                 AccessPointConfiguration {
@@ -483,21 +509,25 @@ pub mod espidf {
                         .context("setup SSID exceeds embedded Wi-Fi capacity")?,
                     ssid_hidden: false,
                     channel: 6,
-                    auth_method: AuthMethod::None,
+                    auth_method: AuthMethod::WPA2Personal,
+                    password: password
+                        .try_into()
+                        .context("setup password exceeds embedded Wi-Fi capacity")?,
                     max_connections: 4,
                     ..Default::default()
                 },
             ))?;
             self.radio_started = true;
-            wifi.start()?;
-            let mut ip = WIFI_SETUP_AP_IP.to_string();
-            for _ in 0..25 {
-                if let Ok(info) = wifi.wifi().ap_netif().get_ip_info() {
-                    ip = format!("{}", info.ip);
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
+            WifiApi::start(wifi.wifi_mut())?;
+            // The AP netif has a static address; it does not wait on DHCP.
+            let ip = wifi
+                .wifi()
+                .ap_netif()
+                .get_ip_info()
+                .ok()
+                .map(|info| info.ip.to_string())
+                .filter(|ip| ip != "0.0.0.0")
+                .unwrap_or_else(|| WIFI_SETUP_AP_IP.to_string());
             self.snapshot = NetworkSnapshot {
                 wifi_state: WifiConnectionState::Provisioning,
                 ntp_state: NtpSyncState::WaitingForWifi,
@@ -674,6 +704,13 @@ pub mod espidf {
 #[cfg(test)]
 mod tests {
     use super::{NetworkSnapshot, NtpSyncState, WifiConnectionState};
+
+    #[test]
+    fn station_retry_backs_off_to_five_minutes() {
+        let delays: Vec<u64> = (0..8).map(super::station_retry_delay_secs).collect();
+        assert_eq!(delays, [15, 30, 60, 120, 240, 300, 300, 300]);
+        assert_eq!(super::station_retry_delay_secs(u32::MAX), 300);
+    }
 
     #[test]
     fn configuration_missing_snapshot_is_safe_for_home() {

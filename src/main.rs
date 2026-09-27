@@ -73,8 +73,8 @@ mod firmware {
         lexicon::LEXICON_ROOT,
         lua_runtime::{catalog::LUA_APPS_DIRECTORY, loader::LUA_LOADER_WORKER_STACK_BYTES},
         network::{
-            espidf::NetworkRuntime, NetworkLogFingerprint, NetworkSnapshot, NtpSyncState,
-            WifiConnectionState,
+            espidf::NetworkRuntime, station_retry_delay_secs, NetworkLogFingerprint,
+            NetworkSnapshot, NtpSyncState, WifiConnectionState,
         },
         network_config::{
             load_sd_wifi_txt, resolve_boot_wifi, BootWifiSource, NetworkConfig, SdWifiTxt,
@@ -133,9 +133,10 @@ mod firmware {
         weread::{self, http::WEREAD_HTTP_WORKER_STACK_BYTES},
         wifi_nvs,
         wifi_setup::{
-            espidf::WifiSetupServer, WifiSetupExit, WifiSetupSnapshot, WifiSetupTimeoutKind,
-            WifiSetupUiRequest, WIFI_SETUP_AP_SSID, WIFI_SETUP_IDLE_TIMEOUT_SECONDS,
-            WIFI_SETUP_SERVER_STACK_BYTES, WIFI_SETUP_TOTAL_TIMEOUT_SECONDS,
+            espidf::WifiSetupServer, setup_ap_password, WifiSetupExit, WifiSetupSnapshot,
+            WifiSetupTimeoutKind, WifiSetupUiRequest, WIFI_SETUP_AP_SSID,
+            WIFI_SETUP_IDLE_TIMEOUT_SECONDS, WIFI_SETUP_SERVER_STACK_BYTES,
+            WIFI_SETUP_TOTAL_TIMEOUT_SECONDS,
         },
         wifi_transfer::{
             espidf::WifiTransferServer, WifiTransferSnapshot, WifiTransferUiRequest,
@@ -769,7 +770,7 @@ mod firmware {
         info!("rustmix-wave=lua-sokoban-tilt-event-bridge-ready sample=SOKOBAN board=9x9 motion=debounced-tilt-only dirty=old-cell,new-cell,status-or-board refresh=shared-panel-coordinator transport=existing-fullscreen-partial panel-api=rust-owned");
         info!("rustmix-wave=weather-fetch-stack-isolation-ready worker=weather-fetch stack-bytes=65536 main-task-stack-bytes=16384 response-max-bytes=8192 state=heap-boxed policy=short-lived-worker-join");
         info!("rustmix-wave=wifi-transfer-web-portal-ready activation=settings-network-explicit-toggle auto-start=false root={WIFI_TRANSFER_ROOT} transport=http-lan-only token=required server-stack-bytes={WIFI_TRANSFER_SERVER_STACK_BYTES} main-task-stack-bytes=16384 upload=streamed-atomic-tmp fat83=true protected-config=true inactivity-seconds={WIFI_TRANSFER_INACTIVITY_SECONDS}");
-        info!("rustmix-wave=wifi-softap-setup-ready ap={WIFI_SETUP_AP_SSID} url=http://192.168.4.1/ trigger=feature-prompt,settings-configure-wifi boot=home-offline persist=nvs,wifi-txt-writeback transfer-portal=sta-only stack-bytes={WIFI_SETUP_SERVER_STACK_BYTES} idle-timeout-seconds={WIFI_SETUP_IDLE_TIMEOUT_SECONDS} total-timeout-seconds={WIFI_SETUP_TOTAL_TIMEOUT_SECONDS} teardown=http-and-radio");
+        info!("rustmix-wave=wifi-softap-setup-ready ap={WIFI_SETUP_AP_SSID} auth=wpa2-session-password url=http://192.168.4.1/ trigger=feature-prompt,settings-configure-wifi boot=home-offline persist=nvs,wifi-txt-writeback transfer-portal=sta-only stack-bytes={WIFI_SETUP_SERVER_STACK_BYTES} idle-timeout-seconds={WIFI_SETUP_IDLE_TIMEOUT_SECONDS} total-timeout-seconds={WIFI_SETUP_TOTAL_TIMEOUT_SECONDS} teardown=http-and-radio");
         log_runtime_memory("boot-complete");
         info!("rustmix-wave=hierarchical-router-ready policy=category-subcategory-feature-details");
         info!("rustmix-wave=wifi-transfer-lifecycle-ready state=off-until-settings-network-toggle server=temporary-http-task sd-root=/sdcard/RUSTMIX stop=switch-off,back,sleep,wifi-loss,inactivity");
@@ -818,6 +819,7 @@ mod firmware {
         let mut station_retry_at = Instant::now()
             .checked_sub(Duration::from_secs(30))
             .unwrap_or_else(Instant::now);
+        let mut station_retry_failures = 0_u32;
         loop {
             if sd_clock_idle && _mounted_sd.is_some() {
                 set_sd_host_clock(false);
@@ -851,6 +853,7 @@ mod firmware {
                         state.network.ssid_label()
                     );
                     ntp_hold_started = Instant::now();
+                    station_retry_failures = 0;
                 } else if state.network.wifi_state == WifiConnectionState::Failed {
                     warn!(
                         "rustmix-wave=wifi-connect status=failed error={}",
@@ -877,13 +880,20 @@ mod firmware {
             } else {
                 RadioJob::None
             };
+            if !weread_needs_radio {
+                station_retry_failures = 0;
+            }
             if weread_needs_radio
                 && !sleep_network.is_suspended()
                 && !state.network.is_station_associated()
                 && !network_runtime.station_connect_pending()
-                && station_retry_at.elapsed() >= Duration::from_secs(15)
+                && station_retry_at.elapsed()
+                    >= Duration::from_secs(station_retry_delay_secs(
+                        station_retry_failures.saturating_sub(1),
+                    ))
             {
                 station_retry_at = Instant::now();
+                station_retry_failures = station_retry_failures.saturating_add(1);
                 let _ =
                     ensure_station_radio(&mut network_runtime, network_config.as_ref(), "weread");
                 state.update_network_snapshot(network_runtime.snapshot());
@@ -3125,7 +3135,8 @@ mod firmware {
             WifiSetupExit::Restart,
         );
         info!("rustmix-wave=wifi-setup status=starting ap={WIFI_SETUP_AP_SSID}");
-        if let Err(error) = runtime.start_softap() {
+        let ap_password = setup_ap_password(|| unsafe { sys::esp_random() });
+        if let Err(error) = runtime.start_softap(&ap_password) {
             warn!("rustmix-wave=wifi-setup status=softap-failed error={error:#}");
             teardown_wifi_setup(
                 runtime,
@@ -3138,12 +3149,8 @@ mod firmware {
         }
         match WifiSetupServer::start() {
             Ok(active) => {
-                match runtime.scan_networks() {
-                    Ok(networks) => active.set_networks(networks),
-                    Err(error) => {
-                        warn!("rustmix-wave=wifi-setup status=scan-failed error={error:#}")
-                    }
-                }
+                // The server queues the first scan; maintain_wifi_setup_server runs it.
+                active.set_ap_password(&ap_password);
                 if let Some(message) = runtime.config_warning() {
                     active.set_notice(message);
                 }

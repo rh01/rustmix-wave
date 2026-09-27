@@ -70,8 +70,8 @@ These checks need a release build on the device. Host tests do not flash firmwar
 
 ## Network, alarms, and settings
 
-1. Confirm Wi-Fi connection and SNTP status, or SoftAP setup when `WIFI.TXT` is missing.
-2. From a phone, join `Rustmix-Setup`, open `http://192.168.4.1`, scan SSIDs, save, and confirm STA join plus `WIFI.TXT` write-back.
+1. Confirm Wi-Fi connection and SNTP status. With no credentials, confirm boot lands on Home and WeRead shows the Wi-Fi Needed prompt.
+2. From a phone, join `Rustmix-Setup` with the password on the e-paper, open `http://192.168.4.1`, scan SSIDs, save, and confirm STA join plus `WIFI.TXT` write-back.
 3. Start the explicit Wi-Fi transfer portal after STA join, access it with the displayed code, then stop it.
 4. Confirm Settings → Network → Configure Wi-Fi can reopen SoftAP while keeping `WIFI.TXT` as a manual path.
 5. Leave SoftAP idle (and, separately, keep the phone page open) and confirm both the 10-minute idle timeout and the 10-minute total timeout stop HTTP and the AP radio, then show Settings → Network → Configure Wi-Fi on e-paper.

@@ -410,6 +410,11 @@ pub mod espidf {
         }
 
         #[must_use]
+        pub const fn radio_started(&self) -> bool {
+            self.radio_started
+        }
+
+        #[must_use]
         pub fn snapshot(&self) -> NetworkSnapshot {
             let mut snapshot = self.snapshot.clone();
             if snapshot.error.is_none() {

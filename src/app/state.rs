@@ -17,6 +17,9 @@ use crate::{
     network::NetworkSnapshot,
     orientation::DisplayOrientation,
     power_key_menu::{PowerKeyMenuOutcome, PowerKeyMenuUiState},
+    power_policy::{
+        cycle_auto_deep_sleep_minutes, PowerDebugSnapshot, DEFAULT_AUTO_DEEP_SLEEP_MINUTES,
+    },
     reader::{ReaderOption, ReaderOrientation, ReaderTickOutcome, ReaderUiState},
     regional::RegionalPreferences,
     storage::StorageSnapshot,
@@ -68,6 +71,11 @@ pub struct AppState {
     pub imu_events: ImuEventBridge,
     pub partial_refreshes: u8,
     pub panel_awake: bool,
+    /// ALDO3 and the SSD1677 are powered only during a refresh.
+    pub panel_rail_on: bool,
+    pub power: PowerDebugSnapshot,
+    pub auto_deep_sleep_minutes: u32,
+    power_minutes_dirty: bool,
     pub select_presses: u32,
     pub orientation: DisplayOrientation,
     pub regional: RegionalPreferences,
@@ -124,6 +132,10 @@ impl Default for AppState {
             imu_events: ImuEventBridge::default(),
             partial_refreshes: 0,
             panel_awake: true,
+            panel_rail_on: false,
+            power: PowerDebugSnapshot::default(),
+            auto_deep_sleep_minutes: DEFAULT_AUTO_DEEP_SLEEP_MINUTES,
+            power_minutes_dirty: false,
             select_presses: 0,
             orientation: DisplayOrientation::default(),
             regional: RegionalPreferences::default(),
@@ -299,18 +311,30 @@ impl AppState {
                     self.note_select_press();
                     self.router.navigate_to(ScreenRoute::DeviceInfoRuntime);
                 }
+                (ScreenRoute::DeviceInfoRuntime, ButtonEvent::Select) => {
+                    self.note_select_press();
+                    self.router.navigate_to(ScreenRoute::DeviceInfoPower);
+                }
+                (ScreenRoute::DeviceInfoPower, ButtonEvent::Select) => {
+                    self.note_select_press();
+                    self.auto_deep_sleep_minutes =
+                        cycle_auto_deep_sleep_minutes(self.auto_deep_sleep_minutes);
+                    self.power.auto_sleep_minutes = self.auto_deep_sleep_minutes;
+                    self.power_minutes_dirty = true;
+                }
                 (
                     ScreenRoute::Clock
                     | ScreenRoute::Environment
                     | ScreenRoute::Motion
                     | ScreenRoute::DeviceInfo
-                    | ScreenRoute::DeviceInfoBoard,
+                    | ScreenRoute::DeviceInfoBoard
+                    | ScreenRoute::DeviceInfoRuntime,
                     ButtonEvent::Up | ButtonEvent::Down,
                 )
                 | (
                     ScreenRoute::AudioDetails
                     | ScreenRoute::ClockDetails
-                    | ScreenRoute::DeviceInfoRuntime
+                    | ScreenRoute::DeviceInfoPower
                     | ScreenRoute::EnvironmentDetails
                     | ScreenRoute::MotionDetails
                     | ScreenRoute::NetworkDetails
@@ -1133,6 +1157,14 @@ impl AppState {
     }
 
     #[must_use]
+    pub fn take_auto_sleep_minutes_update(&mut self) -> Option<u32> {
+        if !self.power_minutes_dirty {
+            return None;
+        }
+        self.power_minutes_dirty = false;
+        Some(self.auto_deep_sleep_minutes)
+    }
+
     pub const fn active_route(&self) -> ScreenRoute {
         self.router.current()
     }

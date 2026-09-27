@@ -1991,6 +1991,24 @@ impl ReaderUiState {
         self.loading.as_ref().map(|loading| loading.stage)
     }
 
+    /// True while a book is still opening or the nearby-page index is incomplete.
+    #[must_use]
+    pub fn needs_background_tick(&self) -> bool {
+        if self.loading.is_some() {
+            return true;
+        }
+        self.session.as_ref().is_some_and(|session| {
+            session.cache.len() < READER_NEARBY_PAGE_CACHE && !session.index_complete
+        })
+    }
+
+    /// Flush the open page, bookmarks, and preferences before MCU deep sleep.
+    pub fn persist_before_sleep(&mut self) {
+        self.persist_current_session_best_effort();
+        self.persist_bookmarks_best_effort();
+        self.persist_preferences_best_effort();
+    }
+
     pub fn tick(&mut self) -> ReaderTickOutcome {
         if let Some(mut loading) = self.loading.take() {
             let outcome = match loading.stage {

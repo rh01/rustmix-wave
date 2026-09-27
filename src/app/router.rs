@@ -68,6 +68,8 @@ pub enum ScreenRoute {
     WifiSetup,
     Weather,
     WeatherDetails,
+    /// Battery, radio, and sleep estimate. Reached from Device Info.
+    DeviceInfoPower,
 }
 
 impl ScreenRoute {
@@ -138,6 +140,7 @@ impl ScreenRoute {
             Self::WifiSetup => "Configure Wi-Fi",
             Self::Weather => "Weather",
             Self::WeatherDetails => "Weather details",
+            Self::DeviceInfoPower => "Power",
         }
     }
 
@@ -208,6 +211,7 @@ impl ScreenRoute {
             Self::WifiSetup => "wifi-setup",
             Self::Weather => "weather",
             Self::WeatherDetails => "weather-details",
+            Self::DeviceInfoPower => "device-info-power",
         }
     }
 
@@ -270,6 +274,7 @@ impl ScreenRoute {
             Self::ClockDetails => Some(Self::Clock),
             Self::DeviceInfoBoard => Some(Self::DeviceInfo),
             Self::DeviceInfoRuntime => Some(Self::DeviceInfoBoard),
+            Self::DeviceInfoPower => Some(Self::DeviceInfoRuntime),
             Self::EnvironmentDetails => Some(Self::Environment),
             Self::MotionEvents => Some(Self::Motion),
             Self::MotionDetails => Some(Self::MotionEvents),
@@ -311,7 +316,86 @@ impl ScreenRoute {
                 | Self::CalendarAgenda
                 | Self::ReaderLoading
                 | Self::VoiceNoteRecording
+                | Self::DeviceInfoPower
         )
+    }
+
+    /// Stable code stored in RTC memory and NVS before deep sleep.
+    #[must_use]
+    pub const fn sleep_code(self) -> u8 {
+        self as u8
+    }
+
+    #[must_use]
+    pub const fn from_sleep_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => Self::Home,
+            1 => Self::Reader,
+            2 => Self::Productivity,
+            3 => Self::Games,
+            4 => Self::Tools,
+            5 => Self::Settings,
+            6 => Self::ContinueReading,
+            7 => Self::Library,
+            8 => Self::Bookmarks,
+            9 => Self::ReaderBookmarks,
+            10 => Self::ReaderLoading,
+            11 => Self::ReaderPage,
+            12 => Self::ReaderOptions,
+            13 => Self::ReaderPreferences,
+            14 => Self::ReaderToc,
+            15 => Self::WeRead,
+            16 => Self::WeReadLogin,
+            17 => Self::WeReadBook,
+            18 => Self::WeReadToc,
+            19 => Self::WeReadRead,
+            20 => Self::WeReadNotes,
+            21 => Self::WeReadDownload,
+            22 => Self::Calendar,
+            23 => Self::CalendarAgenda,
+            24 => Self::CalendarEventDetails,
+            25 => Self::CalendarEventEditor,
+            26 => Self::CalendarDeleteConfirmation,
+            27 => Self::VoiceNotes,
+            28 => Self::VoiceNoteDetails,
+            29 => Self::VoiceNoteRecording,
+            30 => Self::Vocab,
+            31 => Self::VocabSession,
+            32 => Self::VocabStats,
+            33 => Self::GamesTbd,
+            34 => Self::LuaApps,
+            35 => Self::LuaGame,
+            36 => Self::LuaGameError,
+            37 => Self::Files,
+            38 => Self::Dictionary,
+            39 => Self::Lexicon,
+            40 => Self::LexiconEntry,
+            41 => Self::LexiconSources,
+            42 => Self::UnitConverter,
+            43 => Self::Alarms,
+            44 => Self::Audio,
+            45 => Self::AudioDetails,
+            46 => Self::Clock,
+            47 => Self::ClockDetails,
+            48 => Self::Display,
+            49 => Self::PowerKeyMenu,
+            50 => Self::DeviceInfo,
+            51 => Self::DeviceInfoBoard,
+            52 => Self::DeviceInfoRuntime,
+            53 => Self::Environment,
+            54 => Self::EnvironmentDetails,
+            55 => Self::Motion,
+            56 => Self::MotionEvents,
+            57 => Self::MotionDetails,
+            58 => Self::Network,
+            59 => Self::NetworkDetails,
+            60 => Self::WifiTransfer,
+            61 => Self::WifiSetup,
+            62 => Self::Weather,
+            63 => Self::WeatherDetails,
+            64 => Self::DeviceInfoPower,
+            _ => return None,
+        })
     }
 }
 
@@ -408,6 +492,23 @@ mod tests {
             Some(ScreenRoute::WeReadBook)
         );
         assert!(ScreenRoute::WeReadRead.is_weread());
+        assert_eq!(
+            ScreenRoute::DeviceInfoPower.parent(),
+            Some(ScreenRoute::DeviceInfoRuntime)
+        );
+        assert_eq!(
+            ScreenRoute::from_sleep_code(ScreenRoute::ReaderPage.sleep_code()),
+            Some(ScreenRoute::ReaderPage)
+        );
+        assert_eq!(
+            ScreenRoute::from_sleep_code(ScreenRoute::WeReadRead.sleep_code()),
+            Some(ScreenRoute::WeReadRead)
+        );
+        assert_eq!(
+            ScreenRoute::from_sleep_code(ScreenRoute::DeviceInfoPower.sleep_code()),
+            Some(ScreenRoute::DeviceInfoPower)
+        );
+        assert_eq!(ScreenRoute::WeReadRead.sleep_code(), 19);
         assert_eq!(ScreenRoute::Vocab.parent(), Some(ScreenRoute::Productivity));
         assert_eq!(ScreenRoute::VocabSession.parent(), Some(ScreenRoute::Vocab));
         assert_eq!(ScreenRoute::VocabStats.parent(), Some(ScreenRoute::Vocab));

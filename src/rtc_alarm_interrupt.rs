@@ -85,6 +85,10 @@ pub mod espidf {
             Self { pin, last_level }
         }
 
+        pub fn pin_mut(&mut self) -> &mut PinDriver<'d, Input> {
+            &mut self.pin
+        }
+
         #[must_use]
         pub fn sample(&mut self) -> RtcAlarmInterruptSample {
             let level = RtcAlarmInterruptLevel::from_gpio_high(self.pin.is_high());

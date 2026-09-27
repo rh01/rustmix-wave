@@ -23,7 +23,7 @@ use crate::{
     panel_refresh::PANEL_PARTIAL_REFRESH_LIMIT,
 };
 
-/// Page 1/3: product firmware and display contract.
+/// Page 1/4: product firmware and display contract.
 pub fn render_device_info(
     display: &mut OrientedFrameBuffer<'_>,
     state: &AppState,
@@ -47,7 +47,7 @@ pub fn render_device_info(
         display,
         state.display,
         StatusRow {
-            left: "PAGE 1/3",
+            left: "PAGE 1/4",
             middle: orientation,
             right: &version,
         },
@@ -69,7 +69,7 @@ pub fn render_device_info(
     Ok(())
 }
 
-/// Page 2/3: onboard services and read-only storage contract.
+/// Page 2/4: onboard services and read-only storage contract.
 pub fn render_device_info_board(
     display: &mut OrientedFrameBuffer<'_>,
     state: &AppState,
@@ -87,7 +87,7 @@ pub fn render_device_info_board(
         display,
         state.display,
         StatusRow {
-            left: "PAGE 2/3",
+            left: "PAGE 2/4",
             middle: "BOARD",
             right: "READ ONLY",
         },
@@ -115,14 +115,13 @@ pub fn render_device_info_board(
     Ok(())
 }
 
-/// Page 3/3: network status and stable hardware ownership.
+/// Page 3/4: network status and stable hardware ownership.
 pub fn render_device_info_runtime(
     display: &mut OrientedFrameBuffer<'_>,
     state: &AppState,
 ) -> Result<(), Infallible> {
     let heading = state.display.heading_style();
     let body = state.display.body_style();
-    let detail = state.display.detail_style();
     let timezone = state.regional.timezone_label_for_rtc(state.board.rtc);
 
     draw_header(display, state.display, "DEVICE INFO", "RUNTIME OWNERSHIP")?;
@@ -130,7 +129,7 @@ pub fn render_device_info_runtime(
         display,
         state.display,
         StatusRow {
-            left: "PAGE 3/3",
+            left: "PAGE 3/4",
             middle: "RUNTIME",
             right: "STABLE",
         },
@@ -154,13 +153,60 @@ pub fn render_device_info_runtime(
     line(display, 538, "Buttons", "UP4 SELECT5 DOWN6", body)?;
     line(display, 578, "Power key", "Short menu / hold sleep", body)?;
     line(display, 618, "RTC alarm", "GPIO45 active-low", body)?;
-    Text::new(
-        "Hold BOOT to return to page 2.",
-        Point::new(22, 680),
-        detail,
-    )
-    .draw(display)?;
-    draw_footer(display, state.display, "HOLD BOOT BACK")?;
+    draw_action(display, 660, "Power", body)?;
+    draw_footer(display, state.display, "SELECT NEXT  HOLD BOOT BACK")?;
+    Ok(())
+}
+
+/// Page 4/4: estimated power state and the AXP2101 battery ADC.
+pub fn render_device_info_power(
+    display: &mut OrientedFrameBuffer<'_>,
+    state: &AppState,
+) -> Result<(), Infallible> {
+    let heading = state.display.heading_style();
+    let body = state.display.body_style();
+    let detail = state.display.detail_style();
+    let power = state.board.power;
+    let battery = crate::power_policy::format_battery(
+        power.and_then(|power| power.battery_voltage_mv),
+        power.and_then(|power| power.battery_percent),
+    );
+    let cpu = format!(
+        "{}-{} MHz DFS",
+        state.power.cpu_min_mhz, state.power.cpu_max_mhz
+    );
+    let sleep = format!(
+        "{} / light {}",
+        state.power.mcu,
+        if state.power.light_sleep { "on" } else { "off" }
+    );
+    let minutes = format!("{} min", state.auto_deep_sleep_minutes);
+    let idle = format!("{} s", state.power.idle_seconds);
+
+    draw_header(display, state.display, "DEVICE INFO", "POWER")?;
+    draw_status_row(
+        display,
+        state.display,
+        StatusRow {
+            left: "PAGE 4/4",
+            middle: "ESTIMATE",
+            right: state.power.estimate,
+        },
+    )?;
+
+    Text::new("Runtime", Point::new(22, 164), heading).draw(display)?;
+    line(display, 212, "CPU", &cpu, body)?;
+    line(display, 252, "MCU", &sleep, body)?;
+    line(display, 292, "Radio", state.power.radio, body)?;
+    line(display, 332, "Panel", state.power.panel, body)?;
+    line(display, 372, "Audio", state.power.audio, body)?;
+    line(display, 412, "SD card", state.power.sd, body)?;
+    line(display, 452, "Bluetooth", state.power.bluetooth, body)?;
+    line(display, 492, "Battery", &battery, body)?;
+    line(display, 532, "Auto sleep", &minutes, body)?;
+    line(display, 572, "Idle", &idle, body)?;
+    Text::new("Estimates, not a meter.", Point::new(22, 640), detail).draw(display)?;
+    draw_footer(display, state.display, "SELECT TIMEOUT  HOLD BOOT BACK")?;
     Ok(())
 }
 
@@ -200,7 +246,10 @@ fn draw_action(
 
 #[cfg(test)]
 mod tests {
-    use super::{render_device_info, render_device_info_board, render_device_info_runtime};
+    use super::{
+        render_device_info, render_device_info_board, render_device_info_power,
+        render_device_info_runtime,
+    };
     use crate::{app::AppState, framebuffer::FrameBuffer, orientation::OrientedFrameBuffer};
 
     #[test]
@@ -211,5 +260,6 @@ mod tests {
         render_device_info(&mut display, &state).unwrap();
         render_device_info_board(&mut display, &state).unwrap();
         render_device_info_runtime(&mut display, &state).unwrap();
+        render_device_info_power(&mut display, &state).unwrap();
     }
 }

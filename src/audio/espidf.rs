@@ -55,6 +55,8 @@ pub struct AudioRuntime<'d, I2C> {
     amplifier: PinDriver<'d, Output>,
     snapshot: AudioSnapshot,
     chime: ChimeGenerator,
+    i2s_enabled: bool,
+    codec_powered: bool,
 }
 
 impl<'d, I2C> AudioRuntime<'d, I2C>
@@ -124,7 +126,7 @@ where
             });
         }
 
-        Ok(Self {
+        let mut runtime = Self {
             bus,
             codec,
             profile,
@@ -136,13 +138,20 @@ where
                 codec_ready: true,
                 i2s_ready: true,
                 amplifier_enabled: false,
+                codec_powered: true,
                 muted: true,
                 volume_percent: DEFAULT_AUDIO_VOLUME_PERCENT,
                 playback_state: AudioPlaybackState::Muted,
                 error: None,
             },
             chime: ChimeGenerator::default(),
-        })
+            i2s_enabled: true,
+            codec_powered: true,
+        };
+        if let Err(error) = runtime.sleep_codec() {
+            log::warn!("rustmix-wave=audio-codec status=power-down-failed error={error:#}");
+        }
+        Ok(runtime)
     }
 
     #[must_use]
@@ -156,12 +165,14 @@ where
     }
 
     pub fn start_alarm_chime(&mut self) -> Result<()> {
+        self.wake_codec()?;
         self.begin_playback(ChimeMode::AlarmRepeat)
     }
 
     pub fn apply_request(&mut self, request: AudioUiRequest) -> Result<&'static str> {
         match request {
             AudioUiRequest::PlayTestChime => {
+                self.wake_codec()?;
                 self.begin_playback(ChimeMode::TestOnce)?;
                 Ok("test-tone-start")
             }
@@ -217,6 +228,7 @@ where
     }
 
     pub fn begin_voice_note_playback(&mut self) -> Result<()> {
+        self.wake_codec()?;
         self.chime.stop();
         self.codec
             .mute(&mut self.bus, false)
@@ -239,6 +251,7 @@ where
         if self.snapshot.playback_state == AudioPlaybackState::RecordingVoiceNote {
             return Err(anyhow!("microphone capture owns the codec"));
         }
+        self.wake_codec()?;
         self.chime.stop();
         self.codec
             .mute(&mut self.bus, false)
@@ -279,6 +292,7 @@ where
     }
 
     pub fn begin_voice_recording(&mut self) -> Result<()> {
+        self.wake_codec()?;
         self.chime.stop();
         self.amplifier
             .set_low()
@@ -297,7 +311,7 @@ where
         self.snapshot.playback_state = AudioPlaybackState::Muted;
         self.snapshot.muted = true;
         self.snapshot.amplifier_enabled = false;
-        Ok(())
+        self.sleep_codec()
     }
 
     pub fn read_voice_pcm_mono(
@@ -347,6 +361,58 @@ where
         self.snapshot.amplifier_enabled = false;
         self.snapshot.muted = true;
         self.snapshot.playback_state = AudioPlaybackState::Muted;
+        self.sleep_codec()
+    }
+
+    fn wake_codec(&mut self) -> Result<()> {
+        self.set_i2s_enabled(true)?;
+        if self.codec_powered {
+            return Ok(());
+        }
+        self.codec
+            .power_up(&mut self.bus)
+            .map_err(|error| anyhow!("failed to power up ES8311: {error:?}"))?;
+        self.codec_powered = true;
+        self.snapshot.codec_powered = true;
+        log::info!("rustmix-wave=audio-codec status=power-up");
+        Ok(())
+    }
+
+    fn sleep_codec(&mut self) -> Result<()> {
+        let _ = self.amplifier.set_low();
+        if self.codec_powered {
+            self.codec
+                .power_down(&mut self.bus)
+                .map_err(|error| anyhow!("failed to power down ES8311: {error:?}"))?;
+            self.codec_powered = false;
+            log::info!("rustmix-wave=audio-codec status=power-down amp=low");
+        }
+        self.snapshot.codec_powered = false;
+        self.snapshot.amplifier_enabled = false;
+        self.set_i2s_enabled(false)?;
+        Ok(())
+    }
+
+    fn set_i2s_enabled(&mut self, enabled: bool) -> Result<()> {
+        if self.i2s_enabled == enabled {
+            return Ok(());
+        }
+        if enabled {
+            self.tx
+                .tx_enable()
+                .map_err(|error| anyhow!("I2S TX enable failed: {error:?}"))?;
+            self.tx
+                .rx_enable()
+                .map_err(|error| anyhow!("I2S RX enable failed: {error:?}"))?;
+        } else {
+            self.tx
+                .tx_disable()
+                .map_err(|error| anyhow!("I2S TX disable failed: {error:?}"))?;
+            self.tx
+                .rx_disable()
+                .map_err(|error| anyhow!("I2S RX disable failed: {error:?}"))?;
+        }
+        self.i2s_enabled = enabled;
         Ok(())
     }
 
@@ -354,6 +420,7 @@ where
         let _ = self.amplifier.set_low();
         let _ = self.codec.mute(&mut self.bus, true);
         self.chime.stop();
+        let _ = self.sleep_codec();
         self.snapshot.amplifier_enabled = false;
         self.snapshot.muted = true;
         self.snapshot.playback_state = AudioPlaybackState::Error;

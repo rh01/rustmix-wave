@@ -21,7 +21,7 @@ use std::{
 
 use crate::{
     buttons::ButtonEvent,
-    epub::{read_epub_title_on_worker, EpubDocument, EpubOpenJob, EpubTocEntry},
+    epub::{EpubDocument, EpubOpenJob, EpubTitleJob, EpubTocEntry},
 };
 
 /// SD-card library owned by the Reader subsystem.
@@ -3124,6 +3124,38 @@ pub struct ReaderUiState {
     pub sd_cjk_faces: Vec<crate::fonts::SdFontFace>,
     epub_page_anchor_limit: usize,
     epub_index_bytes_limit: usize,
+    title_queue: std::collections::VecDeque<LibraryTitleRequest>,
+    title_job: PendingTitleJob,
+    titles_since_redraw: usize,
+}
+
+/// Library titles filled in before the rows are redrawn mid-scan.
+const LIBRARY_TITLE_REDRAW_BATCH: usize = 8;
+
+/// The title read the library is waiting on, with the row it belongs to.
+#[derive(Clone, Default)]
+struct PendingTitleJob(Option<std::rc::Rc<(EpubTitleJob, LibraryTitleRequest)>>);
+
+impl PartialEq for PendingTitleJob {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (None, None) => true,
+            (Some(left), Some(right)) => std::rc::Rc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for PendingTitleJob {}
+
+impl core::fmt::Debug for PendingTitleJob {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(if self.0.is_some() {
+            "PendingTitleJob(running)"
+        } else {
+            "PendingTitleJob(idle)"
+        })
+    }
 }
 
 impl Default for ReaderUiState {
@@ -3158,6 +3190,9 @@ impl Default for ReaderUiState {
             sd_cjk_faces: Vec::new(),
             epub_page_anchor_limit: READER_EPUB_PAGE_ANCHOR_LIMIT,
             epub_index_bytes_limit: READER_EPUB_ANCHOR_INDEX_BYTES_LIMIT,
+            title_queue: std::collections::VecDeque::new(),
+            title_job: PendingTitleJob::default(),
+            titles_since_redraw: 0,
         }
     }
 }
@@ -3297,21 +3332,135 @@ impl ReaderUiState {
         if removed > 0 {
             log::info!("rustmix-wave=epub-legacy-index status=removed count={removed}");
         }
+        self.title_job = PendingTitleJob::default();
+        self.titles_since_redraw = 0;
         match scan_library(
             Path::new(&self.books_root),
             Some(Path::new(&self.state_root)),
         ) {
-            Ok(books) => {
+            Ok((books, titles)) => {
                 self.books = books;
+                self.title_queue = titles.into();
                 self.library_error = None;
             }
             Err(error) => {
                 self.books.clear();
+                self.title_queue.clear();
                 self.library_error = Some(error);
             }
         }
         self.library_selected = 0;
+        self.poll_titles();
         crate::runtime_memory::log_main_stack_high_water("library-refresh");
+    }
+
+    /// True while EPUB titles are still being read for the library.
+    #[must_use]
+    pub fn titles_pending(&self) -> bool {
+        self.title_job.0.is_some() || !self.title_queue.is_empty()
+    }
+
+    /// Advance the library title scan by at most one reply and never wait.
+    /// Rows keep their filenames until a title arrives. Returns true when the
+    /// library should be redrawn: every few titles, and once when the scan
+    /// finishes and the rows are sorted by title.
+    pub fn poll_titles(&mut self) -> bool {
+        let finished = match self.title_job.0.as_deref() {
+            Some((job, request)) => match job.poll() {
+                Some(result) => Some((request.clone(), result)),
+                None => return false,
+            },
+            None => None,
+        };
+        let mut changed = false;
+        if let Some((request, result)) = finished {
+            self.title_job = PendingTitleJob::default();
+            changed = self.apply_title_result(request, result);
+        }
+        while self.title_job.0.is_none() {
+            let Some(request) = self.title_queue.pop_front() else {
+                break;
+            };
+            match EpubTitleJob::start(&request.path) {
+                Ok(job) => {
+                    self.title_job = PendingTitleJob(Some(std::rc::Rc::new((job, request))));
+                }
+                Err(error) => {
+                    log::info!("rustmix-wave=library-title status=deferred error={error}");
+                    self.title_queue.clear();
+                }
+            }
+        }
+        if changed {
+            self.titles_since_redraw = self.titles_since_redraw.saturating_add(1);
+        }
+        let done = !self.titles_pending();
+        if done && self.titles_since_redraw > 0 {
+            self.sort_library_keeping_selection();
+            self.titles_since_redraw = 0;
+            return true;
+        }
+        if self.titles_since_redraw >= LIBRARY_TITLE_REDRAW_BATCH {
+            self.titles_since_redraw = 0;
+            return true;
+        }
+        false
+    }
+
+    fn apply_title_result(
+        &mut self,
+        request: LibraryTitleRequest,
+        result: Result<String, crate::epub::EpubTitleError>,
+    ) -> bool {
+        match result {
+            Ok(title) if !title.trim().is_empty() => {
+                match self.books.iter_mut().find(|book| book.path == request.path) {
+                    Some(book) => {
+                        book.title = title;
+                        true
+                    }
+                    None => false,
+                }
+            }
+            Ok(_) => false,
+            Err(error) if error.is_malformed() => {
+                log::warn!(
+                    "rustmix-wave=library-title status=blacklisted path={} error={error}",
+                    request.path
+                );
+                remember_title_failure(Some(Path::new(&self.state_root)), request.key);
+                false
+            }
+            Err(error) => {
+                log::info!(
+                    "rustmix-wave=library-title status=deferred path={} error={error}",
+                    request.path
+                );
+                if error.is_timeout() {
+                    // The worker is still busy with that file; the rest of
+                    // this scan keeps filenames instead of queueing behind it.
+                    self.title_queue.clear();
+                }
+                false
+            }
+        }
+    }
+
+    fn sort_library_keeping_selection(&mut self) {
+        let selected_path = matches!(
+            self.library_tab,
+            ReaderLibraryTab::Books | ReaderLibraryTab::Files
+        )
+        .then(|| self.library_selected.checked_sub(1))
+        .flatten()
+        .and_then(|index| self.books.get(index))
+        .map(|book| book.path.clone());
+        sort_library(&mut self.books);
+        if let Some(path) = selected_path {
+            if let Some(index) = self.books.iter().position(|book| book.path == path) {
+                self.library_selected = index + 1;
+            }
+        }
     }
 
     #[must_use]
@@ -4758,8 +4907,9 @@ impl ReaderUiState {
 
 /// Scan one bounded Reader library. TXT and EPUB/EPU rows open through the
 /// shared staged Reader architecture.
+/// EPUB rows carry their filename; [`ReaderUiState`] reads OPF titles later.
 pub fn scan_txt_library(root: impl AsRef<Path>) -> Result<Vec<ReaderBook>, String> {
-    scan_library(root.as_ref(), None)
+    scan_library(root.as_ref(), None).map(|(books, _titles)| books)
 }
 
 const TITLE_FAILURE_FILE: &str = "BADTITLE.TXT";
@@ -4873,12 +5023,21 @@ fn starts_with_zip_local_header(path: &Path) -> bool {
     file.read_exact(&mut magic).is_ok() && magic == *b"PK\x03\x04"
 }
 
-fn scan_library(root: &Path, state_root: Option<&Path>) -> Result<Vec<ReaderBook>, String> {
+/// An EPUB whose OPF title has not been read yet. The row shows its filename
+/// until [`ReaderUiState::poll_titles`] fills the title in.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LibraryTitleRequest {
+    pub path: String,
+    key: String,
+}
+
+fn scan_library(
+    root: &Path,
+    state_root: Option<&Path>,
+) -> Result<(Vec<ReaderBook>, Vec<LibraryTitleRequest>), String> {
     merge_title_failures(state_root);
-    // After one title times out the worker is still busy with it; the rest of
-    // this scan uses filenames instead of waiting behind it.
-    let mut titles_deferred = false;
     let mut books = Vec::new();
+    let mut titles = Vec::new();
     let entries =
         fs::read_dir(root).map_err(|error| format!("Books folder unavailable: {error}"))?;
     for entry in entries.flatten() {
@@ -4905,45 +5064,24 @@ fn scan_library(root: &Path, state_root: Option<&Path>) -> Result<Vec<ReaderBook
             .and_then(|meta| meta.modified().ok())
             .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
             .map_or(0, |duration| duration.as_secs());
-        let fallback_title = path
+        let title = path
             .file_stem()
             .and_then(|value| value.to_str())
             .unwrap_or("Untitled book")
             .to_string();
-        let title = if format == BookFormat::Epub {
-            // One bounded metadata read per book. The reply arrives on a
-            // channel; a dead title worker cannot panic this task.
+        let book_path = path.to_string_lossy().into_owned();
+        if format == BookFormat::Epub {
             pause_between_library_books();
             let key = title_failure_key(&path, size_bytes, modified_seconds);
-            if titles_deferred || title_failure_known(&key) {
-                fallback_title
-            } else {
-                match read_epub_title_on_worker(&path) {
-                    Ok(title) if !title.trim().is_empty() => title,
-                    Ok(_) => fallback_title,
-                    Err(error) if error.is_malformed() => {
-                        log::warn!(
-                            "rustmix-wave=library-title status=blacklisted path={} error={error}",
-                            path.display()
-                        );
-                        remember_title_failure(state_root, key);
-                        fallback_title
-                    }
-                    Err(error) => {
-                        log::info!(
-                            "rustmix-wave=library-title status=deferred path={} error={error}",
-                            path.display()
-                        );
-                        titles_deferred |= error.is_timeout();
-                        fallback_title
-                    }
-                }
+            if !title_failure_known(&key) {
+                titles.push(LibraryTitleRequest {
+                    path: book_path.clone(),
+                    key,
+                });
             }
-        } else {
-            fallback_title
-        };
+        }
         books.push(ReaderBook {
-            path: path.to_string_lossy().into_owned(),
+            path: book_path,
             title,
             format,
             size_bytes,
@@ -4953,8 +5091,12 @@ fn scan_library(root: &Path, state_root: Option<&Path>) -> Result<Vec<ReaderBook
             break;
         }
     }
+    sort_library(&mut books);
+    Ok((books, titles))
+}
+
+fn sort_library(books: &mut [ReaderBook]) {
     books.sort_by(|left, right| left.title.to_lowercase().cmp(&right.title.to_lowercase()));
-    Ok(books)
 }
 
 #[must_use]
@@ -6750,12 +6892,20 @@ mod tests {
         reader.refresh_library();
         assert!(!legacy.exists());
         assert!(cache.join("KEEPME.CCH").is_file());
+        let filenames: Vec<_> = reader.books.iter().map(|book| book.title.clone()).collect();
+        assert_eq!(filenames, vec!["one", "two"], "rows show filenames first");
+        reader.library_selected = 2;
+        drain_library_titles(&mut reader);
         let titles: Vec<_> = reader
             .books
             .iter()
             .map(|book| book.title.as_str())
             .collect();
         assert_eq!(titles, vec!["Alpha", "Beta"]);
+        assert_eq!(
+            reader.library_selected, 2,
+            "the selected row follows its book"
+        );
         assert!(super::LIBRARY_SCAN_PAUSES.with(|count| count.get()) >= 2);
         let _ = fs::remove_dir_all(books);
         let _ = fs::remove_dir_all(state);
@@ -6799,7 +6949,9 @@ mod tests {
             state.to_string_lossy().into_owned(),
         );
         reader.refresh_library();
+        drain_library_titles(&mut reader);
         reader.refresh_library();
+        drain_library_titles(&mut reader);
         let titles: Vec<_> = reader
             .books
             .iter()
@@ -6829,6 +6981,7 @@ mod tests {
             "{blacklist}"
         );
         reader.refresh_library_retrying_titles();
+        drain_library_titles(&mut reader);
         assert_eq!(
             hits(),
             before + 2,
@@ -6965,6 +7118,15 @@ mod tests {
         ]);
         fs::write(&path, bytes).unwrap();
         path
+    }
+
+    fn drain_library_titles(reader: &mut ReaderUiState) {
+        let started = std::time::Instant::now();
+        while reader.titles_pending() {
+            reader.poll_titles();
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     fn open_until_ready(reader: &mut ReaderUiState) {

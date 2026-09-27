@@ -420,25 +420,62 @@ fn title_error_is_transient(message: &str) -> bool {
         || (message.starts_with("EPUB read failed") && !message.contains("fill whole buffer"))
 }
 
-/// Read only the OPF title on the long-lived worker. A late reply, a stopped
-/// worker, or an SD read error is [`EpubTitleError::Unavailable`]; a bad
-/// archive or a parser panic is [`EpubTitleError::Malformed`].
-pub fn read_epub_title_on_worker(path: impl AsRef<Path>) -> Result<String, EpubTitleError> {
-    let inbox = queue_epub_job(EpubJob::Title(path.as_ref().to_path_buf()))
-        .map_err(EpubTitleError::Unavailable)?;
-    match inbox.recv_timeout(EPUB_TITLE_TIMEOUT) {
-        Ok(EpubReply::Title(Ok(title))) => Ok(title),
-        Ok(EpubReply::Title(Err(message))) if title_error_is_transient(&message) => {
+fn classify_title_reply(reply: EpubReply) -> Result<String, EpubTitleError> {
+    match reply {
+        EpubReply::Title(Ok(title)) => Ok(title),
+        EpubReply::Title(Err(message)) if title_error_is_transient(&message) => {
             Err(EpubTitleError::Unavailable(message))
         }
-        Ok(EpubReply::Title(Err(message))) => Err(EpubTitleError::Malformed(message)),
-        Ok(EpubReply::Open(_)) => Err(EpubTitleError::Unavailable(
+        EpubReply::Title(Err(message)) => Err(EpubTitleError::Malformed(message)),
+        EpubReply::Open(_) => Err(EpubTitleError::Unavailable(
             "EPUB worker returned an unexpected result".into(),
         )),
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(EpubTitleError::TimedOut),
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            Err(EpubTitleError::Unavailable("EPUB worker stopped".into()))
+    }
+}
+
+/// One OPF title read running on the EPUB worker. The library polls it so the
+/// main task never waits for a title, including at boot.
+pub struct EpubTitleJob {
+    inbox: mpsc::Receiver<EpubReply>,
+    started: std::time::Instant,
+}
+
+impl EpubTitleJob {
+    pub fn start(path: impl AsRef<Path>) -> Result<Self, EpubTitleError> {
+        Ok(Self {
+            inbox: queue_epub_job(EpubJob::Title(path.as_ref().to_path_buf()))
+                .map_err(EpubTitleError::Unavailable)?,
+            started: std::time::Instant::now(),
+        })
+    }
+
+    /// `None` while the read is still running. A late reply is
+    /// [`EpubTitleError::TimedOut`]; a bad archive or parser panic is
+    /// [`EpubTitleError::Malformed`]; SD errors are
+    /// [`EpubTitleError::Unavailable`].
+    pub fn poll(&self) -> Option<Result<String, EpubTitleError>> {
+        match self.inbox.try_recv() {
+            Ok(reply) => Some(classify_title_reply(reply)),
+            Err(mpsc::TryRecvError::Disconnected) => Some(Err(EpubTitleError::Unavailable(
+                "EPUB worker stopped".into(),
+            ))),
+            Err(mpsc::TryRecvError::Empty) if self.started.elapsed() >= EPUB_TITLE_TIMEOUT => {
+                Some(Err(EpubTitleError::TimedOut))
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
         }
+    }
+}
+
+/// Read one title and wait. Tests use this; the library polls
+/// [`EpubTitleJob`].
+pub fn read_epub_title_on_worker(path: impl AsRef<Path>) -> Result<String, EpubTitleError> {
+    let job = EpubTitleJob::start(path)?;
+    loop {
+        if let Some(result) = job.poll() {
+            return result;
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 

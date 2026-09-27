@@ -1492,7 +1492,7 @@ mod firmware {
                     }
                     ReaderTickOutcome::BackgroundCacheAdvanced => {
                         if let Some(session) = state.reader.session.as_ref() {
-                            info!("rustmix-wave=reader-background-cache indexed-percent={} pages={} complete={}", session.progress_percent(), session.page_offsets.len(), session.index_complete);
+                            info!("rustmix-wave=reader-background-cache indexed-percent={} pages={} complete={} truncated={}", session.progress_percent(), session.indexed_page_count(), session.index_complete, session.index_truncated);
                         }
                     }
                     ReaderTickOutcome::Failed => {

@@ -890,6 +890,7 @@ mod tests {
                 chapter_number: 4,
                 page_number: 3,
                 page_count: 12,
+                approximate: false,
             }),
         };
         let reader = crate::reader::ReaderUiState::default();

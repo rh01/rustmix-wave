@@ -101,7 +101,8 @@ pub fn render_library(
     let heading = state.display.heading_style();
     let detail = state.display.detail_style();
     draw_header(display, state.display, "LIBRARY", "TXT / REFLOWABLE EPUB")?;
-    let status = library_status(reader.library_tab, reader.visible_entries().len());
+    let visible = reader.visible_entries();
+    let status = library_status(reader.library_tab, visible.len());
     draw_status_row(
         display,
         state.display,
@@ -123,7 +124,6 @@ pub fn render_library(
         "SELECT",
         "TABS",
     )?;
-    let visible = reader.visible_entries();
     if visible.is_empty() {
         let message = reader
             .library_error
@@ -1150,6 +1150,7 @@ mod tests {
             encoding: None,
             epub_document: None,
             resume: None,
+            epub_open: Default::default(),
             message: "Preparing".into(),
         });
         render_loading(&mut display, &state).unwrap();

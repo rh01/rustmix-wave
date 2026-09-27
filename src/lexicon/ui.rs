@@ -13,8 +13,9 @@ use crate::{
             EntryRecord, FIELD_DEF_EN, FIELD_DEF_ZH, FIELD_EXAMPLE, FIELD_HEADWORD, FIELD_PHONETIC,
             FIELD_POS, FIELD_READING,
         },
-        load_index, lookup_exact, lookup_prefix, normalize_key, read_entry, LexiconIndex,
-        LEXICON_ROOT,
+        lookup_exact, lookup_prefix, normalize_key, read_entry,
+        store::poll_index,
+        LexiconIndex, LEXICON_ROOT,
     },
 };
 
@@ -122,6 +123,8 @@ pub struct LexiconUiState {
     pub index: Option<LexiconIndex>,
     /// True when the open entry has a clip. False shows no audio mark.
     pub pronounce_ready: bool,
+    /// Lookup waiting for a large page index to load: `Some(prefix_only)`.
+    pub pending_lookup: Option<bool>,
 }
 
 impl Default for LexiconUiState {
@@ -141,6 +144,7 @@ impl Default for LexiconUiState {
             message: "No lexicon on SD".into(),
             index: None,
             pronounce_ready: false,
+            pending_lookup: None,
         }
     }
 }
@@ -303,6 +307,7 @@ impl LexiconUiState {
         }
         self.dict_index = (self.dict_index + 1) % self.dicts.len();
         self.index = None;
+        self.pending_lookup = None;
         self.clear_hits(&format!("Dictionary {}", self.dicts[self.dict_index].id));
     }
 
@@ -327,7 +332,13 @@ impl LexiconUiState {
         };
         let path = dict.lex_path.clone();
         let dict_id = dict.id.clone();
-        self.ensure_index(Path::new(&path))?;
+        if !self.ensure_index(Path::new(&path))? {
+            self.pending_lookup = Some(prefix_only);
+            self.hits.clear();
+            self.focus = InputFocus::Keyboard;
+            self.message = "Opening dictionary...".into();
+            return Ok(());
+        }
         let index = self.index.as_ref().expect("index loaded");
         let mut file = File::open(&path)?;
         let key = normalize_key(&self.query);
@@ -368,17 +379,52 @@ impl LexiconUiState {
         Ok(())
     }
 
-    fn ensure_index(&mut self, path: &Path) -> Result<()> {
+    /// `Ok(false)` while a large index is still loading on its worker.
+    fn ensure_index(&mut self, path: &Path) -> Result<bool> {
         let display = path.display().to_string();
         if self
             .index
             .as_ref()
             .is_some_and(|index| index.path == display)
         {
-            return Ok(());
+            return Ok(true);
         }
-        self.index = Some(load_index(path)?);
-        Ok(())
+        match poll_index(path)? {
+            Some(index) => {
+                self.index = Some(index);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Resume a lookup that was waiting for its page index. Returns true when
+    /// the screen changed.
+    pub fn tick(&mut self) -> bool {
+        let Some(prefix_only) = self.pending_lookup else {
+            return false;
+        };
+        let Some(path) = self
+            .dicts
+            .get(self.dict_index)
+            .map(|dict| dict.lex_path.clone())
+        else {
+            self.pending_lookup = None;
+            return false;
+        };
+        match self.ensure_index(Path::new(&path)) {
+            Ok(false) => false,
+            Ok(true) => {
+                self.pending_lookup = None;
+                self.run_lookup(prefix_only);
+                true
+            }
+            Err(error) => {
+                self.pending_lookup = None;
+                self.message = compact(&error.to_string());
+                true
+            }
+        }
     }
 
     fn load_selected_entry(&mut self) -> Result<()> {
@@ -392,7 +438,9 @@ impl LexiconUiState {
             .ok_or_else(|| anyhow::anyhow!("no hit"))?;
         let path = dict.lex_path.clone();
         let dict_id = dict.id.clone();
-        self.ensure_index(Path::new(&path))?;
+        if !self.ensure_index(Path::new(&path))? {
+            anyhow::bail!("dictionary is still opening");
+        }
         let index = self.index.as_ref().expect("index");
         let mut file = File::open(&path)?;
         let entry = read_entry(&mut file, &index.header, hit.entry_id)?;

@@ -4,6 +4,8 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::Path,
+    sync::Mutex,
+    time::{Duration, Instant},
 };
 
 use anyhow::{bail, Result};
@@ -12,7 +14,7 @@ use super::format::{
     parse_entry, parse_header, parse_key_page, parse_page_index, EntryRecord, Header, KeyRecord,
     PageIndexEntry, PAGE_SIZE,
 };
-use crate::runtime_worker::{run_named_worker, NamedWorkerError};
+use crate::runtime_worker::{NamedWorkerError, NamedWorkerHandle};
 
 /// Open dictionaries whose page index exceeds this on a 32 KiB worker stack.
 pub const PAGE_INDEX_WORKER_THRESHOLD: usize = 64 * 1024;
@@ -57,21 +59,71 @@ impl<R: Read + Seek> LexiconStore<R> {
     }
 }
 
+/// Longest a large page-index load may run before the lookup reports an error.
+const INDEX_LOAD_LIMIT: Duration = Duration::from_secs(60);
+
+type IndexJob = NamedWorkerHandle<LexiconIndex, String>;
+
+fn pending_index() -> &'static Mutex<Option<(String, IndexJob, Instant)>> {
+    static PENDING: Mutex<Option<(String, IndexJob, Instant)>> = Mutex::new(None);
+    &PENDING
+}
+
+fn spawn_index_job(path: &Path) -> Result<IndexJob> {
+    let path_buf = path.to_path_buf();
+    NamedWorkerHandle::spawn("lexicon-open", WORKER_STACK, move || {
+        let mut file = File::open(&path_buf).map_err(|err| err.to_string())?;
+        read_index(&mut file, path_buf.display().to_string()).map_err(|err| err.to_string())
+    })
+    .map_err(|error| anyhow::anyhow!("lexicon worker start failed: {error}"))
+}
+
+/// Load a page index and wait. Large indexes are read on a worker thread.
 pub fn load_index(path: &Path) -> Result<LexiconIndex> {
     let mut file = File::open(path)?;
     let header = read_header_only(&mut file)?;
     if header.pidx_len as usize > PAGE_INDEX_WORKER_THRESHOLD {
-        let path_buf = path.to_path_buf();
-        return match run_named_worker("lexicon-open", WORKER_STACK, move || {
-            let mut file = File::open(&path_buf).map_err(|err| err.to_string())?;
-            read_index(&mut file, path_buf.display().to_string()).map_err(|err| err.to_string())
-        }) {
+        return match spawn_index_job(path)?.join() {
             Ok(index) => Ok(index),
             Err(NamedWorkerError::Operation(error)) => bail!(error),
             Err(error) => bail!("{error}"),
         };
     }
     read_index(&mut file, path.display().to_string())
+}
+
+/// Load a page index without blocking the main loop. `Ok(None)` means a large
+/// index is still loading on its worker; call again on a later pass.
+pub fn poll_index(path: &Path) -> Result<Option<LexiconIndex>> {
+    let display = path.display().to_string();
+    let mut pending = pending_index()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((pending_path, job, started)) = pending.as_mut() {
+        if *pending_path == display {
+            let finished = match job.try_join() {
+                Some(result) => result,
+                None if started.elapsed() >= INDEX_LOAD_LIMIT => Err(NamedWorkerError::Operation(
+                    "dictionary index took too long".into(),
+                )),
+                None => return Ok(None),
+            };
+            *pending = None;
+            return match finished {
+                Ok(index) => Ok(Some(index)),
+                Err(NamedWorkerError::Operation(error)) => bail!(error),
+                Err(error) => bail!("{error}"),
+            };
+        }
+    }
+    let mut file = File::open(path)?;
+    let header = read_header_only(&mut file)?;
+    if header.pidx_len as usize <= PAGE_INDEX_WORKER_THRESHOLD {
+        *pending = None;
+        return read_index(&mut file, display).map(Some);
+    }
+    *pending = Some((display, spawn_index_job(path)?, Instant::now()));
+    Ok(None)
 }
 
 pub fn lookup_exact<R: Read + Seek>(
@@ -278,6 +330,7 @@ mod tests {
         let index = load_index(&path).unwrap();
         assert_eq!(index.header.entry_count, 6);
         assert!(index.header.pidx_len < super::PAGE_INDEX_WORKER_THRESHOLD as u32);
+        assert_eq!(super::poll_index(&path).unwrap(), Some(index));
     }
 
     #[test]

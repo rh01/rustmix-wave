@@ -20,7 +20,10 @@ opt-level = "z"
 codegen-units = 1
 lto = true
 opt-level = "s"
-strip = true
+# Line tables stay in the ELF for backtraces. They are not a loadable
+# segment, so the flashed image does not grow.
+strip = false
+debug = 1
 
 [dependencies]
 anyhow = "1"

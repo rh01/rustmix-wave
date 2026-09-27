@@ -668,7 +668,7 @@ pub mod espidf {
     };
 
     use crate::{
-        runtime_worker::{run_named_worker, NamedWorkerError},
+        runtime_worker::{NamedWorkerError, NamedWorkerHandle},
         weather::{
             parse_open_meteo_response, WeatherData, WeatherFetchError, MAX_WEATHER_RESPONSE_BYTES,
             WEATHER_HTTP_TIMEOUT_SECONDS,
@@ -681,23 +681,33 @@ pub mod espidf {
     /// deliberately small orchestration stack.
     pub const WEATHER_FETCH_WORKER_STACK_BYTES: usize = 64 * 1024;
 
-    /// Fetch one bounded HTTPS payload on a short-lived dedicated worker. The
-    /// main-loop retry policy remains synchronous and deterministic, while TLS
-    /// certificate validation, response reads and JSON parsing receive an
-    /// explicit stack budget independent from the firmware main task.
-    pub fn fetch_open_meteo_on_worker(
+    /// A weather fetch running on its own thread. The main loop polls it.
+    pub type WeatherFetchJob = NamedWorkerHandle<WeatherData, WeatherFetchError>;
+
+    /// Start one bounded HTTPS fetch on a short-lived worker and return at
+    /// once. TLS, the response read, and JSON parsing get an explicit stack
+    /// budget and never run on the main task.
+    pub fn start_open_meteo_fetch(
         config: &WeatherConfig,
-    ) -> Result<WeatherData, WeatherFetchError> {
+    ) -> Result<WeatherFetchJob, WeatherFetchError> {
         let config = config.clone();
         log::info!(
             "rustmix-wave=weather-fetch-worker status=starting stack-bytes={}",
             WEATHER_FETCH_WORKER_STACK_BYTES
         );
-        let result = match run_named_worker(
+        NamedWorkerHandle::spawn(
             "weather-fetch",
             WEATHER_FETCH_WORKER_STACK_BYTES,
             move || fetch_open_meteo(&config),
-        ) {
+        )
+        .map_err(|error| WeatherFetchError::Transport(format!("weather fetch worker {error}")))
+    }
+
+    /// Turn a finished worker result into the fetch outcome and log it.
+    pub fn finish_open_meteo_fetch(
+        result: Result<WeatherData, NamedWorkerError<WeatherFetchError>>,
+    ) -> Result<WeatherData, WeatherFetchError> {
+        let result = match result {
             Ok(data) => Ok(data),
             Err(NamedWorkerError::Operation(error)) => Err(error),
             Err(error) => {
@@ -748,7 +758,7 @@ pub mod espidf {
         if status != 200 {
             return Err(WeatherFetchError::HttpStatus(status));
         }
-        let mut body = [0_u8; MAX_WEATHER_RESPONSE_BYTES];
+        let mut body = vec![0_u8; MAX_WEATHER_RESPONSE_BYTES];
         let bytes_read = io::try_read_full(&mut response, &mut body).map_err(|error| {
             WeatherFetchError::Transport(format!("ESP HTTP response read failed: {}", error.0))
         })?;

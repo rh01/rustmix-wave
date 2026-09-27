@@ -139,7 +139,7 @@ unsafe fn get_str(handle: esp_idf_svc::sys::nvs_handle_t, key: &str) -> Option<S
 
     let key = CString::new(key).ok()?;
     // Xtensa `c_char` is unsigned. A byte buffer casts cleanly on this target.
-    let mut buf = [0u8; 520];
+    let mut buf = vec![0u8; 520];
     let mut len = buf.len();
     if nvs_get_str(handle, key.as_ptr(), buf.as_mut_ptr().cast(), &mut len) != ESP_OK || len == 0 {
         return None;

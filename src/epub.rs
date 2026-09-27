@@ -12,7 +12,15 @@
 //! NCX records become a compact table of contents. Images, CSS layout and
 //! interactive links remain deferred.
 
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs::{self, File},
+    io::{Read, Seek, SeekFrom},
+    panic::AssertUnwindSafe,
+    path::{Path, PathBuf},
+    sync::{mpsc, Mutex},
+    time::Duration,
+};
 
 use miniz_oxide::inflate::decompress_to_vec;
 
@@ -32,12 +40,15 @@ pub const EPUB_MANIFEST_LIMIT: usize = 256;
 pub const EPUB_SPINE_LIMIT: usize = 128;
 /// Maximum TOC records rendered by the Reader UI.
 pub const EPUB_TOC_LIMIT: usize = 128;
-/// Dedicated parser-worker stack budget. Real EPUB DEFLATE and XHTML work
-/// must not run on the 16 KB firmware main task.
+/// Stack of the one EPUB worker that runs both title scans and full opens.
+/// Full opens need 64 KiB for DEFLATE and XHTML flattening. The thread exits
+/// when idle, so this internal RAM is held only while EPUB work is queued.
 pub const EPUB_PARSER_WORKER_STACK_BYTES: usize = 64 * 1024;
-/// Lightweight OPF-title worker stack budget. Library scans only read bounded
-/// ZIP metadata and must not reserve the full parser stack for each title.
-pub const EPUB_TITLE_WORKER_STACK_BYTES: usize = 32 * 1024;
+/// Largest container.xml or OPF member a library title scan will inflate.
+/// The rest of a novel stays on the SD card.
+pub const EPUB_TITLE_MEMBER_LIMIT: usize = 256 * 1024;
+/// ZIP end-of-central-directory comment plus the 22-byte record.
+const ZIP_EOCD_SCAN_BYTES: u64 = 65_557;
 
 /// One reflowable EPUB TOC destination. `text_offset` is an offset into the
 /// flattened UTF-8 text buffer retained by [`EpubDocument`].
@@ -126,44 +137,7 @@ impl ZipArchive {
         if central_end > bytes.len() {
             return Err("EPUB ZIP directory exceeds archive".into());
         }
-        let mut entries = Vec::new();
-        let mut cursor = central_offset;
-        for _ in 0..entry_count {
-            if read_u32(&bytes, cursor)? != 0x0201_4B50 {
-                return Err("EPUB ZIP central record signature mismatch".into());
-            }
-            let flags = read_u16(&bytes, cursor + 8)?;
-            let method = read_u16(&bytes, cursor + 10)?;
-            let compressed_size = read_u32(&bytes, cursor + 20)? as usize;
-            let uncompressed_size = read_u32(&bytes, cursor + 24)? as usize;
-            let name_len = read_u16(&bytes, cursor + 28)? as usize;
-            let extra_len = read_u16(&bytes, cursor + 30)? as usize;
-            let comment_len = read_u16(&bytes, cursor + 32)? as usize;
-            let local_header_offset = read_u32(&bytes, cursor + 42)? as usize;
-            let name_start = cursor + 46;
-            let name_end = name_start
-                .checked_add(name_len)
-                .ok_or_else(|| "EPUB ZIP filename overflow".to_string())?;
-            if name_end > central_end {
-                return Err("EPUB ZIP filename exceeds directory".into());
-            }
-            let name = String::from_utf8_lossy(&bytes[name_start..name_end]).replace('\\', "/");
-            entries.push(ZipEntry {
-                name,
-                flags,
-                method,
-                compressed_size,
-                uncompressed_size,
-                local_header_offset,
-            });
-            cursor = name_end
-                .checked_add(extra_len)
-                .and_then(|value| value.checked_add(comment_len))
-                .ok_or_else(|| "EPUB ZIP central record overflow".to_string())?;
-            if cursor > central_end {
-                return Err("EPUB ZIP central record exceeds directory".into());
-            }
-        }
+        let entries = parse_central_directory(&bytes[central_offset..central_end], entry_count)?;
         Ok(Self { bytes, entries })
     }
 
@@ -247,63 +221,276 @@ struct ManifestItem {
     properties: String,
 }
 
-/// Parse one EPUB on a short-lived dedicated worker stack. The Reader keeps
-/// its existing synchronous staged-loading contract, while archive parsing,
-/// DEFLATE expansion and XHTML flattening no longer consume the firmware main
-/// task's 16 KB stack budget.
-pub fn open_epub_on_worker(path: impl AsRef<Path>) -> Result<EpubDocument, String> {
-    let path = path.as_ref().to_path_buf();
-    log::info!(
-        "rustmix-wave=epub-parser-worker status=starting stack-bytes={}",
-        EPUB_PARSER_WORKER_STACK_BYTES
-    );
-    let worker = std::thread::Builder::new()
-        .name("epub-parser".into())
-        .stack_size(EPUB_PARSER_WORKER_STACK_BYTES)
-        .spawn(move || open_epub(path))
-        .map_err(|error| {
-            let message = format!("EPUB parser worker start failed: {error}");
-            log::warn!("rustmix-wave=epub-parser-worker status=start-failed error={message}");
-            message
-        })?;
-    let result = worker.join().map_err(|_| {
-        let message = "EPUB parser worker panicked".to_string();
-        log::warn!("rustmix-wave=epub-parser-worker status=panicked");
-        message
-    })?;
-    match &result {
-        Ok(document) => log::info!(
-            "rustmix-wave=epub-parser-worker status=completed spine-items={} toc-entries={} text-bytes={}",
-            document.spine_count,
-            document.toc.len(),
-            document.text_size_bytes()
-        ),
-        Err(error) => log::warn!("rustmix-wave=epub-parser-worker status=failed error={error}"),
+/// One internal-RAM thread for EPUB title scans and opens.
+///
+/// `JoinHandle::join` is never called. On ESP-IDF an aborted child never stores
+/// its result, and `std` then hits `expect("threads should not terminate
+/// unexpectedly")` in the caller — which is the firmware main task. A missing
+/// or late reply is a normal error. The stack stays in internal RAM: this
+/// thread reads the SD card, and a PSRAM stack cannot call FATFS.
+///
+/// The thread is never replaced while it is alive, so a late job cannot run
+/// beside a new one. It exits after [`EPUB_WORKER_IDLE_EXIT`] with nothing
+/// queued, which returns its 64 KiB stack to the internal heap.
+const EPUB_TITLE_TIMEOUT: Duration = Duration::from_secs(8);
+/// An open is polled from the Reader tick. Past this the Reader shows an
+/// error; the parse keeps running and later jobs queue behind it.
+pub const EPUB_OPEN_TIMEOUT: Duration = Duration::from_secs(120);
+const EPUB_WORKER_IDLE_EXIT: Duration = Duration::from_secs(5);
+
+type EpubWorker = crate::runtime_worker::LongLivedWorker<EpubJob, EpubReply>;
+
+enum EpubJob {
+    Title(PathBuf),
+    Open(PathBuf),
+    #[cfg(test)]
+    Panic,
+}
+
+enum EpubReply {
+    Title(Result<String, String>),
+    Open(Result<EpubDocument, String>),
+}
+
+/// Why a title could not be read. Only [`EpubTitleError::Malformed`] means the
+/// file itself is bad; the other cases are retried on the next scan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EpubTitleError {
+    Malformed(String),
+    Unavailable(String),
+    TimedOut,
+}
+
+impl EpubTitleError {
+    #[must_use]
+    pub fn is_malformed(&self) -> bool {
+        matches!(self, Self::Malformed(_))
     }
-    result
+
+    #[must_use]
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Self::TimedOut)
+    }
 }
 
-/// Read only the OPF title on a lightweight bounded worker stack. Library scans
-/// remain safe on the firmware main task and fall back to the FAT filename when
-/// metadata cannot be read.
-pub fn read_epub_title_on_worker(path: impl AsRef<Path>) -> Result<String, String> {
-    let path = path.as_ref().to_path_buf();
-    let worker = std::thread::Builder::new()
-        .name("epub-title".into())
-        .stack_size(EPUB_TITLE_WORKER_STACK_BYTES)
-        .spawn(move || read_epub_title(path))
-        .map_err(|error| format!("EPUB title worker start failed: {error}"))?;
-    worker
-        .join()
-        .map_err(|_| "EPUB title worker panicked".to_string())?
+impl core::fmt::Display for EpubTitleError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Malformed(message) | Self::Unavailable(message) => formatter.write_str(message),
+            Self::TimedOut => formatter.write_str("EPUB worker timed out"),
+        }
+    }
 }
 
-/// Read one OPF metadata title without flattening the spine.
+#[cfg(test)]
+pub(crate) static TITLE_WORKER_PATHS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn epub_worker_slot() -> &'static Mutex<Option<EpubWorker>> {
+    static SLOT: Mutex<Option<EpubWorker>> = Mutex::new(None);
+    &SLOT
+}
+
+fn epub_worker() -> Result<EpubWorker, String> {
+    let mut slot = epub_worker_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(worker) = slot.as_ref() {
+        if worker.is_alive() {
+            return Ok(worker.clone());
+        }
+    }
+    log::info!(
+        "rustmix-wave=epub-worker status=starting stack-bytes={EPUB_PARSER_WORKER_STACK_BYTES}"
+    );
+    let worker = crate::runtime_worker::LongLivedWorker::spawn_with_idle_exit(
+        "epub-worker",
+        EPUB_PARSER_WORKER_STACK_BYTES,
+        Some(EPUB_WORKER_IDLE_EXIT),
+        handle_epub_job,
+    )
+    .map_err(|error| format!("EPUB worker start failed: {error}"))?;
+    *slot = Some(worker.clone());
+    Ok(worker)
+}
+
+fn handle_epub_job(job: EpubJob) -> EpubReply {
+    let opened = matches!(job, EpubJob::Open(_));
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| match job {
+        EpubJob::Title(path) => {
+            #[cfg(test)]
+            TITLE_WORKER_PATHS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(path.display().to_string());
+            EpubReply::Title(read_epub_title(&path))
+        }
+        EpubJob::Open(path) => {
+            log::info!(
+                "rustmix-wave=epub-parser-worker status=starting stack-bytes={EPUB_PARSER_WORKER_STACK_BYTES}"
+            );
+            let result = open_epub(&path);
+            match &result {
+                Ok(document) => log::info!(
+                    "rustmix-wave=epub-parser-worker status=completed spine-items={} toc-entries={} text-bytes={}",
+                    document.spine_count,
+                    document.toc.len(),
+                    document.text_size_bytes()
+                ),
+                Err(error) => {
+                    log::warn!("rustmix-wave=epub-parser-worker status=failed error={error}")
+                }
+            }
+            EpubReply::Open(result)
+        }
+        #[cfg(test)]
+        EpubJob::Panic => panic!("epub title worker test panic"),
+    }));
+    match result {
+        Ok(reply) => reply,
+        Err(_) => {
+            log::warn!("rustmix-wave=epub-worker status=panicked");
+            if opened {
+                EpubReply::Open(Err("EPUB worker panicked".into()))
+            } else {
+                EpubReply::Title(Err("EPUB worker panicked".into()))
+            }
+        }
+    }
+}
+
+/// Queue a job. A thread that exited between jobs is replaced once; a live
+/// thread is always reused.
+fn queue_epub_job(mut job: EpubJob) -> Result<mpsc::Receiver<EpubReply>, String> {
+    for _ in 0..2 {
+        match epub_worker()?.submit(job) {
+            Ok(inbox) => return Ok(inbox),
+            Err(returned) => job = returned,
+        }
+    }
+    Err("EPUB worker stopped".into())
+}
+
+/// An EPUB open running on the worker. The Reader polls it every tick.
+pub struct EpubOpenJob {
+    inbox: mpsc::Receiver<EpubReply>,
+    started: std::time::Instant,
+}
+
+impl EpubOpenJob {
+    pub fn start(path: impl AsRef<Path>) -> Result<Self, String> {
+        Ok(Self {
+            inbox: queue_epub_job(EpubJob::Open(path.as_ref().to_path_buf()))?,
+            started: std::time::Instant::now(),
+        })
+    }
+
+    /// `None` while the parse is still running.
+    pub fn poll(&self) -> Option<Result<EpubDocument, String>> {
+        match self.inbox.try_recv() {
+            Ok(EpubReply::Open(result)) => Some(result),
+            Ok(EpubReply::Title(_)) => {
+                Some(Err("EPUB worker returned an unexpected result".into()))
+            }
+            Err(mpsc::TryRecvError::Disconnected) => Some(Err("EPUB worker stopped".into())),
+            Err(mpsc::TryRecvError::Empty) if self.started.elapsed() >= EPUB_OPEN_TIMEOUT => {
+                log::warn!("rustmix-wave=epub-parser-worker status=timed-out");
+                Some(Err("Opening this EPUB took too long".into()))
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+        }
+    }
+}
+
+/// Parse one EPUB on the long-lived worker and wait. Tests and non-UI callers
+/// use this; the Reader polls [`EpubOpenJob`] instead.
+pub fn open_epub_on_worker(path: impl AsRef<Path>) -> Result<EpubDocument, String> {
+    let job = EpubOpenJob::start(path)?;
+    loop {
+        if let Some(result) = job.poll() {
+            return result;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn title_error_is_transient(message: &str) -> bool {
+    message.starts_with("EPUB open failed")
+        || message.starts_with("EPUB stat failed")
+        || message.starts_with("EPUB seek failed")
+        || (message.starts_with("EPUB read failed") && !message.contains("fill whole buffer"))
+}
+
+/// Read only the OPF title on the long-lived worker. A late reply, a stopped
+/// worker, or an SD read error is [`EpubTitleError::Unavailable`]; a bad
+/// archive or a parser panic is [`EpubTitleError::Malformed`].
+pub fn read_epub_title_on_worker(path: impl AsRef<Path>) -> Result<String, EpubTitleError> {
+    let inbox = queue_epub_job(EpubJob::Title(path.as_ref().to_path_buf()))
+        .map_err(EpubTitleError::Unavailable)?;
+    match inbox.recv_timeout(EPUB_TITLE_TIMEOUT) {
+        Ok(EpubReply::Title(Ok(title))) => Ok(title),
+        Ok(EpubReply::Title(Err(message))) if title_error_is_transient(&message) => {
+            Err(EpubTitleError::Unavailable(message))
+        }
+        Ok(EpubReply::Title(Err(message))) => Err(EpubTitleError::Malformed(message)),
+        Ok(EpubReply::Open(_)) => Err(EpubTitleError::Unavailable(
+            "EPUB worker returned an unexpected result".into(),
+        )),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(EpubTitleError::TimedOut),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(EpubTitleError::Unavailable("EPUB worker stopped".into()))
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn title_worker_panic_is_an_error() -> Result<String, EpubTitleError> {
+    let inbox = queue_epub_job(EpubJob::Panic).map_err(EpubTitleError::Unavailable)?;
+    match inbox.recv_timeout(Duration::from_secs(2)) {
+        Ok(EpubReply::Title(Ok(title))) => Ok(title),
+        Ok(EpubReply::Title(Err(message))) => Err(EpubTitleError::Malformed(message)),
+        _ => Err(EpubTitleError::Unavailable("no reply".into())),
+    }
+}
+
+/// Read one OPF metadata title without flattening the spine or slurping the
+/// novel into RAM. Only the ZIP tail, central directory, container, and OPF
+/// are read.
 #[inline(never)]
 pub fn read_epub_title(path: impl AsRef<Path>) -> Result<String, String> {
-    let archive = ZipArchive::open(path)?;
-    let (_, package, _) = epub_package(&archive)?;
-    Ok(package_title(&package))
+    read_epub_title_limited(path).map(|(title, _bytes_read)| title)
+}
+
+/// Title plus the number of archive bytes actually read. Library scans use
+/// this so a long novel cannot allocate its whole ZIP on the heap.
+fn read_epub_title_limited(path: impl AsRef<Path>) -> Result<(String, u64), String> {
+    let path = path.as_ref();
+    let mut file = File::open(path).map_err(|error| format!("EPUB open failed: {error}"))?;
+    let len = file
+        .metadata()
+        .map_err(|error| format!("EPUB stat failed: {error}"))?
+        .len();
+    if len > EPUB_ARCHIVE_BYTES_LIMIT as u64 {
+        return Err(format!(
+            "EPUB archive exceeds {} byte limit",
+            EPUB_ARCHIVE_BYTES_LIMIT
+        ));
+    }
+    let mut bytes_read = 0_u64;
+    let entries = read_central_directory(&mut file, len, &mut bytes_read)?;
+    let container = read_named_member(
+        &mut file,
+        &entries,
+        "META-INF/container.xml",
+        &mut bytes_read,
+    )?;
+    let container = String::from_utf8_lossy(&container);
+    let rootfile = first_open_tag(&container, "rootfile")
+        .and_then(|tag| attribute(tag, "full-path"))
+        .ok_or_else(|| "EPUB container rootfile missing".to_string())?;
+    let package_path = normalize_archive_path("", &rootfile);
+    let package = read_named_member(&mut file, &entries, &package_path, &mut bytes_read)?;
+    let package = String::from_utf8_lossy(&package);
+    Ok((package_title(&package), bytes_read))
 }
 
 fn epub_package(archive: &ZipArchive) -> Result<(String, String, String), String> {
@@ -594,6 +781,170 @@ fn fallback_chapter_label(xhtml: &str, spine_index: usize) -> String {
 fn utf8_member(archive: &ZipArchive, name: &str) -> Result<String, String> {
     let bytes = archive.extract(name)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn parse_central_directory(bytes: &[u8], entry_count: usize) -> Result<Vec<ZipEntry>, String> {
+    if entry_count > EPUB_ARCHIVE_ENTRY_LIMIT {
+        return Err(format!("EPUB ZIP has too many entries: {entry_count}"));
+    }
+    let mut entries = Vec::with_capacity(entry_count);
+    let mut cursor = 0_usize;
+    for _ in 0..entry_count {
+        if read_u32(bytes, cursor)? != 0x0201_4B50 {
+            return Err("EPUB ZIP central record signature mismatch".into());
+        }
+        let flags = read_u16(bytes, cursor + 8)?;
+        let method = read_u16(bytes, cursor + 10)?;
+        let compressed_size = read_u32(bytes, cursor + 20)? as usize;
+        let uncompressed_size = read_u32(bytes, cursor + 24)? as usize;
+        let name_len = read_u16(bytes, cursor + 28)? as usize;
+        let extra_len = read_u16(bytes, cursor + 30)? as usize;
+        let comment_len = read_u16(bytes, cursor + 32)? as usize;
+        let local_header_offset = read_u32(bytes, cursor + 42)? as usize;
+        let name_start = cursor
+            .checked_add(46)
+            .ok_or_else(|| "EPUB ZIP filename overflow".to_string())?;
+        let name_end = name_start
+            .checked_add(name_len)
+            .ok_or_else(|| "EPUB ZIP filename overflow".to_string())?;
+        if name_end > bytes.len() {
+            return Err("EPUB ZIP filename exceeds directory".into());
+        }
+        let name = String::from_utf8_lossy(&bytes[name_start..name_end]).replace('\\', "/");
+        entries.push(ZipEntry {
+            name,
+            flags,
+            method,
+            compressed_size,
+            uncompressed_size,
+            local_header_offset,
+        });
+        cursor = name_end
+            .checked_add(extra_len)
+            .and_then(|value| value.checked_add(comment_len))
+            .ok_or_else(|| "EPUB ZIP central record overflow".to_string())?;
+        if cursor > bytes.len() {
+            return Err("EPUB ZIP central record exceeds directory".into());
+        }
+    }
+    Ok(entries)
+}
+
+fn read_central_directory(
+    file: &mut File,
+    len: u64,
+    bytes_read: &mut u64,
+) -> Result<Vec<ZipEntry>, String> {
+    if len < 22 {
+        return Err("EPUB ZIP end record missing".into());
+    }
+    let tail_len = len.min(ZIP_EOCD_SCAN_BYTES) as usize;
+    let tail_start = len - tail_len as u64;
+    file.seek(SeekFrom::Start(tail_start))
+        .map_err(|error| format!("EPUB seek failed: {error}"))?;
+    let mut tail = vec![0_u8; tail_len];
+    file.read_exact(&mut tail)
+        .map_err(|error| format!("EPUB read failed: {error}"))?;
+    *bytes_read = bytes_read.saturating_add(tail_len as u64);
+    let eocd = find_eocd(&tail).ok_or_else(|| "EPUB ZIP end record missing".to_string())?;
+    let entry_count = read_u16(&tail, eocd + 10)? as usize;
+    let central_size = u64::from(read_u32(&tail, eocd + 12)?);
+    let central_offset = u64::from(read_u32(&tail, eocd + 16)?);
+    if central_size > 1024 * 1024 {
+        return Err("EPUB ZIP directory is too large".into());
+    }
+    let central_end = central_offset
+        .checked_add(central_size)
+        .ok_or_else(|| "EPUB ZIP directory overflow".to_string())?;
+    if central_end > len {
+        return Err("EPUB ZIP directory exceeds archive".into());
+    }
+    let central_size = usize::try_from(central_size).unwrap_or(usize::MAX);
+    let tail_end = tail_start.saturating_add(tail_len as u64);
+    let central = if central_offset >= tail_start && central_end <= tail_end {
+        let start = usize::try_from(central_offset - tail_start).unwrap_or(tail.len());
+        let end = start.saturating_add(central_size).min(tail.len());
+        if end - start != central_size {
+            return Err("EPUB ZIP directory exceeds archive".into());
+        }
+        tail[start..end].to_vec()
+    } else {
+        file.seek(SeekFrom::Start(central_offset))
+            .map_err(|error| format!("EPUB seek failed: {error}"))?;
+        let mut central = vec![0_u8; central_size];
+        file.read_exact(&mut central)
+            .map_err(|error| format!("EPUB read failed: {error}"))?;
+        *bytes_read = bytes_read.saturating_add(central_size as u64);
+        central
+    };
+    parse_central_directory(&central, entry_count)
+}
+
+fn read_named_member(
+    file: &mut File,
+    entries: &[ZipEntry],
+    name: &str,
+    bytes_read: &mut u64,
+) -> Result<Vec<u8>, String> {
+    let entry = entries
+        .iter()
+        .find(|entry| entry.name == name)
+        .or_else(|| {
+            entries
+                .iter()
+                .find(|entry| entry.name.eq_ignore_ascii_case(name))
+        })
+        .ok_or_else(|| format!("EPUB member missing: {name}"))?;
+    if entry.flags & 0x0001 != 0 {
+        return Err(format!(
+            "Encrypted EPUB member is unsupported: {}",
+            entry.name
+        ));
+    }
+    if entry.compressed_size > EPUB_TITLE_MEMBER_LIMIT
+        || entry.uncompressed_size > EPUB_TITLE_MEMBER_LIMIT
+    {
+        return Err(format!("EPUB metadata member is too large: {}", entry.name));
+    }
+    file.seek(SeekFrom::Start(entry.local_header_offset as u64))
+        .map_err(|error| format!("EPUB seek failed: {error}"))?;
+    let mut header = [0_u8; 30];
+    file.read_exact(&mut header)
+        .map_err(|error| format!("EPUB read failed: {error}"))?;
+    *bytes_read = bytes_read.saturating_add(header.len() as u64);
+    if read_u32(&header, 0)? != 0x0403_4B50 {
+        return Err(format!("EPUB local ZIP header mismatch: {}", entry.name));
+    }
+    let name_len = read_u16(&header, 26)? as u64;
+    let extra_len = read_u16(&header, 28)? as u64;
+    let skip = name_len
+        .checked_add(extra_len)
+        .ok_or_else(|| "EPUB ZIP data offset overflow".to_string())?;
+    let skip = i64::try_from(skip).map_err(|_| "EPUB ZIP data offset overflow".to_string())?;
+    file.seek(SeekFrom::Current(skip))
+        .map_err(|error| format!("EPUB seek failed: {error}"))?;
+    let mut compressed = vec![0_u8; entry.compressed_size];
+    file.read_exact(&mut compressed)
+        .map_err(|error| format!("EPUB read failed: {error}"))?;
+    *bytes_read = bytes_read.saturating_add(compressed.len() as u64);
+    let output = match entry.method {
+        0 => compressed,
+        8 => decompress_to_vec(&compressed)
+            .map_err(|error| format!("EPUB deflate failed for {}: {error:?}", entry.name))?,
+        method => {
+            return Err(format!(
+                "Unsupported EPUB compression method {method} for {}",
+                entry.name
+            ))
+        }
+    };
+    if output.len() > EPUB_TITLE_MEMBER_LIMIT {
+        return Err(format!("EPUB member expanded beyond limit: {}", entry.name));
+    }
+    if entry.uncompressed_size != 0 && output.len() != entry.uncompressed_size {
+        return Err(format!("EPUB member size mismatch: {}", entry.name));
+    }
+    Ok(output)
 }
 
 fn find_eocd(bytes: &[u8]) -> Option<usize> {
@@ -944,7 +1295,7 @@ mod tests {
 
     use super::{
         attribute, first_open_tag, html_to_text, open_epub, open_epub_on_worker,
-        read_epub_title_on_worker, EPUB_PARSER_WORKER_STACK_BYTES, EPUB_TITLE_WORKER_STACK_BYTES,
+        read_epub_title_on_worker, EPUB_PARSER_WORKER_STACK_BYTES,
     };
 
     fn temp_epub(name: &str) -> PathBuf {
@@ -1043,9 +1394,43 @@ mod tests {
     }
 
     #[test]
-    fn title_worker_uses_a_smaller_bounded_stack() {
-        assert_eq!(EPUB_TITLE_WORKER_STACK_BYTES, 32 * 1024);
-        assert!(EPUB_TITLE_WORKER_STACK_BYTES < EPUB_PARSER_WORKER_STACK_BYTES);
+    fn a_bad_archive_is_malformed_and_a_missing_file_is_unavailable() {
+        let path = temp_epub("truncated");
+        fs::write(&path, b"PK\x03\x04 truncated").unwrap();
+        let error = read_epub_title_on_worker(&path).unwrap_err();
+        assert!(error.is_malformed(), "{error:?}");
+        let _ = fs::remove_file(&path);
+        let error = read_epub_title_on_worker(&path).unwrap_err();
+        assert!(!error.is_malformed(), "{error:?}");
+    }
+
+    #[test]
+    fn title_worker_panic_is_an_error_and_the_next_read_still_runs() {
+        let error = super::title_worker_panic_is_an_error().unwrap_err();
+        assert!(error.is_malformed(), "{error:?}");
+        assert!(error.to_string().contains("panicked"), "{error}");
+        let path = temp_epub("after-panic");
+        let bytes = stored_zip(&[
+            (
+                "META-INF/container.xml",
+                "<container><rootfiles><rootfile full-path='book.opf'/></rootfiles></container>",
+            ),
+            (
+                "book.opf",
+                "<package><metadata><dc:title>After Panic</dc:title></metadata></package>",
+            ),
+        ]);
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(read_epub_title_on_worker(&path).unwrap(), "After Panic");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn missing_worker_reply_is_a_failure() {
+        let (sender, inbox) = std::sync::mpsc::channel::<Result<String, String>>();
+        drop(sender);
+        let error = inbox.recv_timeout(std::time::Duration::from_millis(20));
+        assert!(error.is_err());
     }
 
     #[test]
@@ -1088,5 +1473,88 @@ mod tests {
         assert_eq!(epub.toc[0].label, "Start");
         assert!(epub.toc[1].text_offset > epub.toc[0].text_offset);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn title_scan_does_not_read_a_large_spine_member() {
+        let path = temp_epub("title-budget");
+        let bytes = stored_zip_with_padding();
+        fs::write(&path, &bytes).unwrap();
+        let (title, read) = super::read_epub_title_limited(&path).unwrap();
+        assert_eq!(title, "遥远的救世主");
+        assert!(bytes.len() > 1024 * 1024);
+        assert!(
+            read < 256 * 1024,
+            "title scan read {read} bytes of a {} byte archive",
+            bytes.len()
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    fn stored_zip_with_padding() -> Vec<u8> {
+        let padding = vec![b'x'; 1024 * 1024];
+        let entries = [
+            (
+                "META-INF/container.xml",
+                b"<container><rootfiles><rootfile full-path='book.opf'/></rootfiles></container>"
+                    .to_vec(),
+            ),
+            (
+                "book.opf",
+                "<package><metadata><dc:title>遥远的救世主</dc:title></metadata></package>"
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            ("OEBPS/bulk.xhtml", padding),
+        ];
+        let mut output = Vec::new();
+        let mut central = Vec::new();
+        for (name, body) in &entries {
+            let offset = output.len() as u32;
+            push_u32(&mut output, 0x0403_4B50);
+            push_u16(&mut output, 20);
+            push_u16(&mut output, 0);
+            push_u16(&mut output, 0);
+            push_u16(&mut output, 0);
+            push_u16(&mut output, 0);
+            push_u32(&mut output, 0);
+            push_u32(&mut output, body.len() as u32);
+            push_u32(&mut output, body.len() as u32);
+            push_u16(&mut output, name.len() as u16);
+            push_u16(&mut output, 0);
+            output.extend(name.as_bytes());
+            output.extend(body);
+
+            push_u32(&mut central, 0x0201_4B50);
+            push_u16(&mut central, 20);
+            push_u16(&mut central, 20);
+            push_u16(&mut central, 0);
+            push_u16(&mut central, 0);
+            push_u16(&mut central, 0);
+            push_u16(&mut central, 0);
+            push_u32(&mut central, 0);
+            push_u32(&mut central, body.len() as u32);
+            push_u32(&mut central, body.len() as u32);
+            push_u16(&mut central, name.len() as u16);
+            push_u16(&mut central, 0);
+            push_u16(&mut central, 0);
+            push_u16(&mut central, 0);
+            push_u16(&mut central, 0);
+            push_u32(&mut central, 0);
+            push_u32(&mut central, offset);
+            central.extend(name.as_bytes());
+        }
+        let central_offset = output.len() as u32;
+        let central_size = central.len() as u32;
+        output.extend(central);
+        push_u32(&mut output, 0x0605_4B50);
+        push_u16(&mut output, 0);
+        push_u16(&mut output, 0);
+        push_u16(&mut output, entries.len() as u16);
+        push_u16(&mut output, entries.len() as u16);
+        push_u32(&mut output, central_size);
+        push_u32(&mut output, central_offset);
+        push_u16(&mut output, 0);
+        output
     }
 }

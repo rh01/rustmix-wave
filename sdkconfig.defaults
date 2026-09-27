@@ -1,5 +1,7 @@
 # Rust main task: leave margin for rendering and log formatting.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+# One hardware watchpoint on the main stack limit. It does not grow the image.
+CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=4096
 CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=4096

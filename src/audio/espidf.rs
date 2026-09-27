@@ -213,7 +213,7 @@ where
         if !self.chime.is_playing() {
             return Ok(false);
         }
-        let mut bytes = [0_u8; PCM_CHUNK_BYTES];
+        let mut bytes = vec![0_u8; PCM_CHUNK_BYTES];
         let completed_test = self.chime.fill_stereo_pcm(
             &mut bytes,
             self.snapshot.volume_percent,

@@ -326,16 +326,28 @@ pub fn atomic_write(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    {
-        let mut file = File::create(temporary).map_err(|error| error.to_string())?;
-        file.write_all(bytes).map_err(|error| error.to_string())?;
-        file.sync_all()
-            .map_err(|error| format!("sync {}: {error}", temporary.display()))?;
+    let written = File::create(temporary)
+        .map_err(|error| error.to_string())
+        .and_then(|mut file| {
+            file.write_all(bytes).map_err(|error| error.to_string())?;
+            file.sync_all()
+                .map_err(|error| format!("sync {}: {error}", temporary.display()))
+        });
+    if let Err(error) = written {
+        let _ = fs::remove_file(temporary);
+        return Err(error);
     }
-    if path.exists() {
+    let had_path = path.exists();
+    if had_path {
         let _ = fs::rename(path, backup);
     }
-    fs::rename(temporary, path).map_err(|error| error.to_string())?;
+    if let Err(error) = fs::rename(temporary, path) {
+        let _ = fs::remove_file(temporary);
+        if had_path && !path.exists() {
+            let _ = fs::rename(backup, path);
+        }
+        return Err(error.to_string());
+    }
     // ESP-IDF FAT cannot open a directory as a file (`EACCES`). A failed
     // directory fsync after a successful rename was reported as a failed save.
     Ok(())
@@ -489,5 +501,20 @@ mod tests {
     fn oversized_session_file_is_rejected() {
         let huge = format!("WRSS1\nvid={}\n", "x".repeat(9000));
         assert!(Session::decode(&huge).is_err());
+    }
+
+    #[test]
+    fn failed_atomic_write_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("weread-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let destination = dir.join("00000001.TXT");
+        let backup = dir.join("CHAP.BAK");
+        std::fs::create_dir_all(destination.join("KEEP")).unwrap();
+        std::fs::create_dir_all(backup.join("KEEP")).unwrap();
+        let temporary = dir.join("TEXT.TMP");
+        assert!(super::atomic_write(&destination, &temporary, &backup, b"body").is_err());
+        assert!(!temporary.exists());
+        assert!(destination.is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

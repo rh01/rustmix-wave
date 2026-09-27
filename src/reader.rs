@@ -15,12 +15,13 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     ptr::NonNull,
+    sync::Mutex,
     time::{Duration, UNIX_EPOCH},
 };
 
 use crate::{
     buttons::ButtonEvent,
-    epub::{open_epub_on_worker, read_epub_title_on_worker, EpubDocument, EpubTocEntry},
+    epub::{read_epub_title_on_worker, EpubDocument, EpubOpenJob, EpubTocEntry},
 };
 
 /// SD-card library owned by the Reader subsystem.
@@ -106,7 +107,16 @@ const CACHE_FNV_PRIME: u64 = 0x100000001b3;
 std::thread_local! {
     static LAYOUT_BUTTON_POLL: Cell<Option<NonNull<dyn FnMut() -> bool + 'static>>> =
         const { Cell::new(None) };
+    static LIBRARY_SCAN_PAUSES: Cell<u32> = const { Cell::new(0) };
 }
+
+/// Progress and bookmark files are small text records. A multi-megabyte file
+/// in this slot is corrupt and must not be loaded onto the heap.
+const READER_PROGRESS_BYTES_LIMIT: u64 = 64 * 1024;
+/// TXT `.CCH` anchor files stay bounded by [`READER_CACHE_OFFSET_LIMIT`].
+const READER_ANCHOR_CACHE_BYTES_LIMIT: u64 = 256 * 1024;
+/// How many legacy whole-book `*.EPI` names to unlink on one library open.
+const LEGACY_INDEX_CLEANUP_LIMIT: usize = 128;
 
 /// Run `body` while EPUB layout batches can poll buttons.
 ///
@@ -141,6 +151,13 @@ pub fn with_layout_button_poll<R>(poll: &mut dyn FnMut() -> bool, body: impl FnO
 
 fn layout_button_pending() -> bool {
     LAYOUT_BUTTON_POLL.with(|slot| slot.get().is_some_and(|poll| unsafe { (*poll.as_ptr())() }))
+}
+
+/// Let the idle task run between library EPUB title reads so a long SD scan
+/// cannot sit in `thread::join` until the task watchdog fires.
+fn pause_between_library_books() {
+    LIBRARY_SCAN_PAUSES.with(|count| count.set(count.get().saturating_add(1)));
+    std::thread::sleep(Duration::from_millis(READER_EPUB_INDEX_YIELD_MILLIS));
 }
 
 /// Reader-supported content types. TXT and bounded reflowable EPUB are active.
@@ -1808,6 +1825,40 @@ pub struct PendingReaderOpen {
     pub epub_document: Option<EpubDocument>,
     pub resume: Option<ReaderLocation>,
     pub message: String,
+    pub epub_open: PendingEpubOpen,
+}
+
+/// The EPUB parse the loading screen is waiting on. `tick` polls it, so the
+/// main loop keeps reading buttons while a long book opens.
+#[derive(Clone, Default)]
+pub struct PendingEpubOpen(Option<std::rc::Rc<EpubOpenJob>>);
+
+impl PendingEpubOpen {
+    fn job(&self) -> Option<&EpubOpenJob> {
+        self.0.as_deref()
+    }
+}
+
+impl PartialEq for PendingEpubOpen {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (None, None) => true,
+            (Some(left), Some(right)) => std::rc::Rc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for PendingEpubOpen {}
+
+impl core::fmt::Debug for PendingEpubOpen {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(if self.0.is_some() {
+            "PendingEpubOpen(running)"
+        } else {
+            "PendingEpubOpen(idle)"
+        })
+    }
 }
 
 /// One wrapped Reader line. `paragraph_end` prevents Justified rendering from
@@ -3234,8 +3285,22 @@ impl ReaderUiState {
         }
     }
 
+    /// Library refresh the user asked for. EPUBs whose titles failed before
+    /// are parsed again, so a replaced or repaired file gets its real title.
+    pub fn refresh_library_retrying_titles(&mut self) {
+        clear_title_failures(Some(Path::new(&self.state_root)));
+        self.refresh_library();
+    }
+
     pub fn refresh_library(&mut self) {
-        match scan_txt_library(&self.books_root) {
+        let removed = discard_legacy_whole_book_indexes(&self.cache_directory());
+        if removed > 0 {
+            log::info!("rustmix-wave=epub-legacy-index status=removed count={removed}");
+        }
+        match scan_library(
+            Path::new(&self.books_root),
+            Some(Path::new(&self.state_root)),
+        ) {
             Ok(books) => {
                 self.books = books;
                 self.library_error = None;
@@ -3246,6 +3311,7 @@ impl ReaderUiState {
             }
         }
         self.library_selected = 0;
+        crate::runtime_memory::log_main_stack_high_water("library-refresh");
     }
 
     #[must_use]
@@ -3380,6 +3446,7 @@ impl ReaderUiState {
             epub_document: None,
             resume,
             message: "Preparing reader...".into(),
+            epub_open: PendingEpubOpen::default(),
         });
     }
 
@@ -3415,6 +3482,7 @@ impl ReaderUiState {
             epub_document: session.epub_document.take(),
             resume: Some(resume),
             message: "Rebuilding the current page first...".into(),
+            epub_open: PendingEpubOpen::default(),
         });
         log::info!(
             "rustmix-wave=reader-session-memory-release status=completed reason=layout-rebuild"
@@ -3473,8 +3541,22 @@ impl ReaderUiState {
                     ReaderTickOutcome::LoadingStageChanged
                 }
                 ReaderLoadingStage::InspectingEpubArchive => {
-                    match open_epub_on_worker(&loading.book.path) {
-                        Ok(document) => {
+                    let polled = match loading.epub_open.job() {
+                        Some(job) => job.poll(),
+                        None => match EpubOpenJob::start(&loading.book.path) {
+                            Ok(job) => {
+                                loading.epub_open = PendingEpubOpen(Some(std::rc::Rc::new(job)));
+                                None
+                            }
+                            Err(error) => Some(Err(error)),
+                        },
+                    };
+                    if polled.is_some() {
+                        loading.epub_open = PendingEpubOpen::default();
+                    }
+                    match polled {
+                        None => ReaderTickOutcome::None,
+                        Some(Ok(document)) => {
                             loading.message = format!(
                                 "{} spine items / {} TOC entries",
                                 document.spine_count,
@@ -3484,7 +3566,7 @@ impl ReaderUiState {
                             loading.stage = ReaderLoadingStage::ReadingEpubPackage;
                             ReaderTickOutcome::LoadingStageChanged
                         }
-                        Err(error) => {
+                        Some(Err(error)) => {
                             loading.stage = ReaderLoadingStage::Failed;
                             loading.message = error;
                             ReaderTickOutcome::Failed
@@ -4677,7 +4759,125 @@ impl ReaderUiState {
 /// Scan one bounded Reader library. TXT and EPUB/EPU rows open through the
 /// shared staged Reader architecture.
 pub fn scan_txt_library(root: impl AsRef<Path>) -> Result<Vec<ReaderBook>, String> {
-    let root = root.as_ref();
+    scan_library(root.as_ref(), None)
+}
+
+const TITLE_FAILURE_FILE: &str = "BADTITLE.TXT";
+const TITLE_FAILURE_LIMIT: usize = 128;
+
+fn title_failures() -> &'static Mutex<Vec<String>> {
+    static FAILURES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    &FAILURES
+}
+
+fn title_failure_key(path: &Path, size: u64, modified: u64) -> String {
+    format!(
+        "{size}\t{modified}\t{}",
+        path.to_string_lossy().replace(['\n', '\r'], " ")
+    )
+}
+
+fn merge_title_failures(state_root: Option<&Path>) {
+    let Some(root) = state_root else {
+        return;
+    };
+    let Ok(text) = read_capped_string(&root.join(TITLE_FAILURE_FILE), 16 * 1024) else {
+        return;
+    };
+    let mut slot = title_failures()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("version=") {
+            continue;
+        }
+        if !slot.iter().any(|existing| existing == line) {
+            slot.push(line.to_string());
+        }
+    }
+    if slot.len() > TITLE_FAILURE_LIMIT {
+        let drop_count = slot.len() - TITLE_FAILURE_LIMIT;
+        slot.drain(0..drop_count);
+    }
+}
+
+fn clear_title_failures(state_root: Option<&Path>) {
+    title_failures()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+    if let Some(root) = state_root {
+        let path = root.join(TITLE_FAILURE_FILE);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(with_extension(&path, "BAK"));
+    }
+}
+
+fn title_failure_known(key: &str) -> bool {
+    title_failures()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .any(|existing| existing == key)
+}
+
+fn remember_title_failure(state_root: Option<&Path>, key: String) {
+    {
+        let mut slot = title_failures()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !slot.iter().any(|existing| existing == &key) {
+            slot.push(key);
+        }
+        if slot.len() > TITLE_FAILURE_LIMIT {
+            let drop_count = slot.len() - TITLE_FAILURE_LIMIT;
+            slot.drain(0..drop_count);
+        }
+    }
+    let Some(root) = state_root else {
+        return;
+    };
+    let body = {
+        let slot = title_failures()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut body = String::from("version=1\n");
+        for entry in slot.iter() {
+            body.push_str(entry);
+            body.push('\n');
+        }
+        body
+    };
+    let _ = atomic_replace_text(&root.join(TITLE_FAILURE_FILE), &body);
+}
+
+/// AppleDouble sidecars, transfer leftovers, empty files, and tiny odd-length
+/// objects are not books. A finished EPUB may itself be an odd number of
+/// bytes, so those are parsed; a title-worker failure is blacklisted instead
+/// of being retried on every boot.
+pub fn library_entry_skipped(name: &str, size: u64) -> bool {
+    name.starts_with("._") || name.to_ascii_uppercase().ends_with(".TMP") || size == 0
+}
+
+fn epub_bytes_skipped(size: u64, path: &Path) -> bool {
+    size % 2 == 1 && (size < 64 || !starts_with_zip_local_header(path))
+}
+
+fn starts_with_zip_local_header(path: &Path) -> bool {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut magic = [0_u8; 4];
+    file.read_exact(&mut magic).is_ok() && magic == *b"PK\x03\x04"
+}
+
+fn scan_library(root: &Path, state_root: Option<&Path>) -> Result<Vec<ReaderBook>, String> {
+    merge_title_failures(state_root);
+    // After one title times out the worker is still busy with it; the rest of
+    // this scan uses filenames instead of waiting behind it.
+    let mut titles_deferred = false;
     let mut books = Vec::new();
     let entries =
         fs::read_dir(root).map_err(|error| format!("Books folder unavailable: {error}"))?;
@@ -4686,11 +4886,21 @@ pub fn scan_txt_library(root: impl AsRef<Path>) -> Result<Vec<ReaderBook>, Strin
         if !path.is_file() {
             continue;
         }
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        let metadata = entry.metadata().ok();
+        let size_bytes = metadata.as_ref().map_or(0, |meta| meta.len());
+        if library_entry_skipped(name, size_bytes) {
+            continue;
+        }
         let Some(format) = book_format_from_path(&path) else {
             continue;
         };
-        let metadata = entry.metadata().ok();
-        let size_bytes = metadata.as_ref().map_or(0, |meta| meta.len());
+        if format == BookFormat::Epub && epub_bytes_skipped(size_bytes, &path) {
+            continue;
+        }
         let modified_seconds = metadata
             .and_then(|meta| meta.modified().ok())
             .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
@@ -4701,10 +4911,34 @@ pub fn scan_txt_library(root: impl AsRef<Path>) -> Result<Vec<ReaderBook>, Strin
             .unwrap_or("Untitled book")
             .to_string();
         let title = if format == BookFormat::Epub {
-            read_epub_title_on_worker(&path)
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or(fallback_title)
+            // One bounded metadata read per book. The reply arrives on a
+            // channel; a dead title worker cannot panic this task.
+            pause_between_library_books();
+            let key = title_failure_key(&path, size_bytes, modified_seconds);
+            if titles_deferred || title_failure_known(&key) {
+                fallback_title
+            } else {
+                match read_epub_title_on_worker(&path) {
+                    Ok(title) if !title.trim().is_empty() => title,
+                    Ok(_) => fallback_title,
+                    Err(error) if error.is_malformed() => {
+                        log::warn!(
+                            "rustmix-wave=library-title status=blacklisted path={} error={error}",
+                            path.display()
+                        );
+                        remember_title_failure(state_root, key);
+                        fallback_title
+                    }
+                    Err(error) => {
+                        log::info!(
+                            "rustmix-wave=library-title status=deferred path={} error={error}",
+                            path.display()
+                        );
+                        titles_deferred |= error.is_timeout();
+                        fallback_title
+                    }
+                }
+            }
         } else {
             fallback_title
         };
@@ -5441,16 +5675,18 @@ fn parse_anchor_cache(
 }
 
 fn load_preferences(path: &Path) -> Result<Option<ReaderPreferences>, String> {
-    load_with_backup(path, ReaderPreferences::parse)
+    load_with_backup(path, READER_PROGRESS_BYTES_LIMIT, ReaderPreferences::parse)
 }
 
 fn load_location_record(path: &Path) -> Result<Option<ReaderLocation>, String> {
-    load_with_backup(path, parse_location_record)
+    load_with_backup(path, READER_PROGRESS_BYTES_LIMIT, parse_location_record)
 }
 
 fn load_location_list(path: &Path, limit: usize) -> Result<Vec<ReaderLocation>, String> {
-    load_with_backup(path, |text| parse_location_list(text, limit))
-        .map(|value| value.unwrap_or_default())
+    load_with_backup(path, READER_PROGRESS_BYTES_LIMIT, |text| {
+        parse_location_list(text, limit)
+    })
+    .map(|value| value.unwrap_or_default())
 }
 
 fn load_anchor_cache(
@@ -5458,11 +5694,14 @@ fn load_anchor_cache(
     book: &ReaderBook,
     layout: ReaderLayout,
 ) -> Result<Option<ReaderAnchorCache>, String> {
-    load_with_backup(path, |text| parse_anchor_cache(text, book, layout))
+    load_with_backup(path, READER_ANCHOR_CACHE_BYTES_LIMIT, |text| {
+        parse_anchor_cache(text, book, layout)
+    })
 }
 
 fn load_with_backup<T>(
     path: &Path,
+    max_bytes: u64,
     parser: impl Fn(&str) -> Result<T, String>,
 ) -> Result<Option<T>, String> {
     let backup = with_extension(path, "BAK");
@@ -5471,7 +5710,7 @@ fn load_with_backup<T>(
         if !candidate.exists() {
             continue;
         }
-        match fs::read_to_string(&candidate) {
+        match read_capped_string(&candidate, max_bytes) {
             Ok(text) => match parser(&text) {
                 Ok(value) => return Ok(Some(value)),
                 Err(error) => errors.push(format!("{}: {error}", candidate.display())),
@@ -5484,6 +5723,50 @@ fn load_with_backup<T>(
     } else {
         Err(errors.join("; "))
     }
+}
+
+fn read_capped_string(path: &Path, max_bytes: u64) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let len = file
+        .metadata()
+        .map_err(|error| format!("stat {}: {error}", path.display()))?
+        .len();
+    if len > max_bytes {
+        return Err(format!(
+            "{} is {len} bytes; refusing to load more than {max_bytes}",
+            path.display()
+        ));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    Ok(text)
+}
+
+/// Unlink leftover whole-book `CACHE/*.EPI` indexes by name. Their bodies can
+/// be larger than RAM; nothing here opens or parses them.
+fn discard_legacy_whole_book_indexes(cache_dir: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(cache_dir) else {
+        return 0;
+    };
+    let mut removed = 0_usize;
+    for entry in entries.flatten().take(LEGACY_INDEX_CLEANUP_LIMIT) {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.to_ascii_uppercase().ends_with(".EPI") {
+            continue;
+        }
+        pause_between_library_books();
+        if fs::remove_file(&path).is_ok() {
+            removed = removed.saturating_add(1);
+        }
+    }
+    removed
 }
 
 fn is_fat83_safe_file_name(path: &Path) -> bool {
@@ -5684,9 +5967,10 @@ mod tests {
         fs::write(root.join("Later.epu"), "zip").unwrap();
         fs::write(root.join("ignore.bin"), "no").unwrap();
         let books = scan_txt_library(&root).unwrap();
-        assert_eq!(books.len(), 2);
+        // "zip" is a 3-byte odd leftover, not an EPUB the device should open.
+        assert_eq!(books.len(), 1);
         assert_eq!(books[0].title, "Dracula");
-        assert_eq!(books[1].format, BookFormat::Epub);
+        assert_eq!(books[0].format, BookFormat::Text);
     }
 
     #[test]
@@ -6430,6 +6714,167 @@ mod tests {
         );
     }
 
+    #[test]
+    fn library_open_pauses_between_epubs_and_unlinks_legacy_epi_without_parsing() {
+        super::LIBRARY_SCAN_PAUSES.with(|count| count.set(0));
+        let books = temp_dir("library-scan-books");
+        let state = temp_dir("library-scan-state");
+        let cache = state.join("CACHE");
+        fs::create_dir_all(&cache).unwrap();
+        let legacy = cache.join("DEADBEEF.EPI");
+        fs::write(&legacy, vec![0xA5_u8; 48 * 1024]).unwrap();
+        fs::write(cache.join("KEEPME.CCH"), b"version=3\n").unwrap();
+        for (name, opf) in [
+            (
+                "one.epub",
+                "<package><metadata><dc:title>Alpha</dc:title></metadata></package>",
+            ),
+            (
+                "two.epub",
+                "<package><metadata><dc:title>Beta</dc:title></metadata></package>",
+            ),
+        ] {
+            let bytes = stored_zip(&[
+                (
+                    "META-INF/container.xml",
+                    "<container><rootfiles><rootfile full-path='book.opf'/></rootfiles></container>",
+                ),
+                ("book.opf", opf),
+            ]);
+            fs::write(books.join(name), bytes).unwrap();
+        }
+        let mut reader = ReaderUiState::with_roots(
+            books.to_string_lossy().into_owned(),
+            state.to_string_lossy().into_owned(),
+        );
+        reader.refresh_library();
+        assert!(!legacy.exists());
+        assert!(cache.join("KEEPME.CCH").is_file());
+        let titles: Vec<_> = reader
+            .books
+            .iter()
+            .map(|book| book.title.as_str())
+            .collect();
+        assert_eq!(titles, vec!["Alpha", "Beta"]);
+        assert!(super::LIBRARY_SCAN_PAUSES.with(|count| count.get()) >= 2);
+        let _ = fs::remove_dir_all(books);
+        let _ = fs::remove_dir_all(state);
+    }
+
+    #[test]
+    fn library_skips_partial_files_and_blacklists_a_bad_epub() {
+        let books = temp_dir("library-junk-books");
+        let state = temp_dir("library-junk-state");
+        fs::create_dir_all(&state).unwrap();
+        let good = stored_zip(&[
+            (
+                "META-INF/container.xml",
+                "<container><rootfiles><rootfile full-path='book.opf'/></rootfiles></container>",
+            ),
+            (
+                "book.opf",
+                "<package><metadata><dc:title>Kept</dc:title></metadata></package>",
+            ),
+        ]);
+        fs::write(books.join("kept.epub"), &good).unwrap();
+        fs::write(books.join("._kept.epub"), &good).unwrap();
+        fs::write(books.join("NOTE.TMP"), b"partial").unwrap();
+        fs::write(books.join("empty.txt"), b"").unwrap();
+        fs::write(books.join("odd.epub"), b"PK\x03\x04xyz").unwrap();
+        let mut broken = b"PK\x03\x04".to_vec();
+        broken.extend(std::iter::repeat(0_u8).take(60));
+        let broken_path = books.join("broken-title-blacklist.epub");
+        fs::write(&broken_path, &broken).unwrap();
+        let hits = || {
+            crate::epub::TITLE_WORKER_PATHS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .filter(|path| path.ends_with("broken-title-blacklist.epub"))
+                .count()
+        };
+        let before = hits();
+        let mut reader = ReaderUiState::with_roots(
+            books.to_string_lossy().into_owned(),
+            state.to_string_lossy().into_owned(),
+        );
+        reader.refresh_library();
+        reader.refresh_library();
+        let titles: Vec<_> = reader
+            .books
+            .iter()
+            .map(|book| book.title.as_str())
+            .collect();
+        assert!(titles.contains(&"Kept"), "{titles:?}");
+        assert!(
+            titles.iter().any(|title| title.contains("broken-title")),
+            "{titles:?}"
+        );
+        assert!(!titles.iter().any(|title| title.starts_with("._")));
+        assert!(!titles
+            .iter()
+            .any(|title| title.eq_ignore_ascii_case("NOTE")));
+        assert!(!titles
+            .iter()
+            .any(|title| title.eq_ignore_ascii_case("empty")));
+        assert!(!titles.iter().any(|title| title.eq_ignore_ascii_case("odd")));
+        assert_eq!(
+            hits(),
+            before + 1,
+            "a blacklisted EPUB must not be parsed again"
+        );
+        let blacklist = fs::read_to_string(state.join("BADTITLE.TXT")).unwrap();
+        assert!(
+            blacklist.contains("broken-title-blacklist.epub"),
+            "{blacklist}"
+        );
+        reader.refresh_library_retrying_titles();
+        assert_eq!(
+            hits(),
+            before + 2,
+            "opening Library by hand parses a blacklisted EPUB again"
+        );
+        let _ = fs::remove_dir_all(books);
+        let _ = fs::remove_dir_all(state);
+    }
+
+    #[test]
+    fn oversized_or_corrupt_progress_is_ignored_without_panicking() {
+        let books = temp_dir("progress-cap-books");
+        let state = temp_dir("progress-cap-state");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(state.join("STATE.TXT"), vec![b'A'; 70 * 1024]).unwrap();
+        fs::write(
+            state.join("POSITS.TXT"),
+            "version=1\nentry=good.epub\tGood\tepub\t10\t0\t4\t20\tnot-a-number\nentry=also.epub\tAlso\tepub\t10\t0\t1\t2\t3\t4\t5\nentry=old.txt\tOld\ttxt\t8\t1\t2\t9\n",
+        )
+        .unwrap();
+        fs::write(state.join("MARKS.TXT"), b"\xff\xfe not utf-8").unwrap();
+        let mut reader = ReaderUiState::with_roots(
+            books.to_string_lossy().into_owned(),
+            state.to_string_lossy().into_owned(),
+        );
+        let report = reader.load_persistent_state();
+        assert!(reader.resume.is_none());
+        let warning = report.warning.unwrap_or_default();
+        assert!(warning.contains("STATE.TXT"), "{warning}");
+        assert!(warning.contains("MARKS.TXT"), "{warning}");
+        assert_eq!(reader.positions.len(), 2);
+        assert_eq!(reader.positions[0].title, "Also");
+        assert_eq!(
+            reader.positions[0]
+                .epub_chapter
+                .as_ref()
+                .map(|chapter| chapter.chapter_number),
+            Some(3)
+        );
+        assert_eq!(reader.positions[1].title, "Old");
+        assert!(reader.positions[1].epub_chapter.is_none());
+        assert!(reader.bookmarks.is_empty());
+        let _ = fs::remove_dir_all(books);
+        let _ = fs::remove_dir_all(state);
+    }
+
     fn push_u16(output: &mut Vec<u8>, value: u16) {
         output.extend(value.to_le_bytes());
     }
@@ -6523,10 +6968,17 @@ mod tests {
     }
 
     fn open_until_ready(reader: &mut ReaderUiState) {
-        for _ in 0..8 {
+        let started = std::time::Instant::now();
+        let mut stages = 0;
+        while stages < 8 && started.elapsed() < std::time::Duration::from_secs(10) {
             let outcome = reader.tick();
             if outcome == ReaderTickOutcome::FirstPageReady {
                 return;
+            }
+            if outcome == ReaderTickOutcome::None {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            } else {
+                stages += 1;
             }
             assert_ne!(
                 outcome,

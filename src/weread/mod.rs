@@ -19,6 +19,7 @@ pub mod parse;
 pub mod protocol;
 pub mod qr;
 pub mod session;
+pub mod store;
 pub mod text;
 pub mod ui;
 

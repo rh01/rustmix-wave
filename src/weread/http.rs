@@ -48,7 +48,7 @@ use crate::{
             HTTP_READ_TIMEOUT_MS, HTTP_TIMEOUT_SECS, MIN_REQUEST_GAP_MS,
         },
         offline::{self, DownloadEvent},
-        session,
+        session, store,
         ui::{self, ServiceOutcome, WereadUi},
     },
 };
@@ -73,6 +73,8 @@ struct Inflight {
     download: Option<offline::CardDownload>,
     write_error: Option<String>,
     chunks_closed: bool,
+    /// Commit queued on the store thread, with the report it will complete.
+    commit: Option<(store::CommitJob, Report)>,
     cancel: Arc<AtomicBool>,
     generation: u64,
     job: Job,
@@ -111,6 +113,13 @@ impl HttpJobs {
         layout: ReaderLayout,
         mounted: bool,
     ) -> ServiceOutcome {
+        if self.inflight.is_none() && ui.next_job_writes_card() && store::busy() {
+            return ServiceOutcome {
+                refresh: false,
+                route: None,
+                touch_activity: false,
+            };
+        }
         ui::drive_with(
             ui,
             &mut self.inflight,
@@ -126,6 +135,17 @@ impl HttpJobs {
 }
 
 fn poll_report(job: &mut Inflight) -> Option<Report> {
+    if let Some((commit, _)) = job.commit.as_ref() {
+        let committed = commit.poll()?;
+        let (_, mut report) = job.commit.take()?;
+        if let Err(error) = committed {
+            if report.result.is_ok() {
+                report.result = Err(JobError::Message(error));
+            }
+        }
+        crate::runtime_memory::log_main_stack_high_water("weread-chapter-commit");
+        return Some(report);
+    }
     drain_download(job);
     if !job.chunks_closed {
         return None;
@@ -134,11 +154,15 @@ fn poll_report(job: &mut Inflight) -> Option<Report> {
         Ok(mut report) => {
             if let Some(download) = job.download.take() {
                 let succeeded = report.result.is_ok();
-                if let Err(error) =
-                    offline::complete_download(download, succeeded, job.write_error.take())
-                {
-                    if report.result.is_ok() {
-                        report.result = Err(JobError::Message(error));
+                match store::CommitJob::start(download, succeeded, job.write_error.take()) {
+                    Ok(commit) => {
+                        job.commit = Some((commit, report));
+                        return None;
+                    }
+                    Err(error) => {
+                        if report.result.is_ok() {
+                            report.result = Err(JobError::Message(error));
+                        }
                     }
                 }
             }
@@ -259,6 +283,7 @@ fn spawn_work(work: Work, unix: Option<u64>, cancel: Arc<AtomicBool>) -> Result<
             download,
             write_error: None,
             chunks_closed,
+            commit: None,
             cancel,
             generation,
             job,
@@ -686,7 +711,7 @@ fn http_call(
         return Err("response exceeds size limit".into());
     }
     let mut body = BoundedBody::new(declared, request.max_bytes)?;
-    let mut chunk = [0_u8; 2048];
+    let mut chunk = vec![0_u8; 2048];
     arm_body_timeout(client.raw);
     loop {
         let (step, read) = read_body_chunk(&mut client, cancel, &mut chunk)?;

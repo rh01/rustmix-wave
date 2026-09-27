@@ -26,7 +26,7 @@ use crate::{
         offline::{self, CachedChapter},
         parse::{BookDetail, ChapterMeta, NoteLine, ReadingProgress, ShelfBook},
         session::{self, Session},
-        text,
+        store, text,
     },
 };
 
@@ -277,6 +277,19 @@ impl WereadUi {
     #[must_use]
     pub fn holds_panel(&self) -> bool {
         self.busy || matches!(self.phase, Phase::Login | Phase::Download) || self.pending.is_some()
+    }
+
+    /// The queued job opens a download temp file on the SD card. The poller
+    /// holds it while the store thread still has a commit or save running.
+    #[must_use]
+    pub fn next_job_writes_card(&self) -> bool {
+        matches!(
+            self.pending,
+            Some(Job::Chapter {
+                fetch_images: false,
+                ..
+            }) | Some(Job::ChapterImage { .. })
+        )
     }
 
     /// True while a shelf, login, chapter, download, or progress upload still needs Wi-Fi.
@@ -741,7 +754,7 @@ impl WereadUi {
         self.chapter_pos = self.chapter_pos.min(self.chapters.len() - 1);
         let chapter = self.chapters[self.chapter_pos].clone();
         if mounted {
-            if let Some(cached) = offline::load_chapter(&sd_root(), &self.book_id, chapter.index) {
+            if let Some(cached) = store::load_chapter(&sd_root(), &self.book_id, chapter.index) {
                 self.images.clear();
                 self.show_text(&cached.text, layout);
                 self.place_open_page();
@@ -780,10 +793,9 @@ impl WereadUi {
     }
 
     fn show_text(&mut self, text: &str, layout: ReaderLayout) {
-        let blocks = text::blocks_from_markup(text);
         self.chapter_source = text.to_string();
         let measures = self.image_measures(layout);
-        self.pages = text::paginate_blocks(&blocks, layout, &measures);
+        self.pages = store::paginate_chapter(text, layout, measures).unwrap_or_default();
         self.paginated_layout = Some(layout);
     }
 
@@ -994,7 +1006,7 @@ impl WereadUi {
         else {
             return false;
         };
-        self.download_images = offline::chapter_image_refs(&sd_root(), &self.book_id, index);
+        self.download_images = store::chapter_image_refs(&sd_root(), &self.book_id, index);
         self.download_image_pos = 0;
         self.download_image_attempts = 0;
         if self.queue_pending_image(due_ms) {
@@ -1535,16 +1547,19 @@ impl WereadUi {
                 }
                 if mounted {
                     if let Some(chapter) = self.chapters.get(self.chapter_pos) {
-                        if let Err(error) = offline::save_chapter(
-                            &sd_root(),
-                            &self.book_id,
-                            &CachedChapter {
-                                uid: chapter.uid.clone(),
-                                index: chapter.index,
-                                title: chapter.title.clone(),
-                                text,
-                            },
-                        ) {
+                        let cached = CachedChapter {
+                            uid: chapter.uid.clone(),
+                            index: chapter.index,
+                            title: chapter.title.clone(),
+                            text,
+                        };
+                        let saved = if downloading {
+                            store::save_chapter(&sd_root(), &self.book_id, &cached)
+                        } else {
+                            store::queue_save_chapter(&sd_root(), &self.book_id, cached)
+                        };
+                        crate::runtime_memory::log_main_stack_high_water("weread-chapter-commit");
+                        if let Err(error) = saved {
                             if downloading {
                                 self.retry_or_skip_download(now_ms, mounted, &error);
                                 return ServiceOutcome {

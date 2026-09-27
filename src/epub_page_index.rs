@@ -20,6 +20,10 @@ pub const HEADER_LEN: usize = 64;
 /// directory ahead of the anchors, so this is the header length.
 pub const ANCHOR_BASE: usize = HEADER_LEN;
 
+/// Largest anchor table a chapter cache will load. Matches the reader page cap
+/// so a corrupt `page_count` cannot allocate an unbounded `Vec`.
+pub const MAX_CACHED_PAGES: u32 = 262_144;
+
 const MAGIC: &[u8; 4] = b"EPCH";
 const LEGACY_WHOLE_BOOK_MAGIC: &[u8; 4] = b"EPIX";
 const VERSION: u16 = 2;
@@ -214,6 +218,13 @@ fn read_cache(
     {
         return Ok(None);
     }
+    if page_count > MAX_CACHED_PAGES {
+        log::info!(
+            "rustmix-wave=epub-chapter-cache status=ignored-oversized-page-count pages={page_count} path={}",
+            path.display()
+        );
+        return Ok(None);
+    }
     let anchor_bytes = anchor_section_bytes(page_count)
         .ok_or_else(|| "chapter anchor length overflow".to_string())?;
     let file_len = file
@@ -402,5 +413,55 @@ mod tests {
             assert!(wrapped < u32::MAX as usize);
         }
         assert!(saturating_page_total(&[u32::MAX, u32::MAX]) > wrapped as u64 || usize::BITS > 32);
+    }
+
+    #[test]
+    fn oversized_page_count_is_ignored_without_allocating_the_table() {
+        let root = temp_dir("oversized");
+        let path = cache_path(&root, 0xAABB_CCDD_1122_3344);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut header = [0_u8; HEADER_LEN];
+        header[0..4].copy_from_slice(MAGIC);
+        header[4..6].copy_from_slice(&VERSION.to_le_bytes());
+        header[8..16].copy_from_slice(&0xAABB_CCDD_1122_3344_u64.to_le_bytes());
+        header[36..40].copy_from_slice(&(MAX_CACHED_PAGES.saturating_add(1)).to_le_bytes());
+        fs::write(&path, header).unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let claimed = (HEADER_LEN as u64)
+            .saturating_add(u64::from(MAX_CACHED_PAGES.saturating_add(1)).saturating_mul(8));
+        file.set_len(claimed).unwrap();
+        drop(file);
+        let sibling = path.parent().unwrap().join("AABBCCDD.EPI");
+        fs::write(&sibling, b"EPIX not-a-chapter-cache").unwrap();
+        assert!(ChapterAnchorCache::load(
+            &path,
+            &ChapterCacheExpect {
+                fingerprint: 0xAABB_CCDD_1122_3344,
+                chapter_index: 0,
+                text_offset: 0,
+                text_end_offset: 0,
+            },
+        )
+        .is_none());
+        assert!(sibling.is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn chapter_cache_directory_can_be_created_beside_a_legacy_epi_file() {
+        let root = temp_dir("beside-epi");
+        fs::create_dir_all(&root).unwrap();
+        let legacy = root.join("01234567.EPI");
+        fs::write(&legacy, vec![0xE5_u8; 64 * 1024]).unwrap();
+        let path = cache_path(&root, sample().fingerprint);
+        sample().store(&path).unwrap();
+        assert!(legacy.is_file());
+        assert_eq!(
+            fs::metadata(&legacy).unwrap().len(),
+            64 * 1024,
+            "storing a chapter cache must not rewrite a sibling whole-book index"
+        );
+        assert!(ChapterAnchorCache::load(&path, &expect_for(&sample())).is_some());
+        let _ = fs::remove_dir_all(&root);
     }
 }

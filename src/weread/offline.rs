@@ -489,6 +489,7 @@ trait DownloadFile {
     fn abort(self);
 }
 
+#[inline(never)]
 pub fn save_chapter(root: &Path, book_id: &str, chapter: &CachedChapter) -> Result<(), String> {
     let dir = book_dir(root, book_id);
     fs::create_dir_all(&dir).map_err(|error| explain_storage_error(&error.to_string()))?;
@@ -509,9 +510,10 @@ pub fn save_chapter(root: &Path, book_id: &str, chapter: &CachedChapter) -> Resu
     if body.len() > MAX_CHAPTER_TEXT + 1024 {
         return Err("chapter cache exceeds the size limit".into());
     }
+    // `CHAP.TMP` belongs to a streaming download the main task may be writing.
     atomic_write(
         &dir.join(&name),
-        &dir.join("CHAP.TMP"),
+        &dir.join("TEXT.TMP"),
         &dir.join("CHAP.BAK"),
         body.as_bytes(),
     )
@@ -777,6 +779,7 @@ fn load_plain_chapter(path: &Path, index: u32) -> Option<CachedChapter> {
 ///
 /// The shard is assembled only here, when the chapter is opened. A successful
 /// decode is rewritten as plain `WRCH1` text so the next open skips the shard.
+#[inline(never)]
 fn load_raw_chapter(root: &Path, book_id: &str, index: u32, path: &Path) -> Option<CachedChapter> {
     let (header, parts) = read_raw_file(path)?;
     let uid = field(&header, "uid");
@@ -796,6 +799,7 @@ fn read_raw_parts(path: &Path) -> Option<Vec<Vec<u8>>> {
     read_raw_file(path).map(|(_, parts)| parts)
 }
 
+#[inline(never)]
 fn read_raw_file(path: &Path) -> Option<(String, Vec<Vec<u8>>)> {
     let mut file = File::open(path).ok()?;
     let header = read_through_separator(&mut file, 1024)?;
@@ -824,7 +828,7 @@ fn read_raw_file(path: &Path) -> Option<(String, Vec<Vec<u8>>)> {
         let mut buf = Vec::new();
         buf.try_reserve_exact(len).ok()?;
         let mut left = len;
-        let mut chunk = [0u8; DOWNLOAD_CHUNK_BYTES];
+        let mut chunk = vec![0_u8; DOWNLOAD_CHUNK_BYTES];
         while left > 0 {
             let take = chunk.len().min(left);
             file.read_exact(&mut chunk[..take]).ok()?;

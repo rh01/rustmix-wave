@@ -195,7 +195,8 @@ impl ChapterDownload {
             return Err("chapter download incomplete".into());
         }
         if let Some(file) = self.file.as_mut() {
-            file.sync_all().ok();
+            file.sync_all()
+                .map_err(|error| explain_storage_error(&error.to_string()))?;
         }
         self.file.take();
         if self.final_path.exists() {
@@ -208,6 +209,14 @@ impl ChapterDownload {
     }
 
     pub fn abort(self) {}
+
+    #[cfg(test)]
+    pub fn replace_with_unsyncable_file(&mut self) {
+        let (read, write) = std::io::pipe().expect("pipe");
+        drop(read);
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        self.file = Some(unsafe { File::from_raw_fd(write.into_raw_fd()) });
+    }
 
     fn begin_part(&mut self, name: &str) -> Result<(), String> {
         if self.part_open {
@@ -910,6 +919,23 @@ mod tests {
         super::save_download_skip(&dir, &book, &[3, 9, 3]).unwrap();
         assert_eq!(super::load_download_skip(&dir, &book), vec![3, 9]);
         assert!(super::load_download_skip(&dir, "missing").is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commit_reports_a_failed_sync_and_does_not_rename() {
+        let (dir, book) = temp_book();
+        let mut download = ChapterDownload::begin(&dir, &book, "2", 2).unwrap();
+        download.apply(DownloadEvent::BeginPart("e0")).unwrap();
+        download
+            .apply(DownloadEvent::Chunk(b"hello".to_vec()))
+            .unwrap();
+        download.apply(DownloadEvent::EndPart).unwrap();
+        download.replace_with_unsyncable_file();
+        let error = download.commit().unwrap_err();
+        assert!(error.starts_with("SD card"), "{error}");
+        assert!(!super::chapter_cached(&dir, &book, 2));
+        assert!(!super::book_dir(&dir, &book).join("CHAP.TMP").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -259,10 +259,27 @@ impl WereadUi {
             if self.busy {
                 self.cancel_requested = true;
             }
+            self.release_settled_download();
             return;
         }
         if current.is_weread() {
             self.phase = phase_from_route(current);
+        }
+        self.release_settled_download();
+    }
+
+    /// Drop the download radio hold once the book is no longer being saved.
+    ///
+    /// `Phase::Download` keeps Wi-Fi up and blocks auto deep sleep. Leaving the
+    /// screen, cancelling, or finishing must clear it. An in-flight HTTPS call
+    /// still holds the radio through `busy` until the client closes.
+    fn release_settled_download(&mut self) {
+        if self.phase == Phase::Download
+            && self.download_cancel
+            && !self.busy
+            && self.pending.is_none()
+        {
+            self.phase = Phase::Book;
         }
     }
 
@@ -293,7 +310,7 @@ impl WereadUi {
             }
             return None;
         }
-        match self.phase {
+        let next = match self.phase {
             Phase::Shelf => self.on_shelf(event),
             Phase::Login => self.on_login(event),
             Phase::Book => self.on_book(event, layout, mounted),
@@ -301,7 +318,9 @@ impl WereadUi {
             Phase::Read => self.on_read(event, layout, mounted),
             Phase::Notes => self.on_notes(event),
             Phase::Download => self.on_download(event),
-        }
+        };
+        self.release_settled_download();
+        next
     }
 
     #[must_use]
@@ -796,6 +815,7 @@ impl WereadUi {
         }
         self.pending = None;
         self.download_done = self.count_cached(mounted);
+        self.download_cancel = true;
         self.status = if self.download_skip.is_empty() {
             format!("Saved {} chapters on the SD card.", self.download_done)
         } else {
@@ -807,6 +827,7 @@ impl WereadUi {
                 self.download_last_error
             )
         };
+        self.release_settled_download();
     }
 
     fn requeue_current_chapter(&mut self, due_ms: u64) {
@@ -1280,6 +1301,10 @@ impl WereadUi {
                 self.download_cancel = true;
                 self.read_after_contents = false;
                 self.toc_after_contents = false;
+                if matches!(self.pending, Some(Job::Chapter { .. })) {
+                    self.pending = None;
+                }
+                self.release_settled_download();
                 self.status = error.to_string();
                 ServiceOutcome {
                     refresh: true,
@@ -1338,6 +1363,7 @@ pub fn drive_with<H>(
             inflight.take();
             ui.busy = false;
             if report.generation != ui.generation {
+                ui.release_settled_download();
                 if !ui.status.starts_with("Download stopped") {
                     ui.status = "Cancelled.".into();
                 }
@@ -1437,7 +1463,7 @@ mod tests {
         buttons::ButtonEvent,
         reader::{BookFontSize, ReaderPreferences},
         weread::{
-            client::{Job, JobError, JobOutput, Report},
+            client::{Job, JobError, JobOutput, Report, HTTP_STALL_ERROR},
             limits::DOWNLOAD_ATTEMPTS,
             offline::{self, CachedChapter, ChapterDownload, DownloadEvent},
             parse::{BookDetail, ChapterMeta, ReadingProgress},
@@ -1868,6 +1894,41 @@ mod tests {
     }
 
     #[test]
+    fn stalled_chapter_download_is_retried() {
+        let mut ui = signed_in();
+        ui.phase = super::Phase::Download;
+        ui.chapters = vec![chapter("1", 1, "One"), chapter("2", 2, "Two")];
+        ui.chapter_pos = 0;
+        ui.generation = 4;
+        let layout = ReaderPreferences::default().layout();
+        ui.apply_report(
+            Report {
+                generation: 4,
+                job: Job::Chapter {
+                    book_id: "b".into(),
+                    chapter_uid: "1".into(),
+                    chapter_idx: 1,
+                    psvts: String::new(),
+                    fetch_images: false,
+                },
+                session: ui.session.clone(),
+                result: Err(JobError::Message(HTTP_STALL_ERROR.into())),
+            },
+            layout,
+            true,
+            1_000,
+        );
+        assert!(!ui.download_cancel);
+        assert!(ui.status.contains("Retrying"));
+        assert!(ui.status.contains(HTTP_STALL_ERROR));
+        assert!(ui.download_skip.is_empty());
+        match &ui.pending {
+            Some(Job::Chapter { chapter_idx, .. }) => assert_eq!(*chapter_idx, 1),
+            other => panic!("expected a retry of chapter 1, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn download_drops_chapter_text_before_the_next_job() {
         let mut ui = signed_in();
         ui.phase = super::Phase::Download;
@@ -2170,6 +2231,109 @@ mod tests {
         assert_eq!(ui.download_attempts, 1);
         assert!(ui.status.contains("SD card write failed"));
         assert!(!ui.status.contains("Saved"));
+        std::env::remove_var("WEREAD_SD_ROOT");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn leaving_a_download_releases_the_radio() {
+        let mut ui = signed_in();
+        ui.phase = super::Phase::Download;
+        ui.pending = Some(Job::Chapter {
+            book_id: "b".into(),
+            chapter_uid: "1".into(),
+            chapter_idx: 1,
+            psvts: String::new(),
+            fetch_images: false,
+        });
+        assert!(ui.needs_radio());
+        ui.note_route(ScreenRoute::WeReadDownload, ScreenRoute::Home);
+        assert!(ui.pending.is_none());
+        assert_ne!(ui.phase, super::Phase::Download);
+        assert!(!ui.needs_radio());
+
+        let mut busy = signed_in();
+        busy.phase = super::Phase::Download;
+        busy.busy = true;
+        busy.generation = 2;
+        busy.note_route(ScreenRoute::WeReadDownload, ScreenRoute::Home);
+        assert!(busy.cancel_requested);
+        assert!(busy.needs_radio());
+        busy.busy = false;
+        busy.apply_report(
+            chapter_report(&busy, 2, JobError::Cancelled),
+            ReaderPreferences::default().layout(),
+            false,
+            0,
+        );
+        assert_ne!(busy.phase, super::Phase::Download);
+        assert!(!busy.needs_radio());
+    }
+
+    #[test]
+    fn cancel_and_finish_release_the_radio_on_the_download_screen() {
+        let layout = ReaderPreferences::default().layout();
+        let mut ui = signed_in();
+        ui.phase = super::Phase::Download;
+        ui.chapters = vec![chapter("1", 1, "One")];
+        assert_eq!(
+            ui.on_button(
+                ScreenRoute::WeReadDownload,
+                ButtonEvent::Select,
+                layout,
+                false
+            ),
+            Some(ScreenRoute::WeReadBook)
+        );
+        assert!(!ui.needs_radio());
+
+        let _sd = sd_root_lock();
+        let dir = std::env::temp_dir().join(format!("weread-ui-done-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("WEREAD_SD_ROOT", &dir);
+        let mut done = signed_in();
+        done.book_id = "43208843".into();
+        done.phase = super::Phase::Download;
+        done.chapters = vec![chapter("1", 1, "One")];
+        offline::save_chapter(
+            &dir,
+            &done.book_id,
+            &CachedChapter {
+                uid: "1".into(),
+                index: 1,
+                title: "One".into(),
+                text: "saved".into(),
+            },
+        )
+        .unwrap();
+        done.generation = 1;
+        done.apply_report(
+            Report {
+                generation: 1,
+                job: Job::Chapter {
+                    book_id: done.book_id.clone(),
+                    chapter_uid: "1".into(),
+                    chapter_idx: 1,
+                    psvts: String::new(),
+                    fetch_images: false,
+                },
+                session: done.session.clone(),
+                result: Ok(JobOutput::ChapterStored {
+                    psvts: String::new(),
+                }),
+            },
+            layout,
+            true,
+            0,
+        );
+        assert!(done.status.contains("Saved"), "{}", done.status);
+        assert_ne!(done.phase, super::Phase::Download);
+        assert!(!done.needs_radio());
+        assert!(done
+            .on_button(ScreenRoute::WeReadDownload, ButtonEvent::Up, layout, true)
+            .is_none());
+        assert!(!done.needs_radio());
         std::env::remove_var("WEREAD_SD_ROOT");
         let _ = fs::remove_dir_all(&dir);
     }

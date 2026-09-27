@@ -5,6 +5,7 @@
 
 use crate::weread::{
     bitmap::{self, MonoBitmap},
+    body::body_transfer_error,
     crypto, decode,
     limits::{
         DOWNLOAD_CLASSIFY_BYTES, MAX_CHAPTER_IMAGES, MAX_HTML_BYTES, MAX_IMAGE_BYTES,
@@ -44,6 +45,111 @@ pub struct StreamedPart {
     /// Leading bytes used to tell a zip, a txt envelope, and a shard apart.
     pub prefix: Vec<u8>,
     pub total: usize,
+    /// Negative when the response has no Content-Length.
+    pub content_length: i64,
+    pub chunked: bool,
+    /// True after the terminal chunk, or when a Content-Length body is complete.
+    pub terminal_chunk: bool,
+}
+
+/// One `esp_http_client_read` result, after a timeout has been separated from a hard error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyRead {
+    /// `read > 0`. The worker keeps those bytes.
+    Bytes,
+    /// `-ESP_ERR_HTTP_EAGAIN`. Cancel is still clear, so the worker reads again.
+    Timeout,
+    /// `read == 0`. The worker checks Content-Length and then drops the client.
+    Ended,
+}
+
+/// Main-task cancel. Sets the flag and does not close the HTTP client.
+///
+/// `esp_http_client_close` destroys the TLS session. The worker may be inside
+/// `esp_tls_conn_read` on that session, so only the worker may close it.
+pub fn request_cancel(flag: &std::sync::atomic::AtomicBool) {
+    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Between body reads. When the flag is set, `close_on_worker` runs on the
+/// worker thread and the read is not started.
+pub fn stop_if_cancelled(
+    cancelled: bool,
+    close_on_worker: &mut dyn FnMut(),
+) -> Result<(), &'static str> {
+    if cancelled {
+        close_on_worker();
+        Err("cancelled")
+    } else {
+        Ok(())
+    }
+}
+
+/// Classify one body read on the worker.
+///
+/// `eagain` is `ESP_ERR_HTTP_EAGAIN` (28679 in IDF 5.4.3). A timeout is not a
+/// failed chapter. When `cancelled` is set, including when it became set while
+/// the read was blocked, the worker closes the client on this thread.
+pub fn worker_read(
+    cancelled: bool,
+    read: i32,
+    eagain: i32,
+    close_on_worker: &mut dyn FnMut(),
+) -> Result<BodyRead, &'static str> {
+    if cancelled {
+        close_on_worker();
+        return Err("cancelled");
+    }
+    if read == -eagain {
+        return Ok(BodyRead::Timeout);
+    }
+    if read < 0 {
+        return Err("HTTP response read failed");
+    }
+    if read == 0 {
+        return Ok(BodyRead::Ended);
+    }
+    Ok(BodyRead::Bytes)
+}
+
+/// Returned when a body read makes no progress. Not `"cancelled"`, so a
+/// download retries and then skips.
+pub const HTTP_STALL_ERROR: &str = "HTTP response stalled";
+/// Returned when one job's body reads run past [`crate::weread::limits::HTTP_CHAPTER_LIMIT_MS`].
+pub const HTTP_CHAPTER_TIMEOUT_ERROR: &str = "HTTP chapter timed out";
+
+/// Idle and total limits for the body reads of one WeRead job.
+///
+/// The device feeds `esp_timer_get_time`. Host tests pass synthetic timestamps.
+/// `last_bytes_ms` moves only when a read returns payload bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BodyClock {
+    started_ms: u64,
+    last_bytes_ms: u64,
+}
+
+impl BodyClock {
+    #[must_use]
+    pub fn start(now_ms: u64) -> Self {
+        Self {
+            started_ms: now_ms,
+            last_bytes_ms: now_ms,
+        }
+    }
+
+    /// `got_bytes` resets the idle window. A timeout passes `false`.
+    pub fn observe(&mut self, now_ms: u64, got_bytes: bool) -> Result<(), &'static str> {
+        if got_bytes {
+            self.last_bytes_ms = now_ms;
+        }
+        if now_ms.saturating_sub(self.started_ms) >= crate::weread::limits::HTTP_CHAPTER_LIMIT_MS {
+            return Err(HTTP_CHAPTER_TIMEOUT_ERROR);
+        }
+        if now_ms.saturating_sub(self.last_bytes_ms) >= crate::weread::limits::HTTP_IDLE_LIMIT_MS {
+            return Err(HTTP_STALL_ERROR);
+        }
+        Ok(())
+    }
 }
 
 pub trait Transport {
@@ -1126,9 +1232,17 @@ fn stream_part(
             },
             part,
         )
-        .map_err(|error| JobError::Message(trim_message(&error)))?;
+        .map_err(transport_job_error)?;
     if streamed.total > MAX_SHARD_BYTES {
         return Err(JobError::Message("response exceeds size limit".into()));
+    }
+    if let Some(error) = body_transfer_error(
+        streamed.content_length,
+        streamed.total,
+        streamed.chunked,
+        streamed.terminal_chunk,
+    ) {
+        return Err(JobError::Message(error.into()));
     }
     session.absorb_set_cookie(&streamed.set_cookie);
     let prefix = String::from_utf8_lossy(
@@ -1357,17 +1471,19 @@ fn renew(
     let previous_skey = session.skey.clone();
     session.absorb_set_cookie(&response.set_cookie);
     let text = body_text(&response).unwrap_or_default();
-    if parse::renewal_succeeded(&text) {
-        if session.skey != previous_skey {
-            if let Some(now) = ctx.unix {
-                session.skey_unix = now;
-            }
-        }
-        Ok(())
-    } else {
+    if !parse::renewal_succeeded(&text) {
         session.expire_web();
-        Err(JobError::Expired)
+        return Err(JobError::Expired);
     }
+    if session.skey == previous_skey || session.skey.is_empty() {
+        return Err(JobError::Message(
+            "WeRead session renewal did not return a new key.".into(),
+        ));
+    }
+    if let Some(now) = ctx.unix {
+        session.skey_unix = now;
+    }
+    Ok(())
 }
 
 fn call(
@@ -1394,9 +1510,7 @@ fn call(
             ));
         }
     }
-    let response = transport
-        .call(&request)
-        .map_err(|error| JobError::Message(trim_message(&error)))?;
+    let response = transport.call(&request).map_err(transport_job_error)?;
     if let Some(len) = response.content_length {
         if len > request.max_bytes {
             return Err(JobError::Message("response exceeds size limit".into()));
@@ -1404,6 +1518,13 @@ fn call(
     }
     if response.body.len() > request.max_bytes {
         return Err(JobError::Message("response exceeds size limit".into()));
+    }
+    let declared = response
+        .content_length
+        .map(|len| i64::try_from(len).unwrap_or(i64::MAX))
+        .unwrap_or(-1);
+    if let Some(error) = body_transfer_error(declared, response.body.len(), false, true) {
+        return Err(JobError::Message(error.into()));
     }
     let text = String::from_utf8_lossy(&response.body);
     match parse::classify(response.status, &text) {
@@ -1438,6 +1559,14 @@ fn decode_pair(first: &[u8], second: &[u8]) -> Result<String, JobError> {
     let bytes =
         decode::decode_shards(&[&a, &b]).map_err(|error| JobError::Message(error.into()))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn transport_job_error(error: String) -> JobError {
+    if error == "cancelled" {
+        JobError::Cancelled
+    } else {
+        JobError::Message(trim_message(&error))
+    }
 }
 
 fn trim_message(value: &str) -> String {
@@ -1525,7 +1654,12 @@ mod tests {
         let shard = seal_plain("<p>Hello 微信</p>");
         let mut reader = Script {
             steps: vec![
-                json_response(r#"{"succ":1}"#),
+                Response {
+                    status: 200,
+                    body: br#"{"succ":1}"#.to_vec(),
+                    set_cookie: "wr_skey=tok2; Path=/".into(),
+                    content_length: Some(10),
+                },
                 Response {
                     status: 200,
                     body: format!(r#"{{"reader":{{"psvts":"ps-token"}}}}"#).into_bytes(),
@@ -1663,7 +1797,7 @@ mod tests {
     }
 
     #[test]
-    fn renewal_keeps_skey_unix_until_wr_skey_changes() {
+    fn renewal_without_a_new_skey_is_an_error() {
         let unix = 1_780_488_000;
         let mut unchanged = Script {
             steps: vec![
@@ -1692,9 +1826,49 @@ mod tests {
             },
             Some(unix),
         );
+        let Err(JobError::Message(message)) = report.result else {
+            panic!("renewal without wr_skey must fail");
+        };
+        assert!(message.contains("new key"));
         assert_eq!(report.session.skey, "old-key");
         assert_eq!(report.session.skey_unix, 1);
+        assert!(unchanged
+            .urls
+            .iter()
+            .all(|url| url.contains("/web/login/renewal")));
+        assert!(!unchanged.urls.iter().any(|url| url.contains("shelf")));
 
+        let mut same_key = Script {
+            steps: vec![Response {
+                status: 200,
+                body: br#"{"succ":1}"#.to_vec(),
+                set_cookie: "wr_skey=old-key; Path=/".into(),
+                content_length: Some(10),
+            }],
+            index: 0,
+            waits: 0,
+            urls: Vec::new(),
+        };
+        let report = perform(
+            &mut same_key,
+            Work {
+                generation: 3,
+                job: Job::Shelf,
+                session: session.clone(),
+            },
+            Some(unix),
+        );
+        assert!(matches!(report.result, Err(JobError::Message(_))));
+        assert_eq!(report.session.skey_unix, 1);
+    }
+
+    #[test]
+    fn renewal_updates_skey_unix_when_wr_skey_changes() {
+        let unix = 1_780_488_000;
+        let mut session = Session::default();
+        session.vid = "9".into();
+        session.skey = "old-key".into();
+        session.skey_unix = 1;
         let mut rotated = Script {
             steps: vec![
                 Response {
@@ -1720,6 +1894,179 @@ mod tests {
         );
         assert_eq!(report.session.skey, "new-key");
         assert_eq!(report.session.skey_unix, unix);
+    }
+
+    #[test]
+    fn cancel_closes_the_client_on_the_worker_after_a_short_read() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // IDF 5.4.3 `ESP_ERR_HTTP_EAGAIN`. The device passes the binding;
+        // this value is what `esp_http_client_read` returns on timeout.
+        const EAGAIN: i32 = 28679;
+        assert!((2_000..=3_000).contains(&crate::weread::limits::HTTP_READ_TIMEOUT_MS));
+
+        struct Session {
+            closed_on_worker: bool,
+        }
+        impl Session {
+            fn close_on_worker(&mut self) {
+                self.closed_on_worker = true;
+            }
+        }
+
+        let mut session = Session {
+            closed_on_worker: false,
+        };
+        let flag = AtomicBool::new(false);
+
+        let step = super::worker_read(false, -EAGAIN, EAGAIN, &mut || session.close_on_worker())
+            .expect("timeout");
+        assert_eq!(step, super::BodyRead::Timeout);
+        assert!(!session.closed_on_worker);
+
+        super::request_cancel(&flag);
+        assert!(flag.load(Ordering::Relaxed));
+        assert!(
+            !session.closed_on_worker,
+            "the main task must not close the client"
+        );
+
+        let error = super::worker_read(flag.load(Ordering::Relaxed), -EAGAIN, EAGAIN, &mut || {
+            session.close_on_worker()
+        })
+        .expect_err("cancel");
+        assert_eq!(error, "cancelled");
+        assert!(
+            session.closed_on_worker,
+            "the worker closes after the timed-out read returns"
+        );
+
+        let mut session = Session {
+            closed_on_worker: false,
+        };
+        let error = super::stop_if_cancelled(true, &mut || session.close_on_worker())
+            .expect_err("between reads");
+        assert_eq!(error, "cancelled");
+        assert!(session.closed_on_worker);
+
+        let mut session = Session {
+            closed_on_worker: false,
+        };
+        assert!(super::stop_if_cancelled(false, &mut || session.close_on_worker()).is_ok());
+        assert!(!session.closed_on_worker);
+        assert_eq!(
+            super::worker_read(false, -1, EAGAIN, &mut || session.close_on_worker()),
+            Err("HTTP response read failed")
+        );
+        assert!(!session.closed_on_worker);
+        assert_eq!(
+            super::worker_read(false, 64, EAGAIN, &mut || session.close_on_worker()),
+            Ok(super::BodyRead::Bytes)
+        );
+        assert_eq!(
+            super::worker_read(false, 0, EAGAIN, &mut || session.close_on_worker()),
+            Ok(super::BodyRead::Ended)
+        );
+    }
+
+    #[test]
+    fn stalled_or_trickling_reads_fail_into_retry_skip() {
+        let mut clock = super::BodyClock::start(0);
+        clock.observe(3_000, false).expect("one short read");
+        clock
+            .observe(18_000, false)
+            .expect("still inside the idle window");
+        clock.observe(19_000, true).expect("bytes reset idle time");
+        clock
+            .observe(38_000, false)
+            .expect("19s since the last byte");
+        assert_eq!(clock.observe(39_000, false), Err(super::HTTP_STALL_ERROR));
+
+        let mut clock = super::BodyClock::start(1_000);
+        for now in (6_000..121_000).step_by(5_000) {
+            clock
+                .observe(now, true)
+                .expect("a trickle stays under the chapter cap");
+        }
+        assert_eq!(
+            clock.observe(121_000, true),
+            Err(super::HTTP_CHAPTER_TIMEOUT_ERROR)
+        );
+
+        for error in [super::HTTP_STALL_ERROR, super::HTTP_CHAPTER_TIMEOUT_ERROR] {
+            assert_ne!(error, "cancelled");
+            assert!(matches!(
+                super::transport_job_error(error.into()),
+                super::JobError::Message(message) if message == error
+            ));
+        }
+    }
+
+    #[test]
+    fn truncated_and_unchunked_downloads_are_not_stored() {
+        let mut short = RecordingStream {
+            steps: vec![Response {
+                status: 200,
+                body: b"AAAA".to_vec(),
+                set_cookie: String::new(),
+                content_length: Some(100),
+            }],
+            index: 0,
+            urls: Vec::new(),
+            chunk_lens: Vec::new(),
+        };
+        let report = perform(
+            &mut short,
+            Work {
+                generation: 1,
+                job: chapter_job(false),
+                session: stream_session(),
+            },
+            Some(1_780_488_000),
+        );
+        let Err(JobError::Message(message)) = report.result else {
+            panic!("short Content-Length must not be stored");
+        };
+        assert!(message.contains("Content-Length"));
+
+        struct OpenChunk;
+        impl Transport for OpenChunk {
+            fn idle(&mut self) {}
+            fn call(&mut self, _request: &Request) -> Result<Response, String> {
+                Err("unused".into())
+            }
+            fn streaming_download(&self) -> bool {
+                true
+            }
+            fn call_stream(
+                &mut self,
+                _request: &Request,
+                _part: &'static str,
+            ) -> Result<StreamedPart, String> {
+                Ok(StreamedPart {
+                    status: 200,
+                    set_cookie: String::new(),
+                    prefix: b"AAAA".to_vec(),
+                    total: 4,
+                    content_length: -1,
+                    chunked: true,
+                    terminal_chunk: false,
+                })
+            }
+        }
+        let report = perform(
+            &mut OpenChunk,
+            Work {
+                generation: 2,
+                job: chapter_job(false),
+                session: stream_session(),
+            },
+            Some(1_780_488_000),
+        );
+        let Err(JobError::Message(message)) = report.result else {
+            panic!("missing terminal chunk must not be stored");
+        };
+        assert!(message.contains("terminal chunk"));
     }
 
     #[test]
@@ -1858,11 +2205,21 @@ mod tests {
                 .body
                 .len()
                 .min(crate::weread::limits::DOWNLOAD_CLASSIFY_BYTES);
+            let content_length = response
+                .content_length
+                .map(|len| i64::try_from(len).unwrap_or(i64::MAX))
+                .unwrap_or(-1);
+            let terminal_chunk = response
+                .content_length
+                .is_none_or(|len| response.body.len() == len);
             Ok(StreamedPart {
                 status: response.status,
                 set_cookie: response.set_cookie,
                 prefix: response.body[..prefix_len].to_vec(),
                 total: response.body.len(),
+                content_length,
+                chunked: false,
+                terminal_chunk,
             })
         }
     }

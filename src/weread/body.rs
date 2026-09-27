@@ -46,6 +46,44 @@ impl BoundedBody {
     }
 }
 
+/// A normal end of the connection is a complete body only when every declared
+/// byte arrived, and a chunked body only after the terminal chunk.
+///
+/// `content_length` is negative when the response has no Content-Length.
+/// `terminal_chunk` is the ESP-IDF "complete data received" flag: for a
+/// chunked response that is the zero-length chunk.
+#[must_use]
+pub fn body_transfer_error(
+    content_length: i64,
+    bytes_read: usize,
+    chunked: bool,
+    terminal_chunk: bool,
+) -> Option<&'static str> {
+    if !chunked && content_length >= 0 && bytes_read != content_length as usize {
+        return Some("HTTP response ended before Content-Length");
+    }
+    if chunked && !terminal_chunk {
+        return Some("HTTP response ended before the terminal chunk");
+    }
+    None
+}
+
+/// A cancelled job is a cancel, not a short body that should be stored.
+/// The worker closes the HTTP client; this check only classifies the stop.
+#[must_use]
+pub fn stopped_transfer_error(
+    cancelled: bool,
+    content_length: i64,
+    bytes_read: usize,
+    chunked: bool,
+    terminal_chunk: bool,
+) -> Option<&'static str> {
+    if cancelled {
+        return Some("cancelled");
+    }
+    body_transfer_error(content_length, bytes_read, chunked, terminal_chunk)
+}
+
 #[cfg(test)]
 mod tests {
     use super::BoundedBody;
@@ -58,5 +96,23 @@ mod tests {
         body.push(b"abcd").unwrap();
         assert!(body.push(b"efghij").is_err());
         assert_eq!(body.len(), 4);
+    }
+
+    #[test]
+    fn short_content_length_and_missing_terminal_chunk_are_failures() {
+        assert_eq!(super::body_transfer_error(100, 100, false, true), None);
+        assert_eq!(
+            super::body_transfer_error(100, 40, false, false),
+            Some("HTTP response ended before Content-Length")
+        );
+        assert_eq!(
+            super::body_transfer_error(-1, 40, true, false),
+            Some("HTTP response ended before the terminal chunk")
+        );
+        assert_eq!(super::body_transfer_error(-1, 40, true, true), None);
+        assert_eq!(
+            super::stopped_transfer_error(true, 100, 40, false, false),
+            Some("cancelled")
+        );
     }
 }

@@ -521,6 +521,26 @@ impl WereadUi {
         }
     }
 
+    /// Long-press chapter jump. A book with no further chapter stays put.
+    pub fn jump_chapter(&mut self, forward: bool, layout: ReaderLayout, mounted: bool) {
+        if self.chapters.is_empty() {
+            return;
+        }
+        if forward {
+            if self.chapter_pos + 1 >= self.chapters.len() {
+                return;
+            }
+            self.chapter_pos += 1;
+            self.page_index = 0;
+        } else if self.chapter_pos == 0 {
+            return;
+        } else {
+            self.chapter_pos -= 1;
+            self.page_index = 0;
+        }
+        self.begin_read(layout, mounted);
+    }
+
     fn on_notes(&mut self, event: ButtonEvent) -> Option<ScreenRoute> {
         let count = self.notes.len().max(1);
         match event {
@@ -1553,14 +1573,8 @@ mod tests {
             level: 1,
         }];
         ui.pages = vec![
-            vec![crate::reader::ReaderPageLine {
-                text: "one".into(),
-                paragraph_end: true,
-            }],
-            vec![crate::reader::ReaderPageLine {
-                text: "two".into(),
-                paragraph_end: true,
-            }],
+            vec![crate::reader::ReaderPageLine::new("one", true)],
+            vec![crate::reader::ReaderPageLine::new("two", true)],
         ];
         let layout = ReaderPreferences::default().layout();
         assert_eq!(
@@ -1934,10 +1948,7 @@ mod tests {
         ui.phase = super::Phase::Download;
         ui.chapters = vec![chapter("1", 1, "One")];
         ui.generation = 2;
-        ui.pages = vec![vec![crate::reader::ReaderPageLine {
-            text: "old".into(),
-            paragraph_end: true,
-        }]];
+        ui.pages = vec![vec![crate::reader::ReaderPageLine::new("old", true)]];
         ui.chapter_source = "old".into();
         ui.apply_report(
             Report {
@@ -1997,10 +2008,7 @@ mod tests {
         ui.chapters = vec![chapter("1", 1, "One")];
         ui.generation = 3;
         ui.chapter_source = "old".into();
-        ui.pages = vec![vec![crate::reader::ReaderPageLine {
-            text: "old".into(),
-            paragraph_end: true,
-        }]];
+        ui.pages = vec![vec![crate::reader::ReaderPageLine::new("old", true)]];
         ui.apply_report(
             Report {
                 generation: 3,

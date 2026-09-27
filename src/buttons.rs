@@ -8,6 +8,22 @@ use embedded_hal::{delay::DelayNs, digital::InputPin};
 const DEBOUNCE_MS: u32 = 25;
 /// Hold duration required for GPIO0 BOOT to navigate one hierarchy level back.
 pub const BOOT_BACK_LONG_PRESS_MS: u32 = 900;
+/// Hold duration that turns a page key into a chapter jump while reading.
+pub const KEY_LONG_PRESS_MS: u32 = 600;
+
+/// One debounced key release, including how long it was held.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KeyPress {
+    pub event: ButtonEvent,
+    pub held_ms: u32,
+}
+
+impl KeyPress {
+    #[must_use]
+    pub const fn is_long(self) -> bool {
+        self.held_ms >= KEY_LONG_PRESS_MS
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ButtonEvent {
@@ -38,8 +54,9 @@ where
         Self { up, select, down }
     }
 
-    /// Return one debounced press. Keys are active low on the Waveshare board.
-    pub fn poll<D: DelayNs>(&mut self, delay: &mut D) -> Result<Option<ButtonEvent>> {
+    /// Return one debounced press, including how long the key was held.
+    /// Keys are active low on the Waveshare board.
+    pub fn poll<D: DelayNs>(&mut self, delay: &mut D) -> Result<Option<KeyPress>> {
         if self.is_pressed(ButtonEvent::Up)? {
             return self.confirm(delay, ButtonEvent::Up);
         }
@@ -56,17 +73,19 @@ where
         &mut self,
         delay: &mut D,
         event: ButtonEvent,
-    ) -> Result<Option<ButtonEvent>> {
+    ) -> Result<Option<KeyPress>> {
         delay.delay_ms(DEBOUNCE_MS);
         if !self.is_pressed(event)? {
             return Ok(None);
         }
 
         // Do not generate repeated UI events while the panel is refreshing.
+        let mut held_ms = DEBOUNCE_MS;
         while self.is_pressed(event)? {
             delay.delay_ms(10);
+            held_ms = held_ms.saturating_add(10);
         }
-        Ok(Some(event))
+        Ok(Some(KeyPress { event, held_ms }))
     }
 
     /// True when any reader key is held down. Layout batches use this so a

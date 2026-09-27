@@ -86,7 +86,8 @@ pub const READER_EPUB_INDEX_YIELD_MILLIS: u64 = 1;
 
 const READER_PERSISTENCE_VERSION: &str = "1";
 const READER_CACHE_VERSION: &str = "3";
-const READER_PREFS_VERSION: &str = "1";
+const READER_PREFS_VERSION: &str = "2";
+const READER_PREFS_VERSION_V1: &str = "1";
 const CACHE_FNV_OFFSET: u64 = 0xcbf29ce484222325;
 const CACHE_FNV_PRIME: u64 = 0x100000001b3;
 
@@ -744,6 +745,343 @@ impl ParagraphAlignment {
     }
 }
 
+/// Extra leading added on top of the font's built-in line step.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LineSpacing {
+    #[default]
+    Px0,
+    Px4,
+    Px8,
+    Px12,
+}
+
+impl LineSpacing {
+    #[must_use]
+    pub const fn pixels(self) -> u8 {
+        match self {
+            Self::Px0 => 0,
+            Self::Px4 => 4,
+            Self::Px8 => 8,
+            Self::Px12 => 12,
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Px0 => "0 px",
+            Self::Px4 => "4 px",
+            Self::Px8 => "8 px",
+            Self::Px12 => "12 px",
+        }
+    }
+
+    #[must_use]
+    pub const fn marker(self) -> &'static str {
+        match self {
+            Self::Px0 => "0",
+            Self::Px4 => "4",
+            Self::Px8 => "8",
+            Self::Px12 => "12",
+        }
+    }
+
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Px0 => Self::Px4,
+            Self::Px4 => Self::Px8,
+            Self::Px8 => Self::Px12,
+            Self::Px12 => Self::Px0,
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "0" => Ok(Self::Px0),
+            "4" => Ok(Self::Px4),
+            "8" => Ok(Self::Px8),
+            "12" => Ok(Self::Px12),
+            other => Err(format!("unsupported line_spacing value {other:?}")),
+        }
+    }
+}
+
+/// Blank lines inserted after a paragraph. Counted inside `lines_per_page`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ParagraphSpacing {
+    #[default]
+    Lines0,
+    Lines1,
+    Lines2,
+}
+
+impl ParagraphSpacing {
+    #[must_use]
+    pub const fn lines(self) -> u8 {
+        match self {
+            Self::Lines0 => 0,
+            Self::Lines1 => 1,
+            Self::Lines2 => 2,
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Lines0 => "0",
+            Self::Lines1 => "1 line",
+            Self::Lines2 => "2 lines",
+        }
+    }
+
+    #[must_use]
+    pub const fn marker(self) -> &'static str {
+        match self {
+            Self::Lines0 => "0",
+            Self::Lines1 => "1",
+            Self::Lines2 => "2",
+        }
+    }
+
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Lines0 => Self::Lines1,
+            Self::Lines1 => Self::Lines2,
+            Self::Lines2 => Self::Lines0,
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "0" => Ok(Self::Lines0),
+            "1" => Ok(Self::Lines1),
+            "2" => Ok(Self::Lines2),
+            other => Err(format!("unsupported paragraph_spacing value {other:?}")),
+        }
+    }
+}
+
+/// Extra inset subtracted from the historical content box, per edge.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PageMargin {
+    #[default]
+    Px0,
+    Px8,
+    Px16,
+    Px24,
+}
+
+impl PageMargin {
+    #[must_use]
+    pub const fn pixels(self) -> u8 {
+        match self {
+            Self::Px0 => 0,
+            Self::Px8 => 8,
+            Self::Px16 => 16,
+            Self::Px24 => 24,
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Px0 => "0",
+            Self::Px8 => "8 px",
+            Self::Px16 => "16 px",
+            Self::Px24 => "24 px",
+        }
+    }
+
+    #[must_use]
+    pub const fn marker(self) -> &'static str {
+        match self {
+            Self::Px0 => "0",
+            Self::Px8 => "8",
+            Self::Px16 => "16",
+            Self::Px24 => "24",
+        }
+    }
+
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Px0 => Self::Px8,
+            Self::Px8 => Self::Px16,
+            Self::Px16 => Self::Px24,
+            Self::Px24 => Self::Px0,
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "0" => Ok(Self::Px0),
+            "8" => Ok(Self::Px8),
+            "16" => Ok(Self::Px16),
+            "24" => Ok(Self::Px24),
+            other => Err(format!("unsupported margin value {other:?}")),
+        }
+    }
+}
+
+/// How often a page turn asks for a full panel refresh to clear ghosting.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FullRefreshEvery {
+    #[default]
+    Off,
+    Turns5,
+    Turns10,
+    Turns20,
+}
+
+impl FullRefreshEvery {
+    #[must_use]
+    pub const fn turns(self) -> Option<u8> {
+        match self {
+            Self::Off => None,
+            Self::Turns5 => Some(5),
+            Self::Turns10 => Some(10),
+            Self::Turns20 => Some(20),
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Turns5 => "5",
+            Self::Turns10 => "10",
+            Self::Turns20 => "20",
+        }
+    }
+
+    #[must_use]
+    pub const fn marker(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Turns5 => "5",
+            Self::Turns10 => "10",
+            Self::Turns20 => "20",
+        }
+    }
+
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Turns5,
+            Self::Turns5 => Self::Turns10,
+            Self::Turns10 => Self::Turns20,
+            Self::Turns20 => Self::Off,
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "0" => Ok(Self::Off),
+            "5" => Ok(Self::Turns5),
+            "10" => Ok(Self::Turns10),
+            "20" => Ok(Self::Turns20),
+            other => Err(format!("unsupported full_refresh value {other:?}")),
+        }
+    }
+}
+
+/// Automatic forward page turn. Off leaves the light-sleep wait unchanged.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AutoPageTurn {
+    #[default]
+    Off,
+    Secs15,
+    Secs30,
+    Secs60,
+    Secs120,
+}
+
+impl AutoPageTurn {
+    #[must_use]
+    pub const fn seconds(self) -> Option<u64> {
+        match self {
+            Self::Off => None,
+            Self::Secs15 => Some(15),
+            Self::Secs30 => Some(30),
+            Self::Secs60 => Some(60),
+            Self::Secs120 => Some(120),
+        }
+    }
+
+    #[must_use]
+    pub const fn millis(self) -> Option<u64> {
+        match self.seconds() {
+            Some(seconds) => Some(seconds.saturating_mul(1_000)),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Secs15 => "15 s",
+            Self::Secs30 => "30 s",
+            Self::Secs60 => "60 s",
+            Self::Secs120 => "120 s",
+        }
+    }
+
+    #[must_use]
+    pub const fn marker(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Secs15 => "15",
+            Self::Secs30 => "30",
+            Self::Secs60 => "60",
+            Self::Secs120 => "120",
+        }
+    }
+
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Secs15,
+            Self::Secs15 => Self::Secs30,
+            Self::Secs30 => Self::Secs60,
+            Self::Secs60 => Self::Secs120,
+            Self::Secs120 => Self::Off,
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "0" => Ok(Self::Off),
+            "15" => Ok(Self::Secs15),
+            "30" => Ok(Self::Secs30),
+            "60" => Ok(Self::Secs60),
+            "120" => Ok(Self::Secs120),
+            other => Err(format!("unsupported auto_page_turn value {other:?}")),
+        }
+    }
+}
+
+/// One-tap combinations of the layout-affecting reading preferences.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadingPreset {
+    Compact,
+    Comfortable,
+    LargePrint,
+}
+
+impl ReadingPreset {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Compact => "Compact",
+            Self::Comfortable => "Comfortable",
+            Self::LargePrint => "Large",
+        }
+    }
+}
+
 /// Layout dimensions affecting TXT pagination and cache fingerprints.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReaderLayout {
@@ -753,10 +1091,20 @@ pub struct ReaderLayout {
     pub ascii_advance_px: i32,
     pub font_size_px: u8,
     pub letter_spacing_px: u8,
+    pub line_spacing_px: u8,
+    pub paragraph_gap_lines: u8,
+    pub margin_top_px: u8,
+    pub margin_bottom_px: u8,
+    pub margin_left_px: u8,
+    pub margin_right_px: u8,
+    pub first_line_indent: bool,
+    pub justified: bool,
     pub orientation: ReaderOrientation,
     pub font_size: BookFontSize,
     pub book_font: BookFont,
     pub letter_spacing: LetterSpacing,
+    pub line_spacing: LineSpacing,
+    pub paragraph_spacing: ParagraphSpacing,
     pub paragraph_alignment: ParagraphAlignment,
 }
 
@@ -772,6 +1120,16 @@ impl ReaderLayout {
         };
         base.saturating_add(i32::from(self.letter_spacing_px))
     }
+
+    /// Width reserved on the first line of a paragraph: two CJK cells.
+    #[must_use]
+    pub fn indent_px(self) -> i32 {
+        if self.first_line_indent {
+            2 * (i32::from(self.font_size_px) + i32::from(self.letter_spacing_px))
+        } else {
+            0
+        }
+    }
 }
 
 /// Reader-owned preference file persisted as `/RUSTMIX/READER/PREFS.TXT`.
@@ -782,8 +1140,26 @@ pub struct ReaderPreferences {
     pub font_size: BookFontSize,
     pub book_font: BookFont,
     pub letter_spacing: LetterSpacing,
+    pub line_spacing: LineSpacing,
+    pub paragraph_spacing: ParagraphSpacing,
+    pub margin_top: PageMargin,
+    pub margin_bottom: PageMargin,
+    pub margin_left: PageMargin,
+    pub margin_right: PageMargin,
+    pub first_line_indent: bool,
+    pub justified: bool,
     pub paragraph_alignment: ParagraphAlignment,
+    pub chinese_script: crate::reader_hanzi::ChineseScript,
+    pub dark_mode: bool,
+    pub full_refresh: FullRefreshEvery,
     pub show_progress: bool,
+    pub status_page: bool,
+    pub status_chapter: bool,
+    pub status_time: bool,
+    pub status_battery: bool,
+    pub swap_page_keys: bool,
+    pub long_press_chapter: bool,
+    pub auto_page_turn: AutoPageTurn,
     sd_cjk_file: [u8; 13],
 }
 
@@ -795,8 +1171,26 @@ impl Default for ReaderPreferences {
             font_size: BookFontSize::Px24,
             book_font: BookFont::Serif,
             letter_spacing: LetterSpacing::Px0,
+            line_spacing: LineSpacing::Px0,
+            paragraph_spacing: ParagraphSpacing::Lines0,
+            margin_top: PageMargin::Px0,
+            margin_bottom: PageMargin::Px0,
+            margin_left: PageMargin::Px0,
+            margin_right: PageMargin::Px0,
+            first_line_indent: false,
+            justified: true,
             paragraph_alignment: ParagraphAlignment::Justified,
+            chinese_script: crate::reader_hanzi::ChineseScript::Original,
+            dark_mode: false,
+            full_refresh: FullRefreshEvery::Off,
             show_progress: true,
+            status_page: true,
+            status_chapter: true,
+            status_time: false,
+            status_battery: false,
+            swap_page_keys: false,
+            long_press_chapter: false,
+            auto_page_turn: AutoPageTurn::Off,
             sd_cjk_file: [0; 13],
         }
     }
@@ -851,14 +1245,155 @@ impl ReaderPreferences {
         self.book_font.marker().to_string()
     }
 
+    /// Alignment actually used while drawing. The justified toggle wins.
+    #[must_use]
+    pub const fn effective_alignment(self) -> ParagraphAlignment {
+        if self.justified {
+            ParagraphAlignment::Justified
+        } else if matches!(self.paragraph_alignment, ParagraphAlignment::Justified) {
+            ParagraphAlignment::Left
+        } else {
+            self.paragraph_alignment
+        }
+    }
+
+    /// Display-time script conversion. Page byte offsets are not changed.
+    #[must_use]
+    pub fn display_line(self, text: &str) -> String {
+        crate::reader_hanzi::convert(text, self.chinese_script)
+    }
+
+    #[must_use]
+    pub fn matching_preset(self) -> Option<ReadingPreset> {
+        for preset in [
+            ReadingPreset::Compact,
+            ReadingPreset::Comfortable,
+            ReadingPreset::LargePrint,
+        ] {
+            if self.matches_preset(preset) {
+                return Some(preset);
+            }
+        }
+        None
+    }
+
+    fn matches_preset(self, preset: ReadingPreset) -> bool {
+        let sample = Self {
+            theme: self.theme,
+            orientation: self.orientation,
+            book_font: self.book_font,
+            chinese_script: self.chinese_script,
+            dark_mode: self.dark_mode,
+            full_refresh: self.full_refresh,
+            show_progress: self.show_progress,
+            status_page: self.status_page,
+            status_chapter: self.status_chapter,
+            status_time: self.status_time,
+            status_battery: self.status_battery,
+            swap_page_keys: self.swap_page_keys,
+            long_press_chapter: self.long_press_chapter,
+            auto_page_turn: self.auto_page_turn,
+            sd_cjk_file: self.sd_cjk_file,
+            ..Self::preset_values(preset)
+        };
+        self == sample
+    }
+
+    fn preset_values(preset: ReadingPreset) -> Self {
+        let mut prefs = Self::default();
+        match preset {
+            ReadingPreset::Compact => {
+                prefs.font_size = BookFontSize::Px20;
+                prefs.letter_spacing = LetterSpacing::Px0;
+                prefs.line_spacing = LineSpacing::Px0;
+                prefs.paragraph_spacing = ParagraphSpacing::Lines0;
+                prefs.margin_top = PageMargin::Px0;
+                prefs.margin_bottom = PageMargin::Px0;
+                prefs.margin_left = PageMargin::Px0;
+                prefs.margin_right = PageMargin::Px0;
+                prefs.first_line_indent = false;
+                prefs.justified = true;
+                prefs.paragraph_alignment = ParagraphAlignment::Justified;
+            }
+            ReadingPreset::Comfortable => {
+                prefs.font_size = BookFontSize::Px24;
+                prefs.letter_spacing = LetterSpacing::Px1;
+                prefs.line_spacing = LineSpacing::Px4;
+                prefs.paragraph_spacing = ParagraphSpacing::Lines1;
+                prefs.margin_top = PageMargin::Px8;
+                prefs.margin_bottom = PageMargin::Px8;
+                prefs.margin_left = PageMargin::Px8;
+                prefs.margin_right = PageMargin::Px8;
+                prefs.first_line_indent = true;
+                prefs.justified = true;
+                prefs.paragraph_alignment = ParagraphAlignment::Justified;
+            }
+            ReadingPreset::LargePrint => {
+                prefs.font_size = BookFontSize::Px48;
+                prefs.letter_spacing = LetterSpacing::Px2;
+                prefs.line_spacing = LineSpacing::Px12;
+                prefs.paragraph_spacing = ParagraphSpacing::Lines2;
+                prefs.margin_top = PageMargin::Px16;
+                prefs.margin_bottom = PageMargin::Px16;
+                prefs.margin_left = PageMargin::Px16;
+                prefs.margin_right = PageMargin::Px16;
+                prefs.first_line_indent = false;
+                prefs.justified = false;
+                prefs.paragraph_alignment = ParagraphAlignment::Left;
+            }
+        }
+        prefs
+    }
+
+    pub fn apply_preset(&mut self, preset: ReadingPreset) {
+        let kept = *self;
+        *self = Self {
+            theme: kept.theme,
+            orientation: kept.orientation,
+            book_font: kept.book_font,
+            chinese_script: kept.chinese_script,
+            dark_mode: kept.dark_mode,
+            full_refresh: kept.full_refresh,
+            show_progress: kept.show_progress,
+            status_page: kept.status_page,
+            status_chapter: kept.status_chapter,
+            status_time: kept.status_time,
+            status_battery: kept.status_battery,
+            swap_page_keys: kept.swap_page_keys,
+            long_press_chapter: kept.long_press_chapter,
+            auto_page_turn: kept.auto_page_turn,
+            sd_cjk_file: kept.sd_cjk_file,
+            ..Self::preset_values(preset)
+        };
+    }
+
+    pub fn cycle_preset(&mut self) -> ReadingPreset {
+        let next = match self.matching_preset() {
+            Some(ReadingPreset::Compact) => ReadingPreset::Comfortable,
+            Some(ReadingPreset::Comfortable) => ReadingPreset::LargePrint,
+            Some(ReadingPreset::LargePrint) | None => ReadingPreset::Compact,
+        };
+        self.apply_preset(next);
+        next
+    }
+
     #[must_use]
     pub fn layout(self) -> ReaderLayout {
         let px = self.font_size.pixels();
-        let (width_px, height_px) = match self.orientation {
+        let (base_width, base_height) = match self.orientation {
             ReaderOrientation::Portrait => (432, 594),
             ReaderOrientation::Landscape => (752, 300),
         };
-        let line_step = i32::from(px) + i32::from(px) / 4 + 2;
+        let margin_left_px = self.margin_left.pixels();
+        let margin_right_px = self.margin_right.pixels();
+        let margin_top_px = self.margin_top.pixels();
+        let margin_bottom_px = self.margin_bottom.pixels();
+        let width_px =
+            (base_width - i32::from(margin_left_px) - i32::from(margin_right_px)).max(80);
+        let height_px =
+            (base_height - i32::from(margin_top_px) - i32::from(margin_bottom_px)).max(80);
+        let line_spacing_px = self.line_spacing.pixels();
+        let line_step = i32::from(px) + i32::from(px) / 4 + 2 + i32::from(line_spacing_px);
         let lines_per_page = (height_px / line_step).max(4) as usize;
         let ascii_advance_px = match self.book_font {
             BookFont::Serif | BookFont::Literata => (i32::from(px) * 10 / 20).max(6),
@@ -877,33 +1412,63 @@ impl ReaderPreferences {
             ascii_advance_px,
             font_size_px: px,
             letter_spacing_px,
+            line_spacing_px,
+            paragraph_gap_lines: self.paragraph_spacing.lines(),
+            margin_top_px,
+            margin_bottom_px,
+            margin_left_px,
+            margin_right_px,
+            first_line_indent: self.first_line_indent,
+            justified: self.justified,
             orientation: self.orientation,
             font_size: self.font_size,
             book_font: self.book_font,
             letter_spacing: self.letter_spacing,
+            line_spacing: self.line_spacing,
+            paragraph_spacing: self.paragraph_spacing,
             paragraph_alignment: self.paragraph_alignment,
         }
     }
 
     #[must_use]
     pub fn serialized(self) -> String {
-        let show_progress = if self.show_progress { "true" } else { "false" };
         format!(
-            "version={}\ntheme={}\norientation={}\nfont_size={}\nbook_font={}\nletter_spacing={}\nparagraph_alignment={}\nshow_progress={}\n",
+            "version={}\ntheme={}\norientation={}\nfont_size={}\nbook_font={}\nletter_spacing={}\nline_spacing={}\nparagraph_spacing={}\nmargin_top={}\nmargin_bottom={}\nmargin_left={}\nmargin_right={}\nfirst_line_indent={}\njustified={}\nparagraph_alignment={}\nchinese={}\ndark_mode={}\nfull_refresh={}\nshow_progress={}\nstatus_page={}\nstatus_chapter={}\nstatus_time={}\nstatus_battery={}\nswap_page_keys={}\nlong_press_chapter={}\nauto_page_turn={}\n",
             READER_PREFS_VERSION,
             self.theme.marker(),
             self.orientation.marker(),
             self.font_size.marker(),
             self.nvs_face_marker(),
             self.letter_spacing.marker(),
+            self.line_spacing.marker(),
+            self.paragraph_spacing.marker(),
+            self.margin_top.marker(),
+            self.margin_bottom.marker(),
+            self.margin_left.marker(),
+            self.margin_right.marker(),
+            bool_marker(self.first_line_indent),
+            bool_marker(self.justified),
             self.paragraph_alignment.marker(),
-            show_progress,
+            self.chinese_script.marker(),
+            bool_marker(self.dark_mode),
+            self.full_refresh.marker(),
+            bool_marker(self.status_page),
+            bool_marker(self.status_page),
+            bool_marker(self.status_chapter),
+            bool_marker(self.status_time),
+            bool_marker(self.status_battery),
+            bool_marker(self.swap_page_keys),
+            bool_marker(self.long_press_chapter),
+            self.auto_page_turn.marker(),
         )
     }
 
     fn parse(text: &str) -> Result<Self, String> {
         let mut prefs = Self::default();
         let mut version = None;
+        let mut saw_status_page = false;
+        let mut saw_status_chapter = false;
+        let mut saw_justified = false;
         for raw in text.lines() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -922,23 +1487,186 @@ impl ReaderPreferences {
                     prefs.apply_parsed_book_font(parsed, value);
                 }
                 "letter_spacing" => prefs.letter_spacing = LetterSpacing::parse(value)?,
+                "line_spacing" => prefs.line_spacing = LineSpacing::parse(value)?,
+                "paragraph_spacing" => prefs.paragraph_spacing = ParagraphSpacing::parse(value)?,
+                "margin_top" => prefs.margin_top = PageMargin::parse(value)?,
+                "margin_bottom" => prefs.margin_bottom = PageMargin::parse(value)?,
+                "margin_left" => prefs.margin_left = PageMargin::parse(value)?,
+                "margin_right" => prefs.margin_right = PageMargin::parse(value)?,
+                "first_line_indent" => {
+                    prefs.first_line_indent = parse_bool("first_line_indent", value)?
+                }
+                "justified" => {
+                    prefs.justified = parse_bool("justified", value)?;
+                    saw_justified = true;
+                }
                 "paragraph_alignment" => {
                     prefs.paragraph_alignment = ParagraphAlignment::parse(value)?
                 }
-                "show_progress" => {
-                    prefs.show_progress = match value.trim() {
-                        "true" => true,
-                        "false" => false,
-                        _ => return Err("show_progress must be true or false".into()),
-                    }
+                "chinese" => {
+                    prefs.chinese_script = crate::reader_hanzi::ChineseScript::parse(value)?
                 }
+                "dark_mode" => prefs.dark_mode = parse_bool("dark_mode", value)?,
+                "full_refresh" => prefs.full_refresh = FullRefreshEvery::parse(value)?,
+                "show_progress" => {
+                    prefs.show_progress = parse_bool("show_progress", value)?;
+                }
+                "status_page" => {
+                    prefs.status_page = parse_bool("status_page", value)?;
+                    saw_status_page = true;
+                }
+                "status_chapter" => {
+                    prefs.status_chapter = parse_bool("status_chapter", value)?;
+                    saw_status_chapter = true;
+                }
+                "status_time" => prefs.status_time = parse_bool("status_time", value)?,
+                "status_battery" => prefs.status_battery = parse_bool("status_battery", value)?,
+                "swap_page_keys" => prefs.swap_page_keys = parse_bool("swap_page_keys", value)?,
+                "long_press_chapter" => {
+                    prefs.long_press_chapter = parse_bool("long_press_chapter", value)?
+                }
+                "auto_page_turn" => prefs.auto_page_turn = AutoPageTurn::parse(value)?,
                 other => return Err(format!("unsupported Reader preference key {other:?}")),
             }
         }
-        if version.as_deref() != Some(READER_PREFS_VERSION) {
-            return Err("unsupported Reader preference version".into());
+        match version.as_deref() {
+            Some(READER_PREFS_VERSION) | Some(READER_PREFS_VERSION_V1) => {}
+            _ => return Err("unsupported Reader preference version".into()),
+        }
+        if !saw_status_page {
+            prefs.status_page = prefs.show_progress;
+        }
+        if !saw_status_chapter {
+            prefs.status_chapter = prefs.show_progress;
+        }
+        prefs.show_progress = prefs.status_page;
+        if !saw_justified {
+            prefs.justified = prefs.paragraph_alignment == ParagraphAlignment::Justified;
+        } else if prefs.justified {
+            prefs.paragraph_alignment = ParagraphAlignment::Justified;
+        } else if prefs.paragraph_alignment == ParagraphAlignment::Justified {
+            prefs.paragraph_alignment = ParagraphAlignment::Left;
         }
         Ok(prefs)
+    }
+}
+
+/// Swap UP and DOWN while a book page is on screen.
+#[must_use]
+pub fn map_page_turn_event(event: ButtonEvent, swap: bool) -> ButtonEvent {
+    if !swap {
+        return event;
+    }
+    match event {
+        ButtonEvent::Up => ButtonEvent::Down,
+        ButtonEvent::Down => ButtonEvent::Up,
+        other => other,
+    }
+}
+
+/// Long-press direction for a chapter jump. `Some(true)` moves forward.
+#[must_use]
+pub fn chapter_jump_forward(
+    event: ButtonEvent,
+    held_ms: u32,
+    enabled: bool,
+    swap: bool,
+) -> Option<bool> {
+    if !enabled || held_ms < crate::buttons::KEY_LONG_PRESS_MS {
+        return None;
+    }
+    match event {
+        ButtonEvent::Down => Some(!swap),
+        ButtonEvent::Up => Some(swap),
+        ButtonEvent::Select => None,
+    }
+}
+
+/// True when the auto-turn interval has elapsed and a key has not paused it.
+#[must_use]
+pub fn poll_auto_page_turn(
+    now_ms: u64,
+    since_ms: u64,
+    interval: AutoPageTurn,
+    paused: bool,
+) -> bool {
+    if paused {
+        return false;
+    }
+    let Some(period) = interval.millis() else {
+        return false;
+    };
+    now_ms.saturating_sub(since_ms) >= period
+}
+
+/// Armed auto-turn keeps the panel on and blocks deep sleep between turns.
+#[must_use]
+pub const fn auto_page_turn_keeps_awake(interval: AutoPageTurn, paused: bool) -> bool {
+    !paused && !matches!(interval, AutoPageTurn::Off)
+}
+
+/// Host-testable auto-turn clock. A key pauses it; setting the interval arms it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AutoTurnClock {
+    pub since_ms: u64,
+    pub paused: bool,
+}
+
+impl AutoTurnClock {
+    #[must_use]
+    pub const fn new(now_ms: u64) -> Self {
+        Self {
+            since_ms: now_ms,
+            paused: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn on_key(mut self) -> Self {
+        self.paused = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn on_interval_set(mut self, now_ms: u64) -> Self {
+        self.paused = false;
+        self.since_ms = now_ms;
+        self
+    }
+
+    #[must_use]
+    pub const fn after_turn(mut self, now_ms: u64) -> Self {
+        self.since_ms = now_ms;
+        self
+    }
+
+    #[must_use]
+    pub fn due(self, now_ms: u64, interval: AutoPageTurn) -> bool {
+        poll_auto_page_turn(now_ms, self.since_ms, interval, self.paused)
+    }
+}
+
+fn bool_marker(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+fn on_off(value: bool) -> &'static str {
+    if value {
+        "On"
+    } else {
+        "Off"
+    }
+}
+
+fn parse_bool(key: &str, value: &str) -> Result<bool, String> {
+    match value.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!("{key} must be true or false")),
     }
 }
 
@@ -1015,6 +1743,19 @@ pub struct PendingReaderOpen {
 pub struct ReaderPageLine {
     pub text: String,
     pub paragraph_end: bool,
+    /// First visual line of a paragraph. Drawing indents it by two CJK cells.
+    pub first_line_indent: bool,
+}
+
+impl ReaderPageLine {
+    #[must_use]
+    pub fn new(text: impl Into<String>, paragraph_end: bool) -> Self {
+        Self {
+            text: text.into(),
+            paragraph_end,
+            first_line_indent: false,
+        }
+    }
 }
 
 /// One cached portrait page and its byte anchor.
@@ -2046,40 +2787,151 @@ impl ReaderOption {
     }
 }
 
-/// Reading Preferences editor rows. UP/DOWN changes the active value and
-/// SELECT advances to the next row, matching the firmware editor convention.
+/// Which Reading Preferences list is on screen. BOOT backs up one level.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PreferenceMenu {
+    #[default]
+    Root,
+    Typography,
+    Page,
+    Display,
+    Status,
+    Controls,
+}
+
+/// Reading Preferences rows. UP/DOWN moves, SELECT changes a value or opens
+/// a submenu. Seven rows is the most that fits above the footer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadingPreference {
-    ReadingTheme,
-    Orientation,
+    Presets,
+    TypographyMenu,
+    PageMenu,
+    ChineseScript,
+    DisplayMenu,
+    StatusMenu,
+    ControlsMenu,
     BookFontSize,
     BookFont,
     LetterSpacing,
+    LineSpacing,
+    ParagraphSpacing,
+    FirstLineIndent,
+    Justified,
+    MarginTop,
+    MarginBottom,
+    MarginLeft,
+    MarginRight,
+    Orientation,
     ParagraphAlignment,
-    ShowProgress,
+    ReadingTheme,
+    DarkMode,
+    FullRefresh,
+    StatusPage,
+    StatusChapter,
+    StatusTime,
+    StatusBattery,
+    SwapPageKeys,
+    LongPressChapter,
+    AutoPageTurn,
 }
 
 impl ReadingPreference {
-    pub const ALL: [Self; 7] = [
+    const ROOT: [Self; 7] = [
+        Self::Presets,
+        Self::TypographyMenu,
+        Self::PageMenu,
+        Self::ChineseScript,
+        Self::DisplayMenu,
+        Self::StatusMenu,
+        Self::ControlsMenu,
+    ];
+    const TYPOGRAPHY: [Self; 7] = [
         Self::BookFontSize,
         Self::BookFont,
         Self::LetterSpacing,
-        Self::ReadingTheme,
+        Self::LineSpacing,
+        Self::ParagraphSpacing,
+        Self::FirstLineIndent,
+        Self::Justified,
+    ];
+    const PAGE: [Self; 6] = [
+        Self::MarginTop,
+        Self::MarginBottom,
+        Self::MarginLeft,
+        Self::MarginRight,
         Self::Orientation,
         Self::ParagraphAlignment,
-        Self::ShowProgress,
     ];
+    const DISPLAY: [Self; 3] = [Self::ReadingTheme, Self::DarkMode, Self::FullRefresh];
+    const STATUS: [Self; 4] = [
+        Self::StatusPage,
+        Self::StatusChapter,
+        Self::StatusTime,
+        Self::StatusBattery,
+    ];
+    const CONTROLS: [Self; 3] = [
+        Self::SwapPageKeys,
+        Self::LongPressChapter,
+        Self::AutoPageTurn,
+    ];
+
+    #[must_use]
+    pub const fn rows(menu: PreferenceMenu) -> &'static [Self] {
+        match menu {
+            PreferenceMenu::Root => &Self::ROOT,
+            PreferenceMenu::Typography => &Self::TYPOGRAPHY,
+            PreferenceMenu::Page => &Self::PAGE,
+            PreferenceMenu::Display => &Self::DISPLAY,
+            PreferenceMenu::Status => &Self::STATUS,
+            PreferenceMenu::Controls => &Self::CONTROLS,
+        }
+    }
+
+    #[must_use]
+    pub const fn submenu(self) -> Option<PreferenceMenu> {
+        match self {
+            Self::TypographyMenu => Some(PreferenceMenu::Typography),
+            Self::PageMenu => Some(PreferenceMenu::Page),
+            Self::DisplayMenu => Some(PreferenceMenu::Display),
+            Self::StatusMenu => Some(PreferenceMenu::Status),
+            Self::ControlsMenu => Some(PreferenceMenu::Controls),
+            _ => None,
+        }
+    }
 
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
+            Self::Presets => "Presets",
+            Self::TypographyMenu => "Typography",
+            Self::PageMenu => "Page",
+            Self::ChineseScript => "Chinese",
+            Self::DisplayMenu => "Display",
+            Self::StatusMenu => "Status Bar",
+            Self::ControlsMenu => "Controls",
             Self::ReadingTheme => "Reading Theme",
             Self::Orientation => "Orientation",
             Self::BookFontSize => "Book Font Size",
             Self::BookFont => "Book Font",
             Self::LetterSpacing => "Letter Spacing",
+            Self::LineSpacing => "Line Spacing",
+            Self::ParagraphSpacing => "Paragraph Spacing",
+            Self::FirstLineIndent => "First-line Indent",
+            Self::Justified => "Justified",
+            Self::MarginTop => "Top Margin",
+            Self::MarginBottom => "Bottom Margin",
+            Self::MarginLeft => "Left Margin",
+            Self::MarginRight => "Right Margin",
             Self::ParagraphAlignment => "Paragraph Alignment",
-            Self::ShowProgress => "Show Progress",
+            Self::DarkMode => "Dark Mode",
+            Self::FullRefresh => "Full Refresh",
+            Self::StatusPage => "Page Number",
+            Self::StatusChapter => "Chapter Progress",
+            Self::StatusTime => "Time",
+            Self::StatusBattery => "Battery",
+            Self::SwapPageKeys => "Swap Page Keys",
+            Self::LongPressChapter => "Chapter Jump",
+            Self::AutoPageTurn => "Auto Page Turn",
         }
     }
 }
@@ -2130,11 +2982,14 @@ pub struct ReaderUiState {
     pub session: Option<ReaderSession>,
     pub options_selected: usize,
     pub preferences_selected: usize,
+    pub preference_menu: PreferenceMenu,
     preferences_layout_dirty: bool,
     pub last_message: Option<String>,
     persistence_event: Option<String>,
     last_persistence_event: Option<String>,
     clear_ghost_requested: bool,
+    turns_since_refresh: u8,
+    auto_turn_rearm: bool,
     pub sd_cjk_faces: Vec<crate::fonts::SdFontFace>,
     epub_page_anchor_limit: usize,
     epub_index_bytes_limit: usize,
@@ -2161,11 +3016,14 @@ impl Default for ReaderUiState {
             session: None,
             options_selected: 0,
             preferences_selected: 0,
+            preference_menu: PreferenceMenu::Root,
             preferences_layout_dirty: false,
             last_message: None,
             persistence_event: None,
             last_persistence_event: None,
             clear_ghost_requested: false,
+            turns_since_refresh: 0,
+            auto_turn_rearm: false,
             sd_cjk_faces: Vec::new(),
             epub_page_anchor_limit: READER_EPUB_PAGE_ANCHOR_LIMIT,
             epub_index_bytes_limit: READER_EPUB_ANCHOR_INDEX_BYTES_LIMIT,
@@ -2720,6 +3578,7 @@ impl ReaderUiState {
                 return;
             }
             self.persist_current_session_best_effort();
+            self.note_page_turn();
         }
     }
 
@@ -2730,6 +3589,96 @@ impl ReaderUiState {
                 return;
             }
             self.persist_current_session_best_effort();
+            self.note_page_turn();
+        }
+    }
+
+    /// Count a successful page turn and request a full refresh every N turns.
+    pub fn note_page_turn(&mut self) {
+        let Some(every) = self.preferences.full_refresh.turns() else {
+            self.turns_since_refresh = 0;
+            return;
+        };
+        self.turns_since_refresh = self.turns_since_refresh.saturating_add(1);
+        if self.turns_since_refresh >= every {
+            self.turns_since_refresh = 0;
+            self.request_clear_ghosting();
+        }
+    }
+
+    #[must_use]
+    pub fn take_auto_turn_rearm(&mut self) -> bool {
+        core::mem::take(&mut self.auto_turn_rearm)
+    }
+
+    /// Jump one EPUB chapter, or about ten TXT pages when the book has none.
+    pub fn jump_chapter(&mut self, forward: bool) {
+        let Some(format) = self.session.as_ref().map(|session| session.book.format) else {
+            return;
+        };
+        if format == BookFormat::Epub && self.jump_epub_chapter(forward) {
+            self.note_page_turn();
+            return;
+        }
+        for _ in 0..10 {
+            if forward {
+                self.next_page();
+            } else {
+                self.previous_page();
+            }
+        }
+    }
+
+    fn jump_epub_chapter(&mut self, forward: bool) -> bool {
+        let Some(session) = self.session.as_mut() else {
+            return false;
+        };
+        let Some(document) = session.epub_document.as_ref() else {
+            return false;
+        };
+        if document.chapters.is_empty() {
+            return false;
+        }
+        let offset = session.view_offset();
+        let index = session
+            .epub_chapter
+            .as_ref()
+            .map(|layout| layout.index)
+            .or_else(|| {
+                document.chapters.iter().position(|chapter| {
+                    offset >= chapter.text_offset && offset < chapter.text_end_offset
+                })
+            })
+            .unwrap_or(0);
+        let target_index = if forward {
+            index.saturating_add(1)
+        } else if document
+            .chapters
+            .get(index)
+            .is_some_and(|chapter| offset > chapter.text_offset)
+        {
+            index
+        } else {
+            match index.checked_sub(1) {
+                Some(previous) => previous,
+                None => return false,
+            }
+        };
+        let Some(target) = document.chapters.get(target_index) else {
+            return false;
+        };
+        let label = target.label.clone();
+        let text_offset = target.text_offset;
+        match session.jump_to_chapter(target_index, text_offset) {
+            Ok(()) => {
+                self.last_message = Some(format!("Chapter: {label}"));
+                self.persist_current_session_best_effort();
+                true
+            }
+            Err(error) => {
+                self.last_message = Some(error);
+                false
+            }
         }
     }
 
@@ -2906,23 +3855,39 @@ impl ReaderUiState {
 
     pub fn begin_preferences_edit(&mut self) {
         self.preferences_selected = 0;
+        self.preference_menu = PreferenceMenu::Root;
         self.preferences_layout_dirty = false;
     }
 
+    /// Leave a submenu for the root list. Returns false when already at root.
+    pub fn close_preference_submenu(&mut self) -> bool {
+        if self.preference_menu == PreferenceMenu::Root {
+            return false;
+        }
+        self.preference_menu = PreferenceMenu::Root;
+        self.preferences_selected = 0;
+        true
+    }
+
     pub fn cycle_preference_previous(&mut self) {
-        self.preferences_selected = self
-            .preferences_selected
-            .checked_sub(1)
-            .unwrap_or(ReadingPreference::ALL.len() - 1);
+        let len = self.preference_rows().len();
+        self.preferences_selected = self.preferences_selected.checked_sub(1).unwrap_or(len - 1);
     }
 
     pub fn cycle_preference_next(&mut self) {
-        self.preferences_selected = (self.preferences_selected + 1) % ReadingPreference::ALL.len();
+        let len = self.preference_rows().len();
+        self.preferences_selected = (self.preferences_selected + 1) % len;
+    }
+
+    #[must_use]
+    pub fn preference_rows(&self) -> &'static [ReadingPreference] {
+        ReadingPreference::rows(self.preference_menu)
     }
 
     #[must_use]
     pub fn selected_preference(&self) -> ReadingPreference {
-        ReadingPreference::ALL[self.preferences_selected]
+        let rows = self.preference_rows();
+        rows[self.preferences_selected % rows.len()]
     }
 
     /// Apply one Settings-style SELECT action to the highlighted preference.
@@ -2943,13 +3908,51 @@ impl ReaderUiState {
     }
 
     fn apply_selected_preference(&mut self, rebuild_open_book: bool) -> bool {
-        let layout_sensitive = match self.selected_preference() {
+        let row = self.selected_preference();
+        if let Some(menu) = row.submenu() {
+            self.preference_menu = menu;
+            self.preferences_selected = 0;
+            return false;
+        }
+        let layout_sensitive = match row {
+            ReadingPreference::Presets => {
+                let preset = self.preferences.cycle_preset();
+                self.last_message = Some(format!("Preset: {}", preset.label()));
+                true
+            }
+            ReadingPreference::ChineseScript => {
+                self.preferences.chinese_script = self.preferences.chinese_script.next();
+                self.last_message = Some(format!(
+                    "Chinese: {}",
+                    self.preferences.chinese_script.label()
+                ));
+                self.persist_preferences_best_effort();
+                false
+            }
             ReadingPreference::ReadingTheme => {
                 self.preferences.theme = self.preferences.theme.next();
                 self.last_message =
                     Some(format!("Reading theme: {}", self.preferences.theme.label()));
                 self.persist_preferences_best_effort();
                 self.request_clear_ghosting();
+                false
+            }
+            ReadingPreference::DarkMode => {
+                self.preferences.dark_mode = !self.preferences.dark_mode;
+                self.last_message =
+                    Some(format!("Dark mode: {}", on_off(self.preferences.dark_mode)));
+                self.persist_preferences_best_effort();
+                self.request_clear_ghosting();
+                false
+            }
+            ReadingPreference::FullRefresh => {
+                self.preferences.full_refresh = self.preferences.full_refresh.next();
+                self.turns_since_refresh = 0;
+                self.last_message = Some(format!(
+                    "Full refresh: {}",
+                    self.preferences.full_refresh.label()
+                ));
+                self.persist_preferences_best_effort();
                 false
             }
             ReadingPreference::Orientation => {
@@ -2981,27 +3984,152 @@ impl ReaderUiState {
                 ));
                 true
             }
+            ReadingPreference::LineSpacing => {
+                self.preferences.line_spacing = self.preferences.line_spacing.next();
+                self.last_message = Some(format!(
+                    "Line spacing: {}",
+                    self.preferences.line_spacing.label()
+                ));
+                true
+            }
+            ReadingPreference::ParagraphSpacing => {
+                self.preferences.paragraph_spacing = self.preferences.paragraph_spacing.next();
+                self.last_message = Some(format!(
+                    "Paragraph spacing: {}",
+                    self.preferences.paragraph_spacing.label()
+                ));
+                true
+            }
+            ReadingPreference::FirstLineIndent => {
+                self.preferences.first_line_indent = !self.preferences.first_line_indent;
+                self.last_message = Some(format!(
+                    "First-line indent: {}",
+                    on_off(self.preferences.first_line_indent)
+                ));
+                true
+            }
+            ReadingPreference::Justified => {
+                self.preferences.justified = !self.preferences.justified;
+                self.preferences.paragraph_alignment = if self.preferences.justified {
+                    ParagraphAlignment::Justified
+                } else if self.preferences.paragraph_alignment == ParagraphAlignment::Justified {
+                    ParagraphAlignment::Left
+                } else {
+                    self.preferences.paragraph_alignment
+                };
+                self.last_message =
+                    Some(format!("Justified: {}", on_off(self.preferences.justified)));
+                true
+            }
+            ReadingPreference::MarginTop => {
+                self.preferences.margin_top = self.preferences.margin_top.next();
+                self.last_message = Some(format!(
+                    "Top margin: {}",
+                    self.preferences.margin_top.label()
+                ));
+                true
+            }
+            ReadingPreference::MarginBottom => {
+                self.preferences.margin_bottom = self.preferences.margin_bottom.next();
+                self.last_message = Some(format!(
+                    "Bottom margin: {}",
+                    self.preferences.margin_bottom.label()
+                ));
+                true
+            }
+            ReadingPreference::MarginLeft => {
+                self.preferences.margin_left = self.preferences.margin_left.next();
+                self.last_message = Some(format!(
+                    "Left margin: {}",
+                    self.preferences.margin_left.label()
+                ));
+                true
+            }
+            ReadingPreference::MarginRight => {
+                self.preferences.margin_right = self.preferences.margin_right.next();
+                self.last_message = Some(format!(
+                    "Right margin: {}",
+                    self.preferences.margin_right.label()
+                ));
+                true
+            }
             ReadingPreference::ParagraphAlignment => {
                 self.preferences.paragraph_alignment = self.preferences.paragraph_alignment.next();
+                self.preferences.justified =
+                    self.preferences.paragraph_alignment == ParagraphAlignment::Justified;
                 self.last_message = Some(format!(
                     "Paragraph alignment: {}",
                     self.preferences.paragraph_alignment.label()
                 ));
                 true
             }
-            ReadingPreference::ShowProgress => {
-                self.preferences.show_progress = !self.preferences.show_progress;
+            ReadingPreference::StatusPage => {
+                self.preferences.status_page = !self.preferences.status_page;
+                self.preferences.show_progress = self.preferences.status_page;
                 self.last_message = Some(format!(
-                    "Show progress: {}",
-                    if self.preferences.show_progress {
-                        "On"
-                    } else {
-                        "Off"
-                    }
+                    "Page number: {}",
+                    on_off(self.preferences.status_page)
                 ));
                 self.persist_preferences_best_effort();
                 false
             }
+            ReadingPreference::StatusChapter => {
+                self.preferences.status_chapter = !self.preferences.status_chapter;
+                self.last_message = Some(format!(
+                    "Chapter progress: {}",
+                    on_off(self.preferences.status_chapter)
+                ));
+                self.persist_preferences_best_effort();
+                false
+            }
+            ReadingPreference::StatusTime => {
+                self.preferences.status_time = !self.preferences.status_time;
+                self.last_message = Some(format!("Time: {}", on_off(self.preferences.status_time)));
+                self.persist_preferences_best_effort();
+                false
+            }
+            ReadingPreference::StatusBattery => {
+                self.preferences.status_battery = !self.preferences.status_battery;
+                self.last_message = Some(format!(
+                    "Battery: {}",
+                    on_off(self.preferences.status_battery)
+                ));
+                self.persist_preferences_best_effort();
+                false
+            }
+            ReadingPreference::SwapPageKeys => {
+                self.preferences.swap_page_keys = !self.preferences.swap_page_keys;
+                self.last_message = Some(format!(
+                    "Swap page keys: {}",
+                    on_off(self.preferences.swap_page_keys)
+                ));
+                self.persist_preferences_best_effort();
+                false
+            }
+            ReadingPreference::LongPressChapter => {
+                self.preferences.long_press_chapter = !self.preferences.long_press_chapter;
+                self.last_message = Some(format!(
+                    "Chapter jump: {}",
+                    on_off(self.preferences.long_press_chapter)
+                ));
+                self.persist_preferences_best_effort();
+                false
+            }
+            ReadingPreference::AutoPageTurn => {
+                self.preferences.auto_page_turn = self.preferences.auto_page_turn.next();
+                self.auto_turn_rearm = true;
+                self.last_message = Some(format!(
+                    "Auto page turn: {}",
+                    self.preferences.auto_page_turn.label()
+                ));
+                self.persist_preferences_best_effort();
+                false
+            }
+            ReadingPreference::TypographyMenu
+            | ReadingPreference::PageMenu
+            | ReadingPreference::DisplayMenu
+            | ReadingPreference::StatusMenu
+            | ReadingPreference::ControlsMenu => false,
         };
         if !layout_sensitive {
             return false;
@@ -3738,20 +4866,48 @@ fn paginate_decoded(decoded: &[(char, u64)], layout: ReaderLayout) -> (Vec<Reade
     let mut lines = Vec::new();
     let mut line = String::new();
     let mut line_width = 0i32;
+    let mut line_indent = layout.first_line_indent;
+    let indent_px = layout.indent_px();
     let mut consumed = decoded
         .first()
         .map_or(0, |(_, offset)| offset.saturating_sub(1));
+
+    let push_line = |lines: &mut Vec<ReaderPageLine>,
+                     text: String,
+                     paragraph_end: bool,
+                     first_line_indent: bool|
+     -> bool {
+        lines.push(ReaderPageLine {
+            text,
+            paragraph_end,
+            first_line_indent,
+        });
+        lines.len() >= layout.lines_per_page
+    };
+    let push_paragraph_gap = |lines: &mut Vec<ReaderPageLine>| -> bool {
+        for _ in 0..layout.paragraph_gap_lines {
+            if lines.len() >= layout.lines_per_page {
+                return true;
+            }
+            lines.push(ReaderPageLine {
+                text: String::new(),
+                paragraph_end: false,
+                first_line_indent: false,
+            });
+        }
+        false
+    };
+
     for (character, next_offset) in decoded.iter().copied() {
         let character = match character {
             '\r' => continue,
             '\n' => {
-                lines.push(ReaderPageLine {
-                    text: core::mem::take(&mut line),
-                    paragraph_end: true,
-                });
+                let indent = line_indent && !line.is_empty();
+                let full = push_line(&mut lines, core::mem::take(&mut line), true, indent);
                 line_width = 0;
+                line_indent = layout.first_line_indent;
                 consumed = next_offset;
-                if lines.len() >= layout.lines_per_page {
+                if full || push_paragraph_gap(&mut lines) {
                     break;
                 }
                 continue;
@@ -3760,13 +4916,13 @@ fn paginate_decoded(decoded: &[(char, u64)], layout: ReaderLayout) -> (Vec<Reade
             value => value,
         };
         let advance = layout.advance_px(character);
-        if !line.is_empty() && line_width + advance > layout.max_line_width_px {
-            lines.push(ReaderPageLine {
-                text: core::mem::take(&mut line),
-                paragraph_end: false,
-            });
+        let limit = (layout.max_line_width_px - if line_indent { indent_px } else { 0 }).max(1);
+        if !line.is_empty() && line_width + advance > limit {
+            let indent = line_indent;
+            let full = push_line(&mut lines, core::mem::take(&mut line), false, indent);
             line_width = 0;
-            if lines.len() >= layout.lines_per_page {
+            line_indent = false;
+            if full {
                 break;
             }
         }
@@ -3782,9 +4938,11 @@ fn paginate_decoded(decoded: &[(char, u64)], layout: ReaderLayout) -> (Vec<Reade
         consumed = next_offset;
     }
     if lines.len() < layout.lines_per_page && (!line.is_empty() || lines.is_empty()) {
+        let indent = line_indent && !line.is_empty();
         lines.push(ReaderPageLine {
             text: line,
             paragraph_end: true,
+            first_line_indent: indent,
         });
     }
     (lines, consumed)
@@ -3826,10 +4984,7 @@ pub fn paginate_plain_text(
         pages.push(lines);
     }
     if pages.is_empty() {
-        pages.push(vec![ReaderPageLine {
-            text: String::new(),
-            paragraph_end: true,
-        }]);
+        pages.push(vec![ReaderPageLine::new(String::new(), true)]);
     }
     pages
 }
@@ -3884,10 +5039,20 @@ fn book_fingerprint(book: &ReaderBook, layout: ReaderLayout) -> u64 {
     feed(&mut hash, &layout.max_line_width_px.to_le_bytes());
     feed(&mut hash, &layout.font_size_px.to_le_bytes());
     feed(&mut hash, &layout.letter_spacing_px.to_le_bytes());
+    feed(&mut hash, &layout.line_spacing_px.to_le_bytes());
+    feed(&mut hash, &layout.paragraph_gap_lines.to_le_bytes());
+    feed(&mut hash, &layout.margin_top_px.to_le_bytes());
+    feed(&mut hash, &layout.margin_bottom_px.to_le_bytes());
+    feed(&mut hash, &layout.margin_left_px.to_le_bytes());
+    feed(&mut hash, &layout.margin_right_px.to_le_bytes());
+    feed(&mut hash, &[u8::from(layout.first_line_indent)]);
+    feed(&mut hash, &[u8::from(layout.justified)]);
     feed(&mut hash, layout.orientation.marker().as_bytes());
     feed(&mut hash, layout.font_size.marker().as_bytes());
     feed(&mut hash, layout.book_font.marker().as_bytes());
     feed(&mut hash, layout.letter_spacing.marker().as_bytes());
+    feed(&mut hash, layout.line_spacing.marker().as_bytes());
+    feed(&mut hash, layout.paragraph_spacing.marker().as_bytes());
     feed(&mut hash, layout.paragraph_alignment.marker().as_bytes());
     feed(&mut hash, READER_CACHE_VERSION.as_bytes());
     hash
@@ -4354,14 +5519,17 @@ mod tests {
     };
 
     use super::{
-        atomic_replace_text, book_format_from_path, detect_txt_encoding, is_fat83_safe_file_name,
-        load_location_record, normalize_decoded, paginate_decoded, parse_location_fields,
-        parse_location_record, scan_txt_library, serialize_location, serialize_location_fields,
-        with_layout_button_poll, BookFont, BookFontSize, BookFormat, LetterSpacing,
-        ParagraphAlignment, ReaderBook, ReaderChapterPageLabel, ReaderLoadingStage,
-        ReaderLocation, ReaderOrientation, ReaderPreferences, ReaderSession, ReaderTickOutcome,
-        ReaderUiState, ReadingPreference, ReadingTheme, TextEncoding, LEGACY_READER_POSITIONS_FILE,
-        READER_BOOKMARKS_FILE, READER_CACHE_OFFSET_LIMIT, READER_EPUB_ANCHOR_INDEX_BYTES_LIMIT,
+        atomic_replace_text, auto_page_turn_keeps_awake, book_format_from_path,
+        chapter_jump_forward, detect_txt_encoding, is_fat83_safe_file_name, load_location_record,
+        map_page_turn_event, normalize_decoded, paginate_decoded, parse_location_fields,
+        parse_location_record, poll_auto_page_turn, scan_txt_library, serialize_location,
+        serialize_location_fields, with_layout_button_poll, AutoPageTurn, AutoTurnClock, BookFont,
+        BookFontSize, BookFormat, FullRefreshEvery, LetterSpacing, LineSpacing, PageMargin,
+        ParagraphAlignment, ParagraphSpacing, ReaderBook, ReaderChapterPageLabel,
+        ReaderLoadingStage, ReaderLocation, ReaderOrientation, ReaderPreferences, ReaderSession,
+        ReaderTickOutcome, ReaderUiState, ReadingPreference, ReadingPreset, ReadingTheme,
+        TextEncoding, LEGACY_READER_POSITIONS_FILE, READER_BOOKMARKS_FILE,
+        READER_CACHE_OFFSET_LIMIT, READER_EPUB_ANCHOR_INDEX_BYTES_LIMIT,
         READER_EPUB_INDEX_YIELD_EVERY_PAGES, READER_EPUB_INDEX_YIELD_MILLIS,
         READER_EPUB_PAGE_ANCHOR_LIMIT, READER_POSITIONS_FILE, READER_PREFS_FILE,
         READER_RECENT_FILE, READER_STATE_FILE,
@@ -4812,6 +5980,12 @@ mod tests {
         assert_eq!(reader.tick(), ReaderTickOutcome::FirstPageReady);
         reader.begin_preferences_edit();
         reader.cycle_preference_next();
+        assert_eq!(
+            reader.selected_preference(),
+            ReadingPreference::TypographyMenu
+        );
+        assert!(!reader.activate_selected_preference());
+        reader.cycle_preference_next();
         reader.cycle_preference_next();
         assert_eq!(
             reader.selected_preference(),
@@ -4880,6 +6054,13 @@ mod tests {
     fn preference_editor_uses_move_then_select_change_policy() {
         let mut reader = ReaderUiState::default();
         reader.begin_preferences_edit();
+        assert_eq!(reader.selected_preference(), ReadingPreference::Presets);
+        reader.cycle_preference_next();
+        assert_eq!(
+            reader.selected_preference(),
+            ReadingPreference::TypographyMenu
+        );
+        assert!(!reader.activate_selected_preference());
         assert_eq!(
             reader.selected_preference(),
             ReadingPreference::BookFontSize
@@ -4893,6 +6074,8 @@ mod tests {
         );
         assert!(!reader.activate_selected_preference());
         assert_eq!(reader.preferences.font_size, BookFontSize::Px32);
+        assert!(reader.close_preference_submenu());
+        assert_eq!(reader.selected_preference(), ReadingPreference::Presets);
     }
 
     #[test]
@@ -5563,6 +6746,223 @@ mod tests {
         open_until_ready(&mut early);
         assert!(!early.session.as_ref().unwrap().index_complete);
         assert_eq!(early.session.as_ref().unwrap().current_absolute_page(), 3);
+    }
+
+    #[test]
+    fn layout_spacing_margins_indent_and_justification_change_pages_and_cache_keys() {
+        let base = ReaderPreferences {
+            book_font: BookFont::CjkUnifont,
+            font_size: BookFontSize::Px16,
+            ..ReaderPreferences::default()
+        };
+        let spaced = ReaderPreferences {
+            line_spacing: LineSpacing::Px12,
+            ..base
+        };
+        assert!(spaced.layout().lines_per_page < base.layout().lines_per_page);
+        assert_eq!(spaced.layout().line_spacing_px, 12);
+
+        let inset = ReaderPreferences {
+            margin_left: PageMargin::Px24,
+            margin_right: PageMargin::Px24,
+            margin_top: PageMargin::Px16,
+            margin_bottom: PageMargin::Px16,
+            ..base
+        };
+        assert!(inset.layout().max_line_width_px < base.layout().max_line_width_px);
+        assert!(inset.layout().lines_per_page <= base.layout().lines_per_page);
+
+        let gapped = ReaderPreferences {
+            paragraph_spacing: ParagraphSpacing::Lines1,
+            ..base
+        };
+        let decoded: Vec<(char, u64)> = "Hello\nWorld"
+            .chars()
+            .enumerate()
+            .map(|(index, value)| (value, index as u64 + 1))
+            .collect();
+        let (lines, _) = paginate_decoded(&decoded, gapped.layout());
+        assert_eq!(lines[0].text, "Hello");
+        assert!(lines[0].paragraph_end);
+        assert!(lines[1].text.is_empty());
+        assert_eq!(lines[2].text, "World");
+
+        let indented = ReaderPreferences {
+            first_line_indent: true,
+            ..base
+        };
+        let cjk: Vec<(char, u64)> = "中"
+            .repeat(40)
+            .chars()
+            .enumerate()
+            .map(|(index, value)| (value, index as u64 + 1))
+            .collect();
+        let (plain, _) = paginate_decoded(&cjk, base.layout());
+        let (first, _) = paginate_decoded(&cjk, indented.layout());
+        assert!(first[0].first_line_indent);
+        assert!(!first[1].first_line_indent);
+        assert!(first[0].text.chars().count() < plain[0].text.chars().count());
+
+        let mut ragged = base;
+        ragged.justified = false;
+        ragged.paragraph_alignment = ParagraphAlignment::Left;
+        assert_ne!(base.layout(), ragged.layout());
+        assert_eq!(ragged.effective_alignment(), ParagraphAlignment::Left);
+
+        let book = ReaderBook {
+            path: "BOOK.TXT".into(),
+            title: "Book".into(),
+            format: BookFormat::Text,
+            size_bytes: 40,
+            modified_seconds: 1,
+        };
+        let names = [
+            ReaderUiState::cache_file_name_for(&book, base.layout()),
+            ReaderUiState::cache_file_name_for(&book, spaced.layout()),
+            ReaderUiState::cache_file_name_for(&book, inset.layout()),
+            ReaderUiState::cache_file_name_for(&book, gapped.layout()),
+            ReaderUiState::cache_file_name_for(&book, indented.layout()),
+            ReaderUiState::cache_file_name_for(&book, ragged.layout()),
+        ];
+        for (index, name) in names.iter().enumerate() {
+            for other in names.iter().skip(index + 1) {
+                assert_ne!(name, other);
+            }
+        }
+    }
+
+    #[test]
+    fn version_one_preferences_migrate_and_round_trip() {
+        let legacy = ReaderPreferences::parse(
+            "version=1\ntheme=high-contrast\norientation=landscape\nfont_size=xlarge\nbook_font=serif\nparagraph_alignment=right\nshow_progress=false\n",
+        )
+        .unwrap();
+        assert_eq!(legacy.paragraph_alignment, ParagraphAlignment::Right);
+        assert!(!legacy.justified);
+        assert!(!legacy.show_progress);
+        assert!(!legacy.status_page);
+        assert!(!legacy.status_chapter);
+        assert!(!legacy.status_time);
+        assert!(!legacy.status_battery);
+        assert_eq!(legacy.line_spacing, LineSpacing::Px0);
+        assert_eq!(legacy.margin_left, PageMargin::Px0);
+        assert!(!legacy.first_line_indent);
+        assert!(!legacy.dark_mode);
+        assert_eq!(legacy.full_refresh, FullRefreshEvery::Off);
+        assert_eq!(legacy.auto_page_turn, AutoPageTurn::Off);
+        assert_eq!(
+            legacy.chinese_script,
+            crate::reader_hanzi::ChineseScript::Original
+        );
+        let stored = legacy.serialized();
+        assert!(stored.starts_with("version=2\n"));
+        assert_eq!(ReaderPreferences::parse(&stored).unwrap(), legacy);
+
+        let modern = ReaderPreferences::parse(
+            "version=2\ntheme=classic\norientation=portrait\nfont_size=24\nbook_font=serif\nletter_spacing=1\nline_spacing=8\nparagraph_spacing=2\nmargin_top=8\nmargin_bottom=16\nmargin_left=24\nmargin_right=0\nfirst_line_indent=true\njustified=false\nparagraph_alignment=center\nchinese=traditional\ndark_mode=true\nfull_refresh=10\nshow_progress=true\nstatus_page=true\nstatus_chapter=false\nstatus_time=true\nstatus_battery=true\nswap_page_keys=true\nlong_press_chapter=true\nauto_page_turn=60\n",
+        )
+        .unwrap();
+        assert_eq!(modern.line_spacing, LineSpacing::Px8);
+        assert_eq!(modern.paragraph_spacing, ParagraphSpacing::Lines2);
+        assert_eq!(modern.margin_top, PageMargin::Px8);
+        assert_eq!(modern.margin_right, PageMargin::Px0);
+        assert!(modern.first_line_indent);
+        assert!(!modern.justified);
+        assert_eq!(modern.paragraph_alignment, ParagraphAlignment::Center);
+        assert!(modern.dark_mode);
+        assert!(modern.status_time);
+        assert!(!modern.status_chapter);
+        assert!(modern.swap_page_keys);
+        assert_eq!(modern.auto_page_turn, AutoPageTurn::Secs60);
+        assert_eq!(modern.full_refresh, FullRefreshEvery::Turns10);
+        assert_eq!(
+            ReaderPreferences::parse(&modern.serialized()).unwrap(),
+            modern
+        );
+    }
+
+    #[test]
+    fn presets_apply_layout_combos_without_dropping_other_preferences() {
+        let mut prefs = ReaderPreferences::default();
+        prefs.dark_mode = true;
+        prefs.swap_page_keys = true;
+        assert_eq!(prefs.matching_preset(), None);
+        let applied = prefs.cycle_preset();
+        assert_eq!(applied, ReadingPreset::Compact);
+        assert_eq!(prefs.font_size, BookFontSize::Px20);
+        assert!(!prefs.first_line_indent);
+        assert_eq!(prefs.letter_spacing, LetterSpacing::Px0);
+        assert!(prefs.dark_mode);
+        assert!(prefs.swap_page_keys);
+        assert_eq!(prefs.cycle_preset(), ReadingPreset::Comfortable);
+        assert_eq!(prefs.font_size, BookFontSize::Px24);
+        assert_eq!(prefs.letter_spacing, LetterSpacing::Px1);
+        assert_eq!(prefs.line_spacing, LineSpacing::Px4);
+        assert_eq!(prefs.paragraph_spacing, ParagraphSpacing::Lines1);
+        assert_eq!(prefs.margin_left, PageMargin::Px8);
+        assert!(prefs.first_line_indent);
+        assert!(prefs.justified);
+        assert_eq!(prefs.cycle_preset(), ReadingPreset::LargePrint);
+        assert_eq!(prefs.font_size, BookFontSize::Px48);
+        assert_eq!(prefs.letter_spacing, LetterSpacing::Px2);
+        assert_eq!(prefs.line_spacing, LineSpacing::Px12);
+        assert_eq!(prefs.paragraph_spacing, ParagraphSpacing::Lines2);
+        assert_eq!(prefs.margin_top, PageMargin::Px16);
+        assert!(!prefs.first_line_indent);
+        assert!(!prefs.justified);
+        assert_eq!(prefs.paragraph_alignment, ParagraphAlignment::Left);
+        assert_eq!(prefs.matching_preset(), Some(ReadingPreset::LargePrint));
+    }
+
+    #[test]
+    fn full_refresh_counter_and_auto_turn_pause_on_a_key() {
+        let mut reader = ReaderUiState::default();
+        reader.preferences.full_refresh = FullRefreshEvery::Turns5;
+        for _ in 0..4 {
+            reader.note_page_turn();
+        }
+        assert!(!reader.take_clear_ghost_request());
+        reader.note_page_turn();
+        assert!(reader.take_clear_ghost_request());
+        reader.note_page_turn();
+        assert!(!reader.take_clear_ghost_request());
+
+        let clock = AutoTurnClock::new(1_000);
+        assert!(!clock.due(15_999, AutoPageTurn::Secs15));
+        assert!(clock.due(16_000, AutoPageTurn::Secs15));
+        let paused = clock.on_key();
+        assert!(!paused.due(80_000, AutoPageTurn::Secs15));
+        let armed = paused.on_interval_set(90_000);
+        assert!(!armed.due(104_999, AutoPageTurn::Secs15));
+        assert!(armed.due(105_000, AutoPageTurn::Secs15));
+        assert!(!poll_auto_page_turn(200_000, 0, AutoPageTurn::Off, false));
+        assert!(auto_page_turn_keeps_awake(AutoPageTurn::Secs120, false));
+        assert!(!auto_page_turn_keeps_awake(AutoPageTurn::Secs60, true));
+        assert!(!auto_page_turn_keeps_awake(AutoPageTurn::Off, false));
+        assert_eq!(
+            map_page_turn_event(ButtonEvent::Down, true),
+            ButtonEvent::Up
+        );
+        assert_eq!(
+            map_page_turn_event(ButtonEvent::Select, true),
+            ButtonEvent::Select
+        );
+        assert_eq!(
+            chapter_jump_forward(ButtonEvent::Down, 600, true, false),
+            Some(true)
+        );
+        assert_eq!(
+            chapter_jump_forward(ButtonEvent::Up, 600, true, true),
+            Some(true)
+        );
+        assert_eq!(
+            chapter_jump_forward(ButtonEvent::Down, 599, true, false),
+            None
+        );
+        assert_eq!(
+            chapter_jump_forward(ButtonEvent::Select, 2_000, true, false),
+            None
+        );
     }
 
     #[test]

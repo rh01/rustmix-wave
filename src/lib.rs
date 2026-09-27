@@ -34,6 +34,7 @@ pub mod power_key;
 pub mod power_key_menu;
 pub mod power_policy;
 pub mod reader;
+pub mod reader_hanzi;
 pub mod reader_nvs;
 pub mod regional;
 pub mod rtc;

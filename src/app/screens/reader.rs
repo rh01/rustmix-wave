@@ -341,6 +341,17 @@ pub fn render_page(
         return render_continue_reading(display, state);
     };
     let size = display.orientation().logical_size();
+    let dark = state.reader.preferences.dark_mode;
+    let ink = if dark {
+        BinaryColor::Off
+    } else {
+        BinaryColor::On
+    };
+    if dark {
+        Rectangle::new(Point::new(0, 0), Size::new(size.width, size.height))
+            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+            .draw(display)?;
+    }
     let width = size.width as i32;
     let height = size.height as i32;
     let landscape = width > height;
@@ -354,9 +365,15 @@ pub fn render_page(
         state.reader.preferences.font_size,
         state.reader.preferences.theme,
     )
-    .with_tracking(session.layout.letter_spacing_px);
+    .with_tracking(session.layout.letter_spacing_px)
+    .with_color(ink);
     let ui_body = state.display.body_style();
     let ui_detail = state.display.detail_style();
+    let ui_ink = if dark {
+        state.display.text_style(UiTextRole::Body, BinaryColor::Off)
+    } else {
+        ui_body
+    };
     let heading = state.display.header_title_style();
 
     Rectangle::new(
@@ -390,68 +407,34 @@ pub fn render_page(
         Point::new(14, status_top),
         Size::new((width - 28) as u32, status_height as u32),
     )
-    .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
+    .into_styled(PrimitiveStyle::with_stroke(ink, 1))
     .draw(display)?;
     let status_baseline = status_top + status_height - 10;
-    let marked = state.reader.current_page_is_bookmarked();
-    if state.reader.preferences.show_progress {
-        Text::new(
-            if session.book.format == BookFormat::Text {
-                session.encoding.label()
-            } else {
-                "EPUB"
-            },
-            Point::new(24, status_baseline),
-            ui_body,
-        )
-        .draw(display)?;
-        Text::new(
-            &session.display_page_label(),
-            Point::new(if landscape { 274 } else { 176 }, status_baseline),
-            ui_body,
-        )
-        .draw(display)?;
-        let cache_label = format!("CACHE {}%", session.progress_percent());
-        Text::new(
-            if marked {
-                "MARKED"
-            } else {
-                cache_label.as_str()
-            },
-            Point::new(if landscape { 590 } else { 358 }, status_baseline),
-            ui_body,
-        )
-        .draw(display)?;
-    } else {
-        let font_label = state.reader.book_font_display_label();
-        Text::new(&font_label, Point::new(24, status_baseline), ui_body).draw(display)?;
-        Text::new(
-            session.content_badge(),
-            Point::new(if landscape { 370 } else { 210 }, status_baseline),
-            ui_body,
-        )
-        .draw(display)?;
-        if marked {
-            Text::new(
-                "MARKED",
-                Point::new(if landscape { 590 } else { 358 }, status_baseline),
-                ui_body,
-            )
-            .draw(display)?;
-        }
-    }
+    let status_label = reading_status_label(state, session);
+    Text::new(
+        &ui_ink.truncate(&status_label, if landscape { 70 } else { 36 }, width - 48),
+        Point::new(24, status_baseline),
+        ui_ink,
+    )
+    .draw(display)?;
 
+    let mut body = body;
+    body.text.left += i32::from(session.layout.margin_left_px);
+    body.text.right -= i32::from(session.layout.margin_right_px);
+    body.text.top += i32::from(session.layout.margin_top_px);
+    body.text.bottom -= i32::from(session.layout.margin_bottom_px);
     if state.reader.preferences.theme == ReadingTheme::HighContrast {
         Rectangle::new(
             Point::new(body.frame.left, body.frame.top),
             Size::new(body.frame.width() as u32, body.frame.height() as u32),
         )
-        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 2))
+        .into_styled(PrimitiveStyle::with_stroke(ink, 2))
         .draw(display)?;
     }
 
     if let Some(page) = session.current_cached_page() {
-        let line_step = i32::from(body_style.line_height()) + 2;
+        let line_step =
+            i32::from(body_style.line_height()) + 2 + i32::from(session.layout.line_spacing_px);
         let first_baseline = body.text.top + i32::from(body_style.line_height());
         for (index, line) in page
             .lines
@@ -463,14 +446,19 @@ pub fn render_page(
             if baseline >= body.text.bottom {
                 break;
             }
+            let mut bounds = body.text;
+            if line.first_line_indent {
+                bounds.left += session.layout.indent_px();
+            }
             let (rendered, left) = aligned_reader_line(
                 line.text.as_str(),
                 line.paragraph_end,
-                session.layout.paragraph_alignment,
+                state.reader.preferences.effective_alignment(),
                 body_style,
-                body.text,
+                bounds,
             );
-            Text::new(rendered.as_str(), Point::new(left, baseline), body_style)
+            let shown = state.reader.preferences.display_line(&rendered);
+            Text::new(shown.as_str(), Point::new(left, baseline), body_style)
                 .draw_clipped(display, body.text)?;
         }
     } else {
@@ -487,18 +475,23 @@ pub fn render_page(
         Point::new(14, footer_line),
         Size::new((width - 28) as u32, 1),
     )
-    .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+    .into_styled(PrimitiveStyle::with_fill(ink))
     .draw(display)?;
-    Text::new(
+    let footer_hint = page_turn_hint(landscape, state.reader.preferences.swap_page_keys);
+    let footer_style = if dark {
         if landscape {
-            "UP PREV  DOWN NEXT  SELECT OPTIONS"
+            state
+                .display
+                .text_style(UiTextRole::Detail, BinaryColor::Off)
         } else {
-            "UP previous   DOWN next   SELECT options"
-        },
-        Point::new(18, height - 18),
-        if landscape { ui_detail } else { ui_body },
-    )
-    .draw(display)?;
+            ui_ink
+        }
+    } else if landscape {
+        ui_detail
+    } else {
+        ui_body
+    };
+    Text::new(footer_hint, Point::new(18, height - 18), footer_style).draw(display)?;
     Ok(())
 }
 
@@ -584,25 +577,65 @@ pub fn render_preferences(
     display: &mut OrientedFrameBuffer<'_>,
     state: &AppState,
 ) -> Result<(), Infallible> {
-    draw_header(
-        display,
-        state.display,
-        "READING PREFERENCES",
-        "SETTINGS-STYLE ROW EDITOR",
-    )?;
-    for (index, preference) in ReadingPreference::ALL.iter().copied().enumerate() {
-        let font_label = state.reader.book_font_display_label();
+    let subtitle = match state.reader.preference_menu {
+        crate::reader::PreferenceMenu::Root => "UP/DOWN MOVE  SELECT OPEN",
+        crate::reader::PreferenceMenu::Typography => "TYPOGRAPHY",
+        crate::reader::PreferenceMenu::Page => "PAGE",
+        crate::reader::PreferenceMenu::Display => "DISPLAY",
+        crate::reader::PreferenceMenu::Status => "STATUS BAR",
+        crate::reader::PreferenceMenu::Controls => "CONTROLS",
+    };
+    draw_header(display, state.display, "READING PREFERENCES", subtitle)?;
+    let font_label = state.reader.book_font_display_label();
+    for (index, preference) in state.reader.preference_rows().iter().copied().enumerate() {
+        let owned;
         let badge = match preference {
+            ReadingPreference::TypographyMenu
+            | ReadingPreference::PageMenu
+            | ReadingPreference::DisplayMenu
+            | ReadingPreference::StatusMenu
+            | ReadingPreference::ControlsMenu => ">>>",
+            ReadingPreference::Presets => {
+                owned = state
+                    .reader
+                    .preferences
+                    .matching_preset()
+                    .map_or("Custom", |preset| preset.label())
+                    .to_string();
+                owned.as_str()
+            }
+            ReadingPreference::ChineseScript => state.reader.preferences.chinese_script.label(),
             ReadingPreference::ReadingTheme => state.reader.preferences.theme.label(),
+            ReadingPreference::DarkMode => on_off(state.reader.preferences.dark_mode),
+            ReadingPreference::FullRefresh => state.reader.preferences.full_refresh.label(),
             ReadingPreference::Orientation => state.reader.preferences.orientation.label(),
             ReadingPreference::BookFontSize => state.reader.preferences.font_size.label(),
             ReadingPreference::BookFont => font_label.as_str(),
             ReadingPreference::LetterSpacing => state.reader.preferences.letter_spacing.label(),
+            ReadingPreference::LineSpacing => state.reader.preferences.line_spacing.label(),
+            ReadingPreference::ParagraphSpacing => {
+                state.reader.preferences.paragraph_spacing.label()
+            }
+            ReadingPreference::FirstLineIndent => {
+                on_off(state.reader.preferences.first_line_indent)
+            }
+            ReadingPreference::Justified => on_off(state.reader.preferences.justified),
+            ReadingPreference::MarginTop => state.reader.preferences.margin_top.label(),
+            ReadingPreference::MarginBottom => state.reader.preferences.margin_bottom.label(),
+            ReadingPreference::MarginLeft => state.reader.preferences.margin_left.label(),
+            ReadingPreference::MarginRight => state.reader.preferences.margin_right.label(),
             ReadingPreference::ParagraphAlignment => {
                 state.reader.preferences.paragraph_alignment.label()
             }
-            ReadingPreference::ShowProgress if state.reader.preferences.show_progress => "On",
-            ReadingPreference::ShowProgress => "Off",
+            ReadingPreference::StatusPage => on_off(state.reader.preferences.status_page),
+            ReadingPreference::StatusChapter => on_off(state.reader.preferences.status_chapter),
+            ReadingPreference::StatusTime => on_off(state.reader.preferences.status_time),
+            ReadingPreference::StatusBattery => on_off(state.reader.preferences.status_battery),
+            ReadingPreference::SwapPageKeys => on_off(state.reader.preferences.swap_page_keys),
+            ReadingPreference::LongPressChapter => {
+                on_off(state.reader.preferences.long_press_chapter)
+            }
+            ReadingPreference::AutoPageTurn => state.reader.preferences.auto_page_turn.label(),
         };
         draw_row(
             display,
@@ -619,6 +652,59 @@ pub fn render_preferences(
         state.display,
         "UP/DOWN MOVE  SELECT CHANGE  HOLD BOOT BACK",
     )
+}
+
+fn on_off(value: bool) -> &'static str {
+    if value {
+        "On"
+    } else {
+        "Off"
+    }
+}
+
+fn page_turn_hint(landscape: bool, swap: bool) -> &'static str {
+    match (landscape, swap) {
+        (true, false) => "UP PREV  DOWN NEXT  SELECT OPTIONS",
+        (true, true) => "UP NEXT  DOWN PREV  SELECT OPTIONS",
+        (false, false) => "UP previous   DOWN next   SELECT options",
+        (false, true) => "UP next   DOWN previous   SELECT options",
+    }
+}
+
+fn reading_status_label(state: &AppState, session: &crate::reader::ReaderSession) -> String {
+    let prefs = state.reader.preferences;
+    let mut parts = Vec::new();
+    if prefs.status_page {
+        parts.push(format!("PAGE {}", session.page_label()));
+    }
+    if prefs.status_chapter {
+        if let Some(chapter) = session.current_epub_chapter_page_label() {
+            parts.push(format!(
+                "CH {} {}",
+                chapter.chapter_number,
+                chapter.page_text()
+            ));
+        } else {
+            parts.push(format!("{}%", session.progress_percent()));
+        }
+    }
+    if prefs.status_time {
+        parts.push(state.board.time_label(state.regional));
+    }
+    if prefs.status_battery {
+        parts.push(state.board.battery_label());
+    }
+    if state.reader.current_page_is_bookmarked() {
+        parts.push("MARKED".into());
+    }
+    if parts.is_empty() {
+        return format!(
+            "{}  {}",
+            state.reader.book_font_display_label(),
+            session.content_badge()
+        );
+    }
+    parts.join("  ")
 }
 
 pub fn render_toc(
@@ -686,7 +772,7 @@ pub fn render_toc(
     draw_footer(display, state.display, "MOVE  SELECT OPEN  HOLD BOOT BACK")
 }
 
-fn aligned_reader_line(
+pub(crate) fn aligned_reader_line(
     line: &str,
     paragraph_end: bool,
     alignment: ParagraphAlignment,

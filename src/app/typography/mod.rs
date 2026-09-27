@@ -162,6 +162,18 @@ impl UiTextStyle {
         }
     }
 
+    /// Ink color. Dark reading mode draws white glyphs on a black page.
+    #[must_use]
+    pub const fn with_color(self, color: BinaryColor) -> Self {
+        Self {
+            font: self.font,
+            color,
+            pixel_scale: self.pixel_scale,
+            cjk_px: self.cjk_px,
+            tracking_px: self.tracking_px,
+        }
+    }
+
     #[must_use]
     pub const fn line_height(self) -> u8 {
         let scale = if self.pixel_scale == 0 {

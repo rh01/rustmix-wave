@@ -105,10 +105,7 @@ pub fn paginate_blocks(blocks: &[Block], layout: ReaderLayout) -> Vec<Vec<Reader
         }
     }
     if pages.is_empty() {
-        pages.push(vec![ReaderPageLine {
-            text: String::new(),
-            paragraph_end: true,
-        }]);
+        pages.push(vec![ReaderPageLine::new(String::new(), true)]);
     }
     pages.truncate(MAX_PAGES);
     pages

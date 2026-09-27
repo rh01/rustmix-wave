@@ -12,7 +12,7 @@ use crate::{
     app::{
         reader_typography::reader_body_style,
         state::AppState,
-        typography::{Text, UiTextRole},
+        typography::{Text, TextBounds, UiTextRole},
         widgets::{footer::draw_footer, header::draw_header},
     },
     orientation::OrientedFrameBuffer,
@@ -239,21 +239,28 @@ pub fn render_read(
         .map(|chapter| chapter.title.as_str())
         .or_else(|| weread.detail.as_ref().map(|detail| detail.title.as_str()))
         .unwrap_or("WeRead");
+    let dark = state.reader.preferences.dark_mode;
+    if dark {
+        let size = display.orientation().logical_size();
+        Rectangle::new(Point::new(0, 0), Size::new(size.width, size.height))
+            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+            .draw(display)?;
+    }
+    let chrome = if dark {
+        state.display.text_style(UiTextRole::Body, BinaryColor::Off)
+    } else {
+        state.display.body_style()
+    };
     draw_header(display, state.display, "WEREAD", "CHAPTER")?;
     Text::new(
         &state.display.heading_style().truncate(title, 24, 420),
         Point::new(24, 128),
-        state.display.body_style(),
+        chrome,
     )
     .draw(display)?;
     let page_count = weread.pages.len().max(1);
     let page_label = format!("Page {} / {page_count}", weread.page_index + 1);
-    Text::new(
-        &page_label,
-        Point::new(300, 128),
-        state.display.detail_style(),
-    )
-    .draw(display)?;
+    Text::new(&page_label, Point::new(300, 128), chrome).draw(display)?;
     let mut top = 160;
     if weread.page_index == 0 {
         if let Some(bitmap) = weread.images.iter().find_map(|image| image.bitmap.as_ref()) {
@@ -261,34 +268,62 @@ pub fn render_read(
             top += 168;
         }
     }
+    let layout = state.reader.preferences.layout();
     let body = reader_body_style(
         state.reader.preferences.book_font,
         state.reader.preferences.font_size,
         state.reader.preferences.theme,
     )
-    .with_tracking(state.reader.preferences.letter_spacing.pixels());
-    let line_step = i32::from(body.line_height()) + 2;
+    .with_tracking(state.reader.preferences.letter_spacing.pixels())
+    .with_color(if dark {
+        BinaryColor::Off
+    } else {
+        BinaryColor::On
+    });
+    let line_step = i32::from(body.line_height()) + 2 + i32::from(layout.line_spacing_px);
+    let left = 24 + i32::from(layout.margin_left_px);
+    let right = 456 - i32::from(layout.margin_right_px);
+    top += i32::from(layout.margin_top_px);
     if let Some(page) = weread.pages.get(weread.page_index) {
         for (index, line) in page.iter().enumerate() {
             let baseline = top + i32::from(body.line_height()) + index as i32 * line_step;
-            if baseline > 700 {
+            if baseline > 700 - i32::from(layout.margin_bottom_px) {
                 break;
             }
-            Text::new(&line.text, Point::new(24, baseline), body).draw(display)?;
+            let indent = if line.first_line_indent {
+                layout.indent_px()
+            } else {
+                0
+            };
+            let shown = state.reader.preferences.display_line(&line.text);
+            let bounds = TextBounds::new(left + indent, top, right, 720);
+            let (rendered, x) = super::reader::aligned_reader_line(
+                shown.as_str(),
+                line.paragraph_end,
+                state.reader.preferences.effective_alignment(),
+                body,
+                bounds,
+            );
+            Text::new(rendered.as_str(), Point::new(x, baseline), body).draw(display)?;
         }
     } else {
+        Text::new(&truncate(&weread.status, 40), Point::new(24, 220), chrome).draw(display)?;
+    }
+    if dark {
         Text::new(
-            &truncate(&weread.status, 40),
-            Point::new(24, 220),
-            state.display.body_style(),
+            footer(weread.busy, "MOVE PAGE  SELECT PREFS  HOLD BOOT BOOK"),
+            Point::new(24, 760),
+            chrome,
         )
         .draw(display)?;
+        Ok(())
+    } else {
+        draw_footer(
+            display,
+            state.display,
+            footer(weread.busy, "MOVE PAGE  SELECT PREFS  HOLD BOOT BOOK"),
+        )
     }
-    draw_footer(
-        display,
-        state.display,
-        footer(weread.busy, "MOVE PAGE  SELECT PREFS  HOLD BOOT BOOK"),
-    )
 }
 
 pub fn render_notes(

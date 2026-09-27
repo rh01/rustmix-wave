@@ -47,12 +47,6 @@ impl core::fmt::Display for PanelSleepError {
 
 impl std::error::Error for PanelSleepError {}
 
-impl From<PanelSleepError> for anyhow::Error {
-    fn from(error: PanelSleepError) -> Self {
-        error.source
-    }
-}
-
 /// Controller driver with explicit ownership of the panel bus and pins.
 pub struct Epaper397<SPI, DC, RST, CS, BUSY, DELAY, POWER> {
     spi: SPI,

@@ -266,7 +266,7 @@ fn render_immersive_chapter(
         };
         Text::new(
             &truncate(&weread.status, 40),
-            Point::new(left, top + 48),
+            Point::new(bounds.left, bounds.top + 48),
             ink,
         )
         .draw(display)?;
@@ -352,11 +352,7 @@ pub fn render_read(
     let size = display.orientation().logical_size();
     let width = size.width as i32;
     let landscape = width > size.height as i32;
-    let left = if landscape {
-        24 + i32::from(layout.margin_left_px)
-    } else {
-        24 + i32::from(layout.margin_left_px)
-    };
+    let left = 24 + i32::from(layout.margin_left_px);
     let right = width - 24 - i32::from(layout.margin_right_px);
     let top = if landscape {
         88 + i32::from(layout.margin_top_px)
@@ -726,7 +722,7 @@ mod tests {
         PngEncoder::new(std::io::Cursor::new(&mut png))
             .write_image(gray.as_raw(), 8, 1, image::ColorType::L8)
             .expect("png");
-        let bitmap = crate::weread::bitmap::decode_mono(&png, 8, 1).expect("bitmap");
+        let bitmap = crate::weread::bitmap::decode_mono(png, 8, 1).expect("bitmap");
         assert!(bitmap.bit(0, 0));
         assert!(!bitmap.bit(1, 0));
 

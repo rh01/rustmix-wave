@@ -8,8 +8,8 @@ use crate::weread::{
     body::body_transfer_error,
     crypto, decode,
     limits::{
-        DOWNLOAD_CLASSIFY_BYTES, IMAGE_TARGET_HEIGHT, IMAGE_TARGET_WIDTH, MAX_CHAPTER_IMAGES,
-        MAX_CHAPTER_IMAGE_BYTES, MAX_HTML_BYTES, MAX_IMAGE_BYTES, MAX_JSON_BYTES, MAX_SHARD_BYTES,
+        DOWNLOAD_CLASSIFY_BYTES, MAX_CHAPTER_IMAGES, MAX_CHAPTER_IMAGE_BYTES, MAX_HTML_BYTES,
+        MAX_IMAGE_BYTES, MAX_JSON_BYTES, MAX_SHARD_BYTES,
     },
     parse::{
         self, BookDetail, ChapterMeta, LoginPoll, NoteLine, ReadingProgress, ResponseClass,
@@ -196,6 +196,9 @@ pub enum Job {
         chapter_idx: u32,
         psvts: String,
         fetch_images: bool,
+        /// Content box the inline image is upscaled into. Zero skips upscaling.
+        image_width: u32,
+        image_height: u32,
     },
     UploadProgress {
         book_id: String,
@@ -375,6 +378,8 @@ fn dispatch(
             chapter_idx,
             psvts,
             fetch_images,
+            image_width,
+            image_height,
         } => chapter(
             transport,
             session,
@@ -384,6 +389,8 @@ fn dispatch(
             *chapter_idx,
             psvts,
             *fetch_images,
+            *image_width,
+            *image_height,
         ),
         Job::UploadProgress {
             book_id,
@@ -805,6 +812,8 @@ fn chapter(
     _chapter_idx: u32,
     psvts: &str,
     fetch_images: bool,
+    image_width: u32,
+    image_height: u32,
 ) -> Result<JobOutput, JobError> {
     let prepared = prepare_chapter(transport, session, ctx, book_id, chapter_uid, psvts)?;
     if transport.streaming_download() {
@@ -830,7 +839,16 @@ fn chapter(
         let text =
             text::zip_html_text(&e0.body).map_err(|error| JobError::Message(error.into()))?;
         let blocks = text::blocks_from_markup(&text);
-        return finish_chapter(transport, ctx, blocks, psvts, "epub", fetch_images);
+        return finish_chapter(
+            transport,
+            ctx,
+            blocks,
+            psvts,
+            "epub",
+            fetch_images,
+            image_width,
+            image_height,
+        );
     }
     let e0_text = String::from_utf8_lossy(&e0.body);
     if e0_text.trim() == "{}" {
@@ -863,7 +881,16 @@ fn chapter(
         )?;
         let plain = decode_pair(&t0.body, &t1.body)?;
         let blocks = text::blocks_from_markup(&plain);
-        return finish_chapter(transport, ctx, blocks, psvts, "txt", fetch_images);
+        return finish_chapter(
+            transport,
+            ctx,
+            blocks,
+            psvts,
+            "txt",
+            fetch_images,
+            image_width,
+            image_height,
+        );
     }
     let e1 = post_shard(
         transport,
@@ -903,6 +930,8 @@ fn chapter(
             psvts,
             "epub",
             fetch_images,
+            image_width,
+            image_height,
         );
     }
     let markup = String::from_utf8_lossy(&bytes).into_owned();
@@ -913,6 +942,8 @@ fn chapter(
         psvts,
         "epub",
         fetch_images,
+        image_width,
+        image_height,
     )
 }
 
@@ -923,6 +954,8 @@ fn finish_chapter(
     psvts: String,
     format: &str,
     fetch_images: bool,
+    image_width: u32,
+    image_height: u32,
 ) -> Result<JobOutput, JobError> {
     let mut images = Vec::new();
     if fetch_images {
@@ -933,7 +966,13 @@ fn finish_chapter(
             let Block::Image(image) = block else {
                 continue;
             };
-            images.push(fetch_inline_image(transport, ctx, image));
+            images.push(fetch_inline_image(
+                transport,
+                ctx,
+                image,
+                image_width,
+                image_height,
+            ));
         }
     }
     let text = text::plain_from_blocks(&blocks);
@@ -952,6 +991,8 @@ fn fetch_inline_image(
     transport: &mut dyn Transport,
     ctx: &mut CallCtx,
     image: &crate::weread::text::ImageRef,
+    image_width: u32,
+    image_height: u32,
 ) -> ChapterImage {
     if !bitmap::allowed_asset_url(&image.url) {
         return ChapterImage {
@@ -973,7 +1014,7 @@ fn fetch_inline_image(
         false,
     );
     let bitmap = fetched.ok().and_then(|response| {
-        bitmap::decode_on_image_thread(response.body, IMAGE_TARGET_WIDTH, IMAGE_TARGET_HEIGHT)
+        bitmap::decode_on_image_thread(response.body, image_width.max(1), image_height.max(1))
     });
     ChapterImage {
         alt: image.alt.clone(),
@@ -1797,6 +1838,8 @@ mod tests {
                     chapter_idx: 2,
                     psvts: String::new(),
                     fetch_images: false,
+                    image_width: 0,
+                    image_height: 0,
                 },
                 session,
             },
@@ -2346,6 +2389,8 @@ mod tests {
             chapter_idx: 2,
             psvts: "ps".into(),
             fetch_images,
+            image_width: 0,
+            image_height: 0,
         }
     }
 

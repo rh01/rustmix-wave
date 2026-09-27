@@ -195,6 +195,8 @@ fn spawn_work(work: Work, unix: Option<u64>, cancel: Arc<AtomicBool>) -> Result<
     let (download, download_tx, chunks) = match &job {
         Job::Chapter {
             fetch_images: false,
+            image_width: 0,
+            image_height: 0,
             book_id,
             chapter_uid,
             chapter_idx,

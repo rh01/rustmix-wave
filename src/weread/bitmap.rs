@@ -282,6 +282,9 @@ fn decode_jpeg(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32, PixelFormat), &'stati
         .saturating_mul(usize::from(got_h))
         .saturating_mul(components);
     decoder.set_max_decoding_buffer_size(output_bytes);
+    // Other tasks can allocate between the earlier budget check and this
+    // infallible `vec!` inside `decode`.
+    recheck_before_infallible(extra, largest)?;
     let pixels = decoder.decode().map_err(|_| "image decode failed")?;
     let width = u32::from(got_w);
     let height = u32::from(got_h);
@@ -326,6 +329,20 @@ fn select_jpeg_scale(
         return Ok((out_w, out_h));
     }
     Err("image is too large")
+}
+
+fn recheck_before_infallible(upcoming: usize, largest: usize) -> Result<(), &'static str> {
+    let heap = crate::weread::limits::spiram_headroom();
+    if crate::weread::limits::spiram_can_hold(
+        heap.free_bytes,
+        heap.largest_block_bytes,
+        upcoming,
+        largest,
+    ) {
+        Ok(())
+    } else {
+        Err("image is too large")
+    }
 }
 
 fn png_ihdr(bytes: &[u8]) -> Option<(u32, u32)> {
@@ -385,6 +402,9 @@ fn decode_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32, usize), &'static str> 
         .map_err(|_| "image decode failed")?;
     pixels.resize(output, 0);
     let (color, depth) = reader.output_color_type();
+    // `out_buffer.resize` inside `next_frame` is infallible. Recheck the
+    // largest SPIRAM block after the RGBA buffer is already reserved.
+    recheck_before_infallible(PNG_ZLIB_OUT_BYTES, PNG_ZLIB_OUT_BYTES)?;
     reader
         .next_frame(&mut pixels)
         .map_err(|_| "image decode failed")?;

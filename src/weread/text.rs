@@ -338,8 +338,10 @@ impl PagePack {
     fn finish(mut self) -> Vec<Vec<FlowItem>> {
         self.flush();
         if self.pages.is_empty() {
-            self.pages
-                .push(vec![FlowItem::Line(ReaderPageLine::new(String::new(), true))]);
+            self.pages.push(vec![FlowItem::Line(ReaderPageLine::new(
+                String::new(),
+                true,
+            ))]);
         }
         self.pages.truncate(MAX_PAGES);
         self.pages
@@ -575,10 +577,14 @@ fn is_html_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        blocks_from_markup, flow_text_chars, image_placeholder, page_for_text_offset,
-        paginate_blocks, plain_from_blocks, zip_html_text, Block, FlowItem, ImageMeasure,
+        blocks_from_markup, content_box_px, content_height_px, flow_text_chars, image_placeholder,
+        line_step_for, page_budget_px, page_for_text_offset, paginate_blocks, plain_from_blocks,
+        zip_html_text, Block, FlowItem, ImageMeasure,
     };
-    use crate::reader::ReaderPreferences;
+    use crate::reader::{
+        LetterSpacing, LineSpacing, PageMargin, ParagraphSpacing, ReaderOrientation,
+        ReaderPageLine, ReaderPreferences,
+    };
 
     #[test]
     fn xhtml_keeps_cjk_paragraphs_and_image_refs() {
@@ -665,12 +671,7 @@ mod tests {
 
     #[test]
     fn text_offset_stays_on_an_image_only_page() {
-        let line = |text: &str| {
-            FlowItem::Line(crate::reader::ReaderPageLine {
-                text: text.into(),
-                paragraph_end: true,
-            })
-        };
+        let line = |text: &str| FlowItem::Line(ReaderPageLine::new(text, true));
         let pages = vec![
             vec![line("Hi")],
             vec![FlowItem::Image {
@@ -687,12 +688,7 @@ mod tests {
 
     #[test]
     fn consecutive_image_only_pages_keep_distinct_offsets() {
-        let line = |text: &str| {
-            FlowItem::Line(crate::reader::ReaderPageLine {
-                text: text.into(),
-                paragraph_end: true,
-            })
-        };
+        let line = |text: &str| FlowItem::Line(ReaderPageLine::new(text, true));
         let image = |slot: u16| FlowItem::Image {
             slot,
             width: 8,
@@ -726,6 +722,87 @@ mod tests {
         pages
             .get(index)
             .is_some_and(|page| page.iter().any(|item| item.line_text().contains(needle)))
+    }
+
+    #[test]
+    fn content_box_follows_orientation_margins_and_immersive() {
+        let portrait = ReaderPreferences::default().layout();
+        assert_eq!(content_box_px(portrait), (432, 594));
+        assert_eq!(content_height_px(portrait), 594);
+        assert!(page_budget_px(portrait) <= 594);
+        assert_eq!(page_budget_px(portrait) % line_step_for(portrait), 0);
+
+        let mut landscape_prefs = ReaderPreferences::default();
+        landscape_prefs.orientation = ReaderOrientation::Landscape;
+        let landscape = landscape_prefs.layout();
+        assert_eq!(content_box_px(landscape), (752, 300));
+        assert!(page_budget_px(landscape) <= 300);
+        assert!(page_budget_px(landscape) < page_budget_px(portrait));
+
+        let mut immersive = ReaderPreferences::default();
+        immersive.immersive = true;
+        assert_eq!(content_height_px(immersive.layout()), 800);
+        immersive.orientation = ReaderOrientation::Landscape;
+        let immersive_land = immersive.layout();
+        assert_eq!(content_height_px(immersive_land), 480);
+        assert_eq!(
+            content_box_px(immersive_land).0,
+            immersive_land.max_line_width_px as u32
+        );
+
+        let mut margins = ReaderPreferences::default();
+        margins.margin_top = PageMargin::Px16;
+        margins.margin_bottom = PageMargin::Px24;
+        let shrunk = margins.layout();
+        assert_eq!(
+            content_height_px(shrunk),
+            594 - u32::from(shrunk.margin_top_px) - u32::from(shrunk.margin_bottom_px)
+        );
+        assert!(page_budget_px(shrunk) < page_budget_px(portrait));
+    }
+
+    #[test]
+    fn layout_prefs_reflow_text_around_an_image() {
+        let paragraph = "A".repeat(120);
+        let markup = format!(
+            "<p>{paragraph}</p><img alt=\"fig\" src=\"https://res.weread.qq.com/a.jpg\"><p>After</p>"
+        );
+        let blocks = blocks_from_markup(&markup);
+        let tight = ReaderPreferences::default();
+        let mut loose = tight;
+        loose.letter_spacing = LetterSpacing::Px4;
+        loose.line_spacing = LineSpacing::Px12;
+        loose.paragraph_spacing = ParagraphSpacing::Lines2;
+        loose.first_line_indent = true;
+        let tight_pages = paginate_blocks(&blocks, tight.layout(), &[None]);
+        let loose_layout = loose.layout();
+        let loose_pages = paginate_blocks(&blocks, loose_layout, &[None]);
+        let lines = |pages: &[Vec<FlowItem>]| {
+            pages
+                .iter()
+                .flatten()
+                .filter(|item| matches!(item, FlowItem::Line(_)))
+                .count()
+        };
+        assert!(lines(&loose_pages) > lines(&tight_pages));
+        assert!(line_step_for(loose_layout) > line_step_for(tight.layout()));
+        let first = loose_pages
+            .iter()
+            .flatten()
+            .find_map(|item| match item {
+                FlowItem::Line(line) => Some(line),
+                FlowItem::Image { .. } => None,
+            })
+            .expect("text");
+        assert!(first.first_line_indent);
+        assert!(loose_pages
+            .iter()
+            .flatten()
+            .any(|item| item.line_text().contains("[image: fig]")));
+        assert!(loose_pages
+            .iter()
+            .flatten()
+            .any(|item| item.line_text().contains("After")));
     }
 
     #[test]

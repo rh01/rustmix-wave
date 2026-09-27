@@ -40,11 +40,12 @@ pub const MAX_JPEG_EDGE: u32 = 256;
 pub const PNG_ZLIB_OUT_BYTES: usize = 256 * 1024;
 /// Headroom that must remain after the worst-case decode peak.
 pub const IMAGE_SAFETY_MARGIN_BYTES: usize = 512 * 1024;
-/// Widest reader measure. Decode stays at [`MAX_IMAGE_EDGE`] / [`MAX_JPEG_EDGE`];
-/// the luma is upscaled to this box only after the file and coefficients are gone.
-pub const IMAGE_TARGET_WIDTH: u32 = 752;
-/// Tallest reader page the bitmap is scaled into before pagination.
-pub const IMAGE_TARGET_HEIGHT: u32 = 594;
+/// Largest content box an image can be upscaled into: the immersive panel,
+/// 800×480, with margins at zero. Portrait chrome is 432×594 and landscape
+/// chrome is 752×300; the live target comes from the open layout.
+pub const MAX_CONTENT_WIDTH: u32 = 800;
+/// Tallest content box (immersive portrait).
+pub const MAX_CONTENT_HEIGHT: u32 = 800;
 /// Shelf rows kept in RAM.
 pub const MAX_SHELF_BOOKS: usize = 128;
 /// Catalog entries kept for one book.
@@ -118,7 +119,8 @@ pub fn packed_bitmap_bytes(width: u32, height: u32) -> usize {
 /// Stored bitmaps are the upscaled content size, not the decoder edge.
 #[must_use]
 pub fn loaded_chapter_bitmap_bytes() -> usize {
-    packed_bitmap_bytes(IMAGE_TARGET_WIDTH, IMAGE_TARGET_HEIGHT)
+    packed_bitmap_bytes(MAX_CONTENT_WIDTH, 480)
+        .max(packed_bitmap_bytes(480, MAX_CONTENT_HEIGHT))
         .saturating_mul(MAX_CHAPTER_IMAGES.saturating_sub(1))
 }
 
@@ -314,10 +316,10 @@ mod tests {
         jpeg_largest_infallible, jpeg_scaled_edge, loaded_chapter_bitmap_bytes,
         packed_bitmap_bytes, png_decode_peak, spiram_can_hold, DOWNLOAD_CHUNK_BYTES,
         HTTP_CHAPTER_LIMIT_MS, HTTP_IDLE_LIMIT_MS, HTTP_IO_BUFFER_BYTES, HTTP_READ_TIMEOUT_MS,
-        HTTP_TIMEOUT_SECS, IMAGE_DECODE_STACK_BYTES, IMAGE_SAFETY_MARGIN_BYTES,
-        IMAGE_TARGET_HEIGHT, IMAGE_TARGET_WIDTH, MAX_CHAPTER_IMAGES, MAX_CHAPTER_IMAGE_BYTES,
-        MAX_CHAPTER_TEXT, MAX_DECODE_PIXELS, MAX_IMAGE_DECODE_BYTES, MAX_IMAGE_EDGE, MAX_JPEG_EDGE,
-        MAX_SHARD_BYTES, MODULE_PSRAM_BYTES, PNG_ZLIB_OUT_BYTES, WEREAD_HTTP_WORKER_STACK_BYTES,
+        HTTP_TIMEOUT_SECS, IMAGE_DECODE_STACK_BYTES, IMAGE_SAFETY_MARGIN_BYTES, MAX_CHAPTER_IMAGES,
+        MAX_CHAPTER_IMAGE_BYTES, MAX_CHAPTER_TEXT, MAX_CONTENT_HEIGHT, MAX_CONTENT_WIDTH,
+        MAX_DECODE_PIXELS, MAX_IMAGE_DECODE_BYTES, MAX_IMAGE_EDGE, MAX_JPEG_EDGE, MAX_SHARD_BYTES,
+        MODULE_PSRAM_BYTES, PNG_ZLIB_OUT_BYTES, WEREAD_HTTP_WORKER_STACK_BYTES,
     };
     use crate::fonts::{
         GLYPH_CACHE_BUDGET_BYTES, MAX_SD_FONT_BYTES, SD_FONT_RESIDENT_BUDGET_BYTES,
@@ -449,16 +451,15 @@ mod tests {
             0,
             0
         ));
-        let display = (IMAGE_TARGET_WIDTH as usize) * (IMAGE_TARGET_HEIGHT as usize);
+        let display = (MAX_CONTENT_WIDTH as usize) * 480;
         assert!(
             display.saturating_mul(3) <= image_heap_room(),
             "upscale plus dither runs after the file is dropped"
         );
-        assert!(
-            loaded_chapter_bitmap_bytes()
-                >= packed_bitmap_bytes(IMAGE_TARGET_WIDTH, IMAGE_TARGET_HEIGHT)
-        );
+        assert!(loaded_chapter_bitmap_bytes() >= packed_bitmap_bytes(MAX_CONTENT_WIDTH, 480));
         assert!(image_heap_room() < MODULE_PSRAM_BYTES);
+        assert_eq!(MAX_CONTENT_WIDTH, 800);
+        assert_eq!(MAX_CONTENT_HEIGHT, 800);
         assert_eq!(MAX_CHAPTER_IMAGE_BYTES, 1024 * 1024);
         assert!(MAX_CHAPTER_IMAGES <= 8);
         assert!(IMAGE_DECODE_STACK_BYTES >= 48 * 1024);

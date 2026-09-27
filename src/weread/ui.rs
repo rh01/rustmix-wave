@@ -19,9 +19,8 @@ use crate::{
         bitmap::{self, MonoBitmap},
         client::{ChapterImage, Job, JobError, JobOutput, Report, Work},
         limits::{
-            DOWNLOAD_ATTEMPTS, DOWNLOAD_RETRY_MS, IMAGE_TARGET_HEIGHT, IMAGE_TARGET_WIDTH,
-            LOGIN_POLL_MS, LOGIN_TIMEOUT_MS, MAX_CHAPTER_IMAGES, MIN_REQUEST_GAP_MS,
-            PROGRESS_DELAY_MS,
+            DOWNLOAD_ATTEMPTS, DOWNLOAD_RETRY_MS, LOGIN_POLL_MS, LOGIN_TIMEOUT_MS,
+            MAX_CHAPTER_IMAGES, MIN_REQUEST_GAP_MS, PROGRESS_DELAY_MS,
         },
         nvs,
         offline::{self, CachedChapter},
@@ -220,11 +219,8 @@ impl ImageDecodeJobs {
         }
         if self.job.is_none() {
             if let Some(next) = ui.take_image_decode() {
-                match bitmap::spawn_image_decode(
-                    next.bytes,
-                    IMAGE_TARGET_WIDTH,
-                    IMAGE_TARGET_HEIGHT,
-                ) {
+                let (image_width, image_height) = text::content_box_px(layout);
+                match bitmap::spawn_image_decode(next.bytes, image_width, image_height) {
                     Ok(handle) => {
                         self.job = Some(ImageDecodeJob {
                             generation: next.generation,
@@ -766,6 +762,7 @@ impl WereadUi {
         }
         self.pages.clear();
         self.images.clear();
+        let (image_width, image_height) = text::content_box_px(layout);
         self.queue(
             Job::Chapter {
                 book_id: self.book_id.clone(),
@@ -773,6 +770,8 @@ impl WereadUi {
                 chapter_idx: chapter.index,
                 psvts: self.psvts.clone(),
                 fetch_images: true,
+                image_width,
+                image_height,
             },
             0,
         );
@@ -953,6 +952,8 @@ impl WereadUi {
                         chapter_idx: index,
                         psvts: self.psvts.clone(),
                         fetch_images: false,
+                        image_width: 0,
+                        image_height: 0,
                     },
                     due_ms,
                 );
@@ -1222,6 +1223,8 @@ impl WereadUi {
                 chapter_idx: chapter.index,
                 psvts: self.psvts.clone(),
                 fetch_images: false,
+                image_width: 0,
+                image_height: 0,
             },
             due_ms,
         );
@@ -2259,6 +2262,8 @@ mod tests {
                         chapter_idx: 1,
                         psvts: String::new(),
                         fetch_images: false,
+                        image_width: 0,
+                        image_height: 0,
                     },
                     session: ui.session.clone(),
                     result: Err(JobError::Message("Not enough memory".into())),
@@ -2286,6 +2291,8 @@ mod tests {
                     chapter_idx: 1,
                     psvts: String::new(),
                     fetch_images: false,
+                    image_width: 0,
+                    image_height: 0,
                 },
                 session: ui.session.clone(),
                 result: Err(JobError::Message("Not enough memory".into())),
@@ -2319,6 +2326,8 @@ mod tests {
                     chapter_idx: 1,
                     psvts: String::new(),
                     fetch_images: false,
+                    image_width: 0,
+                    image_height: 0,
                 },
                 session: ui.session.clone(),
                 result: Err(JobError::Message(HTTP_STALL_ERROR.into())),
@@ -2356,6 +2365,8 @@ mod tests {
                     chapter_idx: 1,
                     psvts: String::new(),
                     fetch_images: false,
+                    image_width: 0,
+                    image_height: 0,
                 },
                 session: ui.session.clone(),
                 result: Ok(JobOutput::Chapter {
@@ -2417,6 +2428,8 @@ mod tests {
                     chapter_idx: 1,
                     psvts: "ps".into(),
                     fetch_images: false,
+                    image_width: 0,
+                    image_height: 0,
                 },
                 session: ui.session.clone(),
                 result: Ok(JobOutput::ChapterStored { psvts: "ps".into() }),
@@ -2477,6 +2490,8 @@ mod tests {
                     chapter_idx: 1,
                     psvts: "ps".into(),
                     fetch_images: false,
+                    image_width: 0,
+                    image_height: 0,
                 },
                 session: ui.session.clone(),
                 result: Ok(JobOutput::ChapterStored { psvts: "ps".into() }),
@@ -2665,11 +2680,11 @@ mod tests {
         let text = "中".repeat(80) + &"abcd ".repeat(80);
         let tight = ReaderPreferences::default();
         ui.show_text(&text, tight.layout());
-        let tight_line = ui.pages[0][0].text.chars().count();
+        let tight_line = ui.pages[0][0].line_text().chars().count();
         let mut loose = tight;
         loose.letter_spacing = crate::reader::LetterSpacing::Px4;
         assert!(ui.sync_layout(loose.layout()));
-        assert!(ui.pages[0][0].text.chars().count() < tight_line);
+        assert!(ui.pages[0][0].line_text().chars().count() < tight_line);
         assert_eq!(ui.chapter_source, text);
         assert!(!ui.sync_layout(loose.layout()));
     }
@@ -2700,6 +2715,8 @@ mod tests {
             chapter_idx: 2,
             psvts: String::new(),
             fetch_images: false,
+            image_width: 0,
+            image_height: 0,
         });
         assert!(ui.needs_radio());
         ui.phase = super::Phase::Book;
@@ -2718,6 +2735,8 @@ mod tests {
                 chapter_idx: 1,
                 psvts: String::new(),
                 fetch_images: false,
+                image_width: 0,
+                image_height: 0,
             },
             session: ui.session.clone(),
             result: Err(error),
@@ -2748,6 +2767,8 @@ mod tests {
                     chapter_idx: 1,
                     psvts: String::new(),
                     fetch_images: false,
+                    image_width: 0,
+                    image_height: 0,
                 },
                 session: ui.session.clone(),
                 result: Ok(JobOutput::Chapter {
@@ -2834,6 +2855,8 @@ mod tests {
                     chapter_idx: 1,
                     psvts: String::new(),
                     fetch_images: false,
+                    image_width: 0,
+                    image_height: 0,
                 },
                 session: ui.session.clone(),
                 result: Ok(JobOutput::ChapterStored {
@@ -2861,6 +2884,8 @@ mod tests {
             chapter_idx: 1,
             psvts: String::new(),
             fetch_images: false,
+            image_width: 0,
+            image_height: 0,
         });
         assert!(ui.needs_radio());
         ui.note_route(ScreenRoute::WeReadDownload, ScreenRoute::Home);
@@ -2933,6 +2958,8 @@ mod tests {
                     chapter_idx: 1,
                     psvts: String::new(),
                     fetch_images: false,
+                    image_width: 0,
+                    image_height: 0,
                 },
                 session: done.session.clone(),
                 result: Ok(JobOutput::ChapterStored {

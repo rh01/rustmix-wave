@@ -32,8 +32,7 @@ pub fn overlay(session: &mut Session) -> bool {
 #[cfg(target_os = "espidf")]
 fn save_espidf(session: &Session) {
     use esp_idf_svc::sys::{
-        nvs_close, nvs_commit, nvs_handle_t, nvs_open, nvs_open_mode_t_NVS_READWRITE, nvs_set_str,
-        ESP_OK,
+        nvs_close, nvs_commit, nvs_handle_t, nvs_open, nvs_open_mode_t_NVS_READWRITE, ESP_OK,
     };
     use std::ffi::CString;
 
@@ -64,7 +63,7 @@ fn save_espidf(session: &Session) {
 #[cfg(target_os = "espidf")]
 fn overlay_espidf(session: &mut Session) -> bool {
     use esp_idf_svc::sys::{
-        nvs_close, nvs_get_str, nvs_handle_t, nvs_open, nvs_open_mode_t_NVS_READONLY, ESP_OK,
+        nvs_close, nvs_handle_t, nvs_open, nvs_open_mode_t_NVS_READONLY, ESP_OK,
     };
     use std::ffi::CString;
 
@@ -139,11 +138,12 @@ unsafe fn get_str(handle: esp_idf_svc::sys::nvs_handle_t, key: &str) -> Option<S
     use std::ffi::CString;
 
     let key = CString::new(key).ok()?;
-    let mut buf = [0i8; 520];
+    // Xtensa `c_char` is unsigned. A byte buffer casts cleanly on this target.
+    let mut buf = [0u8; 520];
     let mut len = buf.len();
-    if nvs_get_str(handle, key.as_ptr(), buf.as_mut_ptr(), &mut len) != ESP_OK || len == 0 {
+    if nvs_get_str(handle, key.as_ptr(), buf.as_mut_ptr().cast(), &mut len) != ESP_OK || len == 0 {
         return None;
     }
-    let bytes = core::slice::from_raw_parts(buf.as_ptr() as *const u8, len.saturating_sub(1));
-    core::str::from_utf8(bytes).ok().map(str::to_string)
+    let end = len.saturating_sub(1).min(buf.len());
+    core::str::from_utf8(&buf[..end]).ok().map(str::to_string)
 }

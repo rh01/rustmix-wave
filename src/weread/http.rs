@@ -6,8 +6,8 @@
 use std::{thread, time::Duration};
 
 use embedded_svc::{
-    http::{client::Client as HttpClient, Method},
-    io::{Read, Write},
+    http::{client::Client as HttpClient, Headers, Method},
+    io::Write,
 };
 use esp_idf_svc::{
     http::client::{Configuration as HttpConfiguration, EspHttpConnection},
@@ -83,11 +83,16 @@ impl Transport for EspTransport {
         let connection = EspHttpConnection::new(&http_config)
             .map_err(|error| format!("HTTP connection init failed: {error}"))?;
         let mut client = HttpClient::wrap(connection);
-        let headers: Vec<(&str, &str)> = request
+        let mut headers: Vec<(&str, &str)> = request
             .headers
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str()))
             .collect();
+        // A declared length keeps ESP-IDF off chunked request bodies.
+        let content_length = request.body.as_ref().map(|body| body.len().to_string());
+        if let Some(length) = content_length.as_deref() {
+            headers.push(("Content-Length", length));
+        }
         let mut http_request = client
             .request(method, &request.url, &headers)
             .map_err(|error| format!("HTTP request setup failed: {error}"))?;
@@ -100,13 +105,11 @@ impl Transport for EspTransport {
             .submit()
             .map_err(|error| format!("HTTP request failed: {error}"))?;
         let status = response.status();
-        let declared = response.content_len().map(|len| len as usize);
-        if response
-            .content_len()
-            .is_some_and(|len| len > request.max_bytes as u64)
-        {
+        let declared_len = response.content_len();
+        if declared_len.is_some_and(|len| len > request.max_bytes as u64) {
             return Err("response exceeds size limit".into());
         }
+        let declared = declared_len.map(|len| len as usize);
         let mut set_cookie = String::new();
         for name in ["Set-Cookie", "set-cookie"] {
             if let Some(value) = response.header(name) {

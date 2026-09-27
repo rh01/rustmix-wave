@@ -1,0 +1,35 @@
+Lexicon pack credits
+
+These sources may be converted by tools/lexicon/build_lexicon.py. The firmware
+does not embed the dictionary dumps. Generated SD packs must keep the META.TXT
+attribution that the builder writes.
+
+ECDICT
+  License: MIT
+  Copyright: skywind3000
+  https://github.com/skywind3000/ECDICT
+
+JMdict
+  License: Creative Commons Attribution-ShareAlike 4.0
+  Copyright: Electronic Dictionary Research and Development Group
+  http://www.edrdg.org/jmdict/edict_doc.html
+
+KANJIDIC2
+  License: Creative Commons Attribution-ShareAlike 4.0
+  Copyright: Electronic Dictionary Research and Development Group
+  http://www.edrdg.org/wiki/index.php/KANJIDIC_Project
+
+CC-CEDICT
+  License: Creative Commons Attribution-ShareAlike 4.0
+  Copyright: MDBG
+  https://cc-cedict.org/wiki/
+
+JLPT word lists used to build RMXWLS1 decks against JMdict
+  Community lists associated with Tanos / Jonathan Waller
+  Machine-readable CSV: jamsinclair/open-anki-jlpt-decks (MIT)
+  https://github.com/jamsinclair/open-anki-jlpt-decks
+
+Open English WordNet (CC BY 4.0) is a permitted future source. This tree does
+not download or convert it. A source plugin slot is reserved and not registered.
+
+Do not use kajweb/dict, KyleBing, or mahavivo dumps with this converter.

@@ -22,8 +22,12 @@ impl LoadedSdFace {
     }
 
     #[must_use]
+    pub fn contains_char(&self, character: char) -> bool {
+        self.font.lookup_glyph_index(character) != 0 || character == '\0'
+    }
+
     pub fn rasterize(&self, character: char, px: u8) -> Option<RasterGlyph> {
-        if self.font.lookup_glyph_index(character) == 0 && character != '\0' {
+        if !self.contains_char(character) {
             return None;
         }
         let (metrics, coverage) = self.font.rasterize(character, f32::from(px));

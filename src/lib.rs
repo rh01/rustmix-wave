@@ -21,6 +21,7 @@ pub mod games;
 pub mod imu;
 pub mod imu_events;
 pub mod keyboard_navigation;
+pub mod lexicon;
 pub mod lua_runtime;
 pub mod network;
 pub mod network_config;
@@ -44,6 +45,7 @@ pub mod sleep_network;
 
 pub mod storage;
 pub mod unit_converter;
+pub mod vocab;
 pub mod voice_note_metadata;
 pub mod voice_notes;
 pub mod weather;

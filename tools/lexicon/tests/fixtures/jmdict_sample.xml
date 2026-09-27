@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<JMdict>
+<entry>
+<ent_seq>1</ent_seq>
+<k_ele><keb>猫</keb><ke_pri>news1</ke_pri></k_ele>
+<r_ele><reb>ねこ</reb><re_pri>ichi1</re_pri></r_ele>
+<sense><pos>&n;</pos><gloss>cat</gloss><gloss>feline</gloss></sense>
+</entry>
+<entry>
+<ent_seq>2</ent_seq>
+<k_ele><keb>犬</keb></k_ele>
+<r_ele><reb>いぬ</reb></r_ele>
+<sense><pos>&n;</pos><gloss>dog</gloss></sense>
+</entry>
+<entry>
+<ent_seq>3</ent_seq>
+<r_ele><reb>こんにちは</reb><re_pri>spec1</re_pri></r_ele>
+<sense><pos>&int;</pos><gloss>hello</gloss></sense>
+</entry>
+</JMdict>

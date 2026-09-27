@@ -24,9 +24,9 @@ The home dashboard shows date, time, battery, weather summary, Wi-Fi state, and 
 | Row | Opens |
 | --- | --- |
 | Reader | Continue Reading, Library, and Bookmarks |
-| Productivity | Calendar and Voice Notes |
+| Productivity | Calendar, Voice Notes, and Vocabulary |
 | Games | SD-loaded apps backed by native Rust game surfaces |
-| Tools | File Browser, Dictionary, and Unit Converter |
+| Tools | File Browser, Dictionary, Lexicon, and Unit Converter |
 | Settings | Device services, display, network, sensors, alarms, audio, and weather |
 
 Navigation: rotate to choose a category, then press SELECT. Use BOOT long from a category page to return home.
@@ -135,7 +135,7 @@ Bookmarks retain byte-offset anchors as the authoritative jump target. EPUB rows
 
 <img src="../screenshots/productivity.jpg" width="360" alt="Productivity menu">
 
-The Productivity category contains Calendar and Voice Notes.
+The Productivity category contains Calendar, Voice Notes, and Vocabulary.
 
 ### Calendar month view
 
@@ -243,6 +243,18 @@ The title editor reuses the shared keyboard-grid navigation model.
 
 The internal `VOICE###.WAV` filename does not change.
 
+### Vocabulary
+
+Vocabulary reviews word lists from `/RUSTMIX/LEXICON/LISTS` plus My words. The default scheduler is FSRS-6. `SETTINGS.TXT` can select `algo=sm2`. Set the RTC before studying. If the clock is missing, the screen shows `时钟未设置` and does not schedule.
+
+| Control | Action |
+| --- | --- |
+| Rotary up / down | Choose a deck, or a rating after the card is flipped |
+| SELECT | Start the deck, flip the card, then confirm Again / Hard / Good / Easy |
+| BOOT long | Leave the session. Unsaved reviews are written to `PROGRESS.BIN` |
+
+Card redraws use the normal panel refresh. A global refresh still runs every 32 partial updates.
+
 ## 4. Games
 
 ### Games category and SD Lua app catalog
@@ -311,7 +323,7 @@ Sokoban Tilt maps debounced tilt events to player movement and crate pushes. Til
 
 <img src="../screenshots/tools.jpg" width="360" alt="Tools menu">
 
-Tools contains File Browser, Dictionary, and Unit Converter.
+Tools contains File Browser, Dictionary, Lexicon, and Unit Converter.
 
 ### File Browser
 
@@ -341,6 +353,22 @@ The native Dictionary reuses the X4 prefix-shard SD pack. Enter letters, use **G
 | BOOT short | Toggle `NAV H` / `NAV V` |
 | SELECT | Activate letter, DEL, CLR, GO, or `*` |
 | BOOT long | Return to Tools |
+
+### Lexicon
+
+Lexicon is a second offline dictionary, separate from the X4 Dictionary pack. It reads `/RUSTMIX/LEXICON/<ID>/DICT.LEX` files built on a computer. See `docs/SD_CARD_SETUP.md` for the exact generator commands.
+
+| Control | Action |
+| --- | --- |
+| Rotary up / down | Move within the active keyboard axis, or through results |
+| BOOT short | Toggle `NAV H` / `NAV V` without moving the selected key |
+| MODE | Cycle English letters, kana, and pinyin |
+| GO | Exact lookup, then prefix fallback |
+| `*` | Prefix lookup |
+| DICT | Cycle installed dictionaries |
+| SRC | Open licenses and credits, including when no SD pack is present |
+| SELECT on an entry | Save the headword to My words |
+| BOOT long | Return to Tools, or from an entry back to search |
 
 ### Unit Converter
 

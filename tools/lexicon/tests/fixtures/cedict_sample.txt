@@ -1,0 +1,4 @@
+# CC-CEDICT sample
+你好 你好 [ni3 hao3] /hello/hi/
+銀行 银行 [yin2 hang2] /bank/
+女 女 [nv3] /woman/

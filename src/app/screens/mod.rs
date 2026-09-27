@@ -17,6 +17,7 @@ pub mod display;
 pub mod environment;
 pub mod files;
 pub mod home;
+pub mod lexicon;
 pub mod lua_game;
 pub mod motion;
 pub mod network;
@@ -24,6 +25,7 @@ pub mod placeholder;
 pub mod power_key;
 pub mod reader;
 pub mod unit_converter;
+pub mod vocab;
 pub mod voice_notes;
 pub mod weather;
 
@@ -58,10 +60,16 @@ pub fn render_active_screen(
         ScreenRoute::VoiceNotes => voice_notes::render_voice_notes(display, state),
         ScreenRoute::VoiceNoteDetails => voice_notes::render_voice_note_details(display, state),
         ScreenRoute::VoiceNoteRecording => voice_notes::render_voice_note_recording(display, state),
+        ScreenRoute::Vocab => vocab::render_vocab(display, state),
+        ScreenRoute::VocabSession => vocab::render_vocab_session(display, state),
+        ScreenRoute::VocabStats => vocab::render_vocab_stats(display, state),
         ScreenRoute::LuaApps => lua_game::render_lua_apps(display, state),
         ScreenRoute::LuaGame => lua_game::render_lua_game(display, state),
         ScreenRoute::LuaGameError => lua_game::render_lua_error(display, state),
         ScreenRoute::Dictionary => dictionary::render_dictionary(display, state),
+        ScreenRoute::Lexicon => lexicon::render_lexicon(display, state),
+        ScreenRoute::LexiconEntry => lexicon::render_lexicon_entry(display, state),
+        ScreenRoute::LexiconSources => lexicon::render_lexicon_sources(display, state),
         ScreenRoute::UnitConverter => unit_converter::render_unit_converter(display, state),
         ScreenRoute::Clock => clock::render_clock(display, state),
         ScreenRoute::ClockDetails => clock::render_clock_details(display, state),

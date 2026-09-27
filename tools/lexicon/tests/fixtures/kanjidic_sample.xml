@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kanjidic2>
+<character>
+<literal>働</literal>
+<misc><grade>8</grade><stroke_count>13</stroke_count><freq>417</freq><jlpt>1</jlpt></misc>
+<reading_meaning>
+<rmgroup>
+<reading r_type="ja_on">ドウ</reading>
+<reading r_type="ja_kun">はたら.く</reading>
+<meaning>work</meaning>
+</rmgroup>
+</reading_meaning>
+<query_code><q_code qc_type="skip">2-3-10</q_code></query_code>
+</character>
+<character>
+<literal>亜</literal>
+<misc><stroke_count>7</stroke_count></misc>
+<reading_meaning><rmgroup><meaning>Asia</meaning></rmgroup></reading_meaning>
+<query_code><q_code qc_type="skip">1-7-0</q_code></query_code>
+</character>
+</kanjidic2>

@@ -603,6 +603,7 @@ mod firmware {
         info!("rustmix-wave=voice-notes-catalog-scrolling-saved-wav-playback-ready visible-rows=6 format=wav-pcm16-mono-16khz playback=bounded-sd-stream mono-to-stereo=true volume=existing-codec-setting audio-owner=native stale-tmp-cleanup=boot alarms=interrupt");
         info!("rustmix-wave=voice-notes-organizer-controls-export-ready gain-persistence=SETTINGS.TXT metadata=META.TXT titles=friendly-sidecar filenames=fat83-wav recording-date-time=rtc-local storage=esp-vfs-fat-info delete-confirmation=true pause-resume=rx-discard export=wifi-transfer-shortcut");
         info!("rustmix-wave=offline-dictionary-x4-pack-native-foundation-ready root={DICTIONARY_ROOT} index=INDEX.TXT shards=DATA/*.JSN shard-max-bytes={DICTIONARY_SHARD_MAX_BYTES} lookup=exact-prefix-fallback wildcard=true ui=native-rust");
+        info!("rustmix-wave=lexicon-vocab-ready root=/sdcard/RUSTMIX/LEXICON format=RMXLEX1 lists=RMXWLS1 vocab=/sdcard/RUSTMIX/VOCAB scheduler=fsrs6,sm2");
         info!("rustmix-wave=dictionary-keyboard-boot-axis-navigation-ready short-press=boot toggle=horizontal,vertical default-axis=horizontal selected-key=preserved long-press=hierarchical-back helper=keyboard-grid-navigation");
         info!(
             "rustmix-wave=voice-notes-catalog status=completed notes={} root={VOICE_NOTES_ROOT}",

@@ -9,6 +9,7 @@ use crate::{
     dictionary::DictionaryUiState,
     imu::ImuReading,
     imu_events::{ImuControlOutcome, ImuDetectedEvent, ImuEventBridge},
+    lexicon::{ui::LexiconCommand, LexiconUiState},
     lua_runtime::LuaRuntimeUiState,
     network::NetworkSnapshot,
     orientation::DisplayOrientation,
@@ -17,6 +18,7 @@ use crate::{
     regional::RegionalPreferences,
     storage::StorageSnapshot,
     unit_converter::UnitConverterUiState,
+    vocab::ui::{ResultSave, VocabUiState},
     voice_notes::{VoiceNotesUiRequest, VoiceNotesUiState},
     weather::WeatherSnapshot,
     wifi_transfer::{WifiTransferSnapshot, WifiTransferState, WifiTransferUiRequest},
@@ -47,6 +49,10 @@ pub struct AppState {
     pub calendar: CalendarUiState,
     /// Offline X4-pack-compatible native Dictionary keyboard and lookup snapshot.
     pub dictionary: DictionaryUiState,
+    /// Multilingual RMXLEX1 lookup keyboard, hits, and open entry.
+    pub lexicon: LexiconUiState,
+    /// SD-backed FSRS-6 / SM-2 vocabulary trainer.
+    pub vocab: VocabUiState,
     /// Offline fixed-point Unit Converter cursor and editable field.
     pub unit_converter: UnitConverterUiState,
     /// TXT / reflowable EPUB Reader library, staged opening, RAM cache and options.
@@ -98,6 +104,8 @@ impl Default for AppState {
             display: DisplayPreferences::default(),
             calendar: CalendarUiState::default(),
             dictionary: DictionaryUiState::default(),
+            lexicon: LexiconUiState::default(),
+            vocab: VocabUiState::default(),
             unit_converter: UnitConverterUiState::default(),
             reader: ReaderUiState::default(),
             lua_runtime: LuaRuntimeUiState::default(),
@@ -154,6 +162,16 @@ impl AppState {
             self.apply_calendar_delete_confirmation(event);
         } else if route == ScreenRoute::Dictionary {
             self.apply_dictionary(event);
+        } else if matches!(
+            route,
+            ScreenRoute::Lexicon | ScreenRoute::LexiconEntry | ScreenRoute::LexiconSources
+        ) {
+            self.apply_lexicon(event);
+        } else if matches!(
+            route,
+            ScreenRoute::Vocab | ScreenRoute::VocabSession | ScreenRoute::VocabStats
+        ) {
+            self.apply_vocab(event);
         } else if route == ScreenRoute::UnitConverter {
             self.apply_unit_converter(event);
         } else if route == ScreenRoute::MotionEvents {
@@ -335,6 +353,13 @@ impl AppState {
                 if target == ScreenRoute::Dictionary {
                     self.dictionary.refresh_pack_status();
                 }
+                if target == ScreenRoute::Lexicon {
+                    self.lexicon.refresh_catalog();
+                }
+                if target == ScreenRoute::Vocab {
+                    self.vocab.load_default();
+                    self.sync_vocab_clock();
+                }
                 if target == ScreenRoute::ContinueReading && self.reader.session.is_some() {
                     self.router.navigate_to(ScreenRoute::ReaderPage);
                 } else {
@@ -349,6 +374,104 @@ impl AppState {
             self.note_select_press();
         }
         self.dictionary.apply_button(event);
+    }
+
+    fn apply_lexicon(&mut self, event: ButtonEvent) {
+        match self.router.current() {
+            ScreenRoute::Lexicon => {
+                if event == ButtonEvent::Select {
+                    self.note_select_press();
+                }
+                match self.lexicon.apply_button(event) {
+                    LexiconCommand::OpenEntry => {
+                        self.router.navigate_to(ScreenRoute::LexiconEntry);
+                    }
+                    LexiconCommand::OpenSources => {
+                        self.router.navigate_to(ScreenRoute::LexiconSources);
+                    }
+                    LexiconCommand::None => {}
+                }
+            }
+            ScreenRoute::LexiconEntry => match event {
+                ButtonEvent::Up => {
+                    self.lexicon
+                        .change_entry_page(-1, self.lexicon.entry_page_count());
+                }
+                ButtonEvent::Down => {
+                    self.lexicon
+                        .change_entry_page(1, self.lexicon.entry_page_count());
+                }
+                ButtonEvent::Select => {
+                    self.note_select_press();
+                    if let Some(entry) = self.lexicon.entry.clone() {
+                        match self.vocab.save_myword(&entry.dict_id, entry.entry_id) {
+                            ResultSave::Saved => {
+                                self.lexicon.message = "Saved to My words".into();
+                            }
+                            ResultSave::Failed(error) => {
+                                self.lexicon.message = compact_message(&error);
+                            }
+                        }
+                    }
+                }
+            },
+            ScreenRoute::LexiconSources => match event {
+                ButtonEvent::Up => {
+                    let count = self.lexicon.dicts.len().max(1);
+                    self.lexicon.source_index = self
+                        .lexicon
+                        .source_index
+                        .checked_sub(1)
+                        .unwrap_or(count - 1);
+                }
+                ButtonEvent::Down => {
+                    let count = self.lexicon.dicts.len().max(1);
+                    self.lexicon.source_index = (self.lexicon.source_index + 1) % count;
+                }
+                ButtonEvent::Select => self.note_select_press(),
+            },
+            _ => {}
+        }
+    }
+
+    fn apply_vocab(&mut self, event: ButtonEvent) {
+        match self.router.current() {
+            ScreenRoute::Vocab => {
+                if event == ButtonEvent::Select {
+                    self.note_select_press();
+                }
+                if self.vocab.apply_deck_button(event) {
+                    self.router.navigate_to(ScreenRoute::VocabSession);
+                } else if self.vocab.show_stats {
+                    self.vocab.show_stats = false;
+                    self.router.navigate_to(ScreenRoute::VocabStats);
+                }
+            }
+            ScreenRoute::VocabSession => {
+                if event == ButtonEvent::Select {
+                    self.note_select_press();
+                }
+                if self.vocab.apply_session_button(event) {
+                    self.router.navigate_to(ScreenRoute::VocabStats);
+                }
+            }
+            ScreenRoute::VocabStats => {}
+            _ => {}
+        }
+    }
+
+    fn sync_vocab_clock(&mut self) {
+        match self.board.rtc {
+            Some(rtc) if !self.board.rtc_clock_integrity_was_lost => {
+                self.vocab.sync_clock(
+                    i32::from(rtc.year),
+                    u32::from(rtc.month),
+                    u32::from(rtc.day),
+                    false,
+                );
+            }
+            _ => self.vocab.sync_clock(0, 0, 0, true),
+        }
     }
 
     fn apply_voice_notes(&mut self, event: ButtonEvent) {
@@ -570,6 +693,9 @@ impl AppState {
             self.voice_notes.toggle_title_editor_navigation_axis()
         } else if self.router.current() == ScreenRoute::Dictionary {
             self.dictionary.toggle_navigation_axis();
+            true
+        } else if self.router.current() == ScreenRoute::Lexicon {
+            self.lexicon.toggle_navigation_axis();
             true
         } else {
             false
@@ -855,6 +981,9 @@ impl AppState {
         if self.router.current() == ScreenRoute::CalendarEventEditor {
             self.calendar.clear_editor();
         }
+        if self.router.current() == ScreenRoute::VocabSession {
+            self.vocab.save();
+        }
         if self.router.current() == ScreenRoute::ReaderLoading {
             self.reader.cancel_loading();
         }
@@ -888,6 +1017,12 @@ impl AppState {
 
     pub fn update_board_snapshot(&mut self, board: BoardSnapshot) {
         self.board = board;
+        if matches!(
+            self.router.current(),
+            ScreenRoute::Vocab | ScreenRoute::VocabSession | ScreenRoute::VocabStats
+        ) {
+            self.sync_vocab_clock();
+        }
     }
 
     pub fn update_storage_snapshot(&mut self, storage: StorageSnapshot) {
@@ -954,6 +1089,16 @@ impl AppState {
 
     pub fn set_orientation(&mut self, orientation: DisplayOrientation) {
         self.orientation = orientation;
+    }
+}
+
+fn compact_message(value: &str) -> String {
+    let mut chars = value.chars();
+    let clipped: String = chars.by_ref().take(72).collect();
+    if chars.next().is_some() {
+        format!("{clipped}...")
+    } else {
+        clipped
     }
 }
 
@@ -1335,5 +1480,19 @@ mod tests {
         state.open_power_key_menu();
         state.back();
         assert_eq!(state.active_route(), ScreenRoute::Calendar);
+    }
+
+    #[test]
+    fn lexicon_boot_short_toggles_axis_and_vocab_back_returns_homeward() {
+        let mut state = AppState::default();
+        state.router.navigate_to(ScreenRoute::Lexicon);
+        assert!(state.apply_keyboard_boot_short_press());
+        assert_eq!(state.lexicon.navigation_mode_label(), "NAV V");
+        state.router.navigate_to(ScreenRoute::Vocab);
+        state.router.navigate_to(ScreenRoute::VocabSession);
+        state.back();
+        assert_eq!(state.active_route(), ScreenRoute::Vocab);
+        state.back();
+        assert_eq!(state.active_route(), ScreenRoute::Productivity);
     }
 }

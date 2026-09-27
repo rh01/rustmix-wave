@@ -26,8 +26,8 @@ const HOME_ENTRIES: [MenuEntry; MAIN_CATEGORY_COUNT] = [
     },
     MenuEntry {
         label: "Productivity",
-        subtitle: "Calendar and voice notes",
-        badge: "2",
+        subtitle: "Calendar, notes and vocabulary",
+        badge: "3",
         route: ScreenRoute::Productivity,
     },
     MenuEntry {
@@ -38,8 +38,8 @@ const HOME_ENTRIES: [MenuEntry; MAIN_CATEGORY_COUNT] = [
     },
     MenuEntry {
         label: "Tools",
-        subtitle: "Files, dictionary and conversion",
-        badge: "3",
+        subtitle: "Files, dictionary, lexicon, conversion",
+        badge: "4",
         route: ScreenRoute::Tools,
     },
     MenuEntry {
@@ -71,7 +71,7 @@ const READER_ENTRIES: [MenuEntry; 3] = [
     },
 ];
 
-const PRODUCTIVITY_ENTRIES: [MenuEntry; 2] = [
+const PRODUCTIVITY_ENTRIES: [MenuEntry; 3] = [
     MenuEntry {
         label: "Calendar",
         subtitle: "US agenda and personal editor",
@@ -84,6 +84,12 @@ const PRODUCTIVITY_ENTRIES: [MenuEntry; 2] = [
         badge: "READY",
         route: ScreenRoute::VoiceNotes,
     },
+    MenuEntry {
+        label: "Vocabulary",
+        subtitle: "FSRS-6 and SM-2 word review",
+        badge: "READY",
+        route: ScreenRoute::Vocab,
+    },
 ];
 
 const GAMES_ENTRIES: [MenuEntry; 1] = [MenuEntry {
@@ -93,7 +99,7 @@ const GAMES_ENTRIES: [MenuEntry; 1] = [MenuEntry {
     route: ScreenRoute::LuaApps,
 }];
 
-const TOOLS_ENTRIES: [MenuEntry; 3] = [
+const TOOLS_ENTRIES: [MenuEntry; 4] = [
     MenuEntry {
         label: "File Browser",
         subtitle: "Read-only SDMMC browser",
@@ -111,6 +117,12 @@ const TOOLS_ENTRIES: [MenuEntry; 3] = [
         subtitle: "Offline fixed-point conversions",
         badge: "READY",
         route: ScreenRoute::UnitConverter,
+    },
+    MenuEntry {
+        label: "Lexicon",
+        subtitle: "EN, kana and pinyin lookup",
+        badge: "READY",
+        route: ScreenRoute::Lexicon,
     },
 ];
 
@@ -209,9 +221,9 @@ mod tests {
     fn exposes_requested_main_category_counts_without_synthetic_back_rows() {
         assert_eq!(home_entries().len(), MAIN_CATEGORY_COUNT);
         assert_eq!(category_entries(ScreenRoute::Reader).len(), 3);
-        assert_eq!(category_entries(ScreenRoute::Productivity).len(), 2);
+        assert_eq!(category_entries(ScreenRoute::Productivity).len(), 3);
         assert_eq!(category_entries(ScreenRoute::Games).len(), 1);
-        assert_eq!(category_entries(ScreenRoute::Tools).len(), 3);
+        assert_eq!(category_entries(ScreenRoute::Tools).len(), 4);
         assert_eq!(category_entries(ScreenRoute::Settings).len(), 9);
         for route in [
             ScreenRoute::Reader,

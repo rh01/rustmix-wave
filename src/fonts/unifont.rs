@@ -44,6 +44,23 @@ pub fn contains(character: char) -> bool {
     native_bitmap(character).is_some()
 }
 
+/// True when the right 8 columns of a 16x16 cell are blank.
+#[must_use]
+pub fn right_half_empty(bitmap: &[u8]) -> bool {
+    bitmap.len() >= BITMAP_BYTES && (0..16).all(|row| bitmap[row * 2 + 1] == 0)
+}
+
+/// Half-width Unifont cells advance by half a pixel size, at least 1px.
+#[must_use]
+pub fn advance_px(bitmap: &[u8], px: u8) -> u8 {
+    let px = px.max(1);
+    if right_half_empty(bitmap) {
+        (px / 2).max(1)
+    } else {
+        px
+    }
+}
+
 #[allow(dead_code)]
 #[must_use]
 pub const fn native_px() -> u8 {
@@ -77,7 +94,7 @@ fn binary_search_u16(codes: &[u8], needle: u16) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{contains, native_bitmap, pack_glyph_count};
+    use super::{contains, native_bitmap, pack_glyph_count, right_half_empty};
 
     #[test]
     fn pack_contains_gb2312_ideograph_and_fullwidth_punctuation() {
@@ -87,5 +104,17 @@ mod tests {
         assert!(contains('，'));
         assert!(native_bitmap('中').is_some());
         assert!(native_bitmap('A').is_none());
+        assert!(!right_half_empty(native_bitmap('中').unwrap()));
+    }
+
+    #[test]
+    fn half_width_advance_uses_the_empty_right_half() {
+        let mut bitmap = [0u8; 32];
+        assert!(super::right_half_empty(&bitmap));
+        assert_eq!(super::advance_px(&bitmap, 16), 8);
+        bitmap[1] = 0x80;
+        assert!(!super::right_half_empty(&bitmap));
+        assert_eq!(super::advance_px(&bitmap, 16), 16);
+        assert_eq!(super::advance_px(&bitmap, 0), 1);
     }
 }

@@ -38,5 +38,8 @@ jobs:
       - name: Run native-target host tests
         run: ./scripts/test-host.sh
 
+      - name: Run lexicon converter tests
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s tools/lexicon/tests
+
       - name: Verify ELF-only release workflow
         run: ./scripts/test-release-flash-workflow.sh

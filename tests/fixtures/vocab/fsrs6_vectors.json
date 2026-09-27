@@ -1,0 +1,799 @@
+{
+  "source": "py-fsrs",
+  "algorithm": "FSRS-6",
+  "desired_retention": 0.9,
+  "learning_steps": [],
+  "relearning_steps": [],
+  "enable_fuzzing": false,
+  "sequences": [
+    {
+      "ratings": [
+        "Again"
+      ],
+      "steps": [
+        {
+          "rating": "Again",
+          "elapsed_days": 0,
+          "stability": 0.212,
+          "difficulty": 6.4133,
+          "interval": 1,
+          "day": 0
+        }
+      ]
+    },
+    {
+      "ratings": [
+        "Hard"
+      ],
+      "steps": [
+        {
+          "rating": "Hard",
+          "elapsed_days": 0,
+          "stability": 1.2931,
+          "difficulty": 5.112170705601056,
+          "interval": 1,
+          "day": 0
+        }
+      ]
+    },
+    {
+      "ratings": [
+        "Good"
+      ],
+      "steps": [
+        {
+          "rating": "Good",
+          "elapsed_days": 0,
+          "stability": 2.3065,
+          "difficulty": 2.118103970459016,
+          "interval": 2,
+          "day": 0
+        }
+      ]
+    },
+    {
+      "ratings": [
+        "Easy"
+      ],
+      "steps": [
+        {
+          "rating": "Easy",
+          "elapsed_days": 0,
+          "stability": 8.2956,
+          "difficulty": 1.0,
+          "interval": 8,
+          "day": 0
+        }
+      ]
+    },
+    {
+      "ratings": [
+        "Good",
+        "Good",
+        "Good"
+      ],
+      "steps": [
+        {
+          "rating": "Good",
+          "elapsed_days": 0,
+          "stability": 2.3065,
+          "difficulty": 2.118103970459016,
+          "interval": 2,
+          "day": 0
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 2,
+          "stability": 10.964332335820698,
+          "difficulty": 2.111214235785395,
+          "interval": 11,
+          "day": 2
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 11,
+          "stability": 46.28021728755693,
+          "difficulty": 2.1043313908464483,
+          "interval": 46,
+          "day": 13
+        }
+      ]
+    },
+    {
+      "ratings": [
+        "Again",
+        "Good",
+        "Good"
+      ],
+      "steps": [
+        {
+          "rating": "Again",
+          "elapsed_days": 0,
+          "stability": 0.212,
+          "difficulty": 6.4133,
+          "interval": 1,
+          "day": 0
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 1,
+          "stability": 1.8867876195204154,
+          "difficulty": 6.402115069296838,
+          "interval": 2,
+          "day": 1
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 2,
+          "stability": 6.269161317502347,
+          "difficulty": 6.3909413235243795,
+          "interval": 6,
+          "day": 3
+        }
+      ]
+    },
+    {
+      "ratings": [
+        "Good",
+        "Again",
+        "Good"
+      ],
+      "steps": [
+        {
+          "rating": "Good",
+          "elapsed_days": 0,
+          "stability": 2.3065,
+          "difficulty": 2.118103970459016,
+          "interval": 2,
+          "day": 0
+        },
+        {
+          "rating": "Again",
+          "elapsed_days": 2,
+          "stability": 0.6075801062519337,
+          "difficulty": 7.394502741279718,
+          "interval": 1,
+          "day": 2
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 1,
+          "stability": 2.4004040500172708,
+          "difficulty": 7.382336607835277,
+          "interval": 2,
+          "day": 3
+        }
+      ]
+    },
+    {
+      "ratings": [
+        "Easy",
+        "Easy",
+        "Hard"
+      ],
+      "steps": [
+        {
+          "rating": "Easy",
+          "elapsed_days": 0,
+          "stability": 8.2956,
+          "difficulty": 1.0,
+          "interval": 8,
+          "day": 0
+        },
+        {
+          "rating": "Easy",
+          "elapsed_days": 8,
+          "stability": 65.62422616189994,
+          "difficulty": 1.0,
+          "interval": 66,
+          "day": 8
+        },
+        {
+          "rating": "Hard",
+          "elapsed_days": 66,
+          "stability": 171.958835286134,
+          "difficulty": 4.010608969296839,
+          "interval": 172,
+          "day": 74
+        }
+      ]
+    },
+    {
+      "ratings": [
+        "Hard",
+        "Good",
+        "Easy",
+        "Good"
+      ],
+      "steps": [
+        {
+          "rating": "Hard",
+          "elapsed_days": 0,
+          "stability": 1.2931,
+          "difficulty": 5.112170705601056,
+          "interval": 1,
+          "day": 0
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 1,
+          "stability": 4.546029441066125,
+          "difficulty": 5.102286904192293,
+          "interval": 5,
+          "day": 1
+        },
+        {
+          "rating": "Easy",
+          "elapsed_days": 5,
+          "stability": 27.030634318325546,
+          "difficulty": 3.4509277903004603,
+          "interval": 27,
+          "day": 6
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 27,
+          "stability": 90.45400353590432,
+          "difficulty": 3.442705231806998,
+          "interval": 90,
+          "day": 33
+        }
+      ]
+    },
+    {
+      "ratings": [
+        "Good",
+        "Hard",
+        "Hard",
+        "Good"
+      ],
+      "steps": [
+        {
+          "rating": "Good",
+          "elapsed_days": 0,
+          "stability": 2.3065,
+          "difficulty": 2.118103970459016,
+          "interval": 2,
+          "day": 0
+        },
+        {
+          "rating": "Hard",
+          "elapsed_days": 2,
+          "stability": 7.513320366762569,
+          "difficulty": 4.752858488532557,
+          "interval": 8,
+          "day": 2
+        },
+        {
+          "rating": "Hard",
+          "elapsed_days": 8,
+          "stability": 18.876547150465242,
+          "difficulty": 6.501931317190316,
+          "interval": 19,
+          "day": 10
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 19,
+          "stability": 47.04743823644869,
+          "difficulty": 6.490657755169964,
+          "interval": 47,
+          "day": 29
+        }
+      ]
+    },
+    {
+      "ratings": [
+        "Again",
+        "Again",
+        "Good"
+      ],
+      "steps": [
+        {
+          "rating": "Again",
+          "elapsed_days": 0,
+          "stability": 0.212,
+          "difficulty": 6.4133,
+          "interval": 1,
+          "day": 0
+        },
+        {
+          "rating": "Again",
+          "elapsed_days": 1,
+          "stability": 0.10088578982099844,
+          "difficulty": 8.806304468856837,
+          "interval": 1,
+          "day": 1
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 1,
+          "stability": 0.6832068408085884,
+          "difficulty": 8.792726533684817,
+          "interval": 1,
+          "day": 2
+        }
+      ]
+    },
+    {
+      "ratings": [
+        "Easy",
+        "Good",
+        "Again",
+        "Easy"
+      ],
+      "steps": [
+        {
+          "rating": "Easy",
+          "elapsed_days": 0,
+          "stability": 8.2956,
+          "difficulty": 1.0,
+          "interval": 8,
+          "day": 0
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 8,
+          "stability": 38.90514998232684,
+          "difficulty": 1.0,
+          "interval": 39,
+          "day": 8
+        },
+        {
+          "rating": "Again",
+          "elapsed_days": 39,
+          "stability": 2.8623266774582303,
+          "difficulty": 7.0269895692968385,
+          "interval": 3,
+          "day": 47
+        },
+        {
+          "rating": "Easy",
+          "elapsed_days": 3,
+          "stability": 12.820165386669986,
+          "difficulty": 6.018776394938751,
+          "interval": 13,
+          "day": 50
+        }
+      ]
+    },
+    {
+      "ratings": [
+        "Good",
+        "Good",
+        "Easy",
+        "Good",
+        "Good"
+      ],
+      "steps": [
+        {
+          "rating": "Good",
+          "elapsed_days": 0,
+          "stability": 2.3065,
+          "difficulty": 2.118103970459016,
+          "interval": 2,
+          "day": 0
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 2,
+          "stability": 10.964332335820698,
+          "difficulty": 2.111214235785395,
+          "interval": 11,
+          "day": 2
+        },
+        {
+          "rating": "Easy",
+          "elapsed_days": 11,
+          "stability": 77.10745326192749,
+          "difficulty": 1.0,
+          "interval": 77,
+          "day": 13
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 77,
+          "stability": 278.3278242029053,
+          "difficulty": 1.0,
+          "interval": 278,
+          "day": 90
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 278,
+          "stability": 864.9066676124448,
+          "difficulty": 1.0,
+          "interval": 865,
+          "day": 368
+        }
+      ]
+    },
+    {
+      "ratings": [
+        "Hard",
+        "Hard",
+        "Good",
+        "Good"
+      ],
+      "steps": [
+        {
+          "rating": "Hard",
+          "elapsed_days": 0,
+          "stability": 1.2931,
+          "difficulty": 5.112170705601056,
+          "interval": 1,
+          "day": 0
+        },
+        {
+          "rating": "Hard",
+          "elapsed_days": 1,
+          "stability": 3.2494117658571677,
+          "difficulty": 6.7404595108297,
+          "interval": 3,
+          "day": 1
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 3,
+          "stability": 9.03413829365584,
+          "difficulty": 6.728947420615708,
+          "interval": 9,
+          "day": 4
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 9,
+          "stability": 23.402062090259555,
+          "difficulty": 6.717446842491931,
+          "interval": 23,
+          "day": 13
+        }
+      ]
+    },
+    {
+      "ratings": [
+        "Good",
+        "Easy",
+        "Good",
+        "Hard",
+        "Again"
+      ],
+      "steps": [
+        {
+          "rating": "Good",
+          "elapsed_days": 0,
+          "stability": 2.3065,
+          "difficulty": 2.118103970459016,
+          "interval": 2,
+          "day": 0
+        },
+        {
+          "rating": "Easy",
+          "elapsed_days": 2,
+          "stability": 18.52175418175859,
+          "difficulty": 1.0,
+          "interval": 19,
+          "day": 2
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 19,
+          "stability": 81.00659514701519,
+          "difficulty": 1.0,
+          "interval": 81,
+          "day": 21
+        },
+        {
+          "rating": "Hard",
+          "elapsed_days": 81,
+          "stability": 207.21776797344793,
+          "difficulty": 4.010608969296839,
+          "interval": 207,
+          "day": 102
+        },
+        {
+          "rating": "Again",
+          "elapsed_days": 207,
+          "stability": 4.930006818844558,
+          "difficulty": 8.016556265363716,
+          "interval": 5,
+          "day": 309
+        }
+      ]
+    },
+    {
+      "ratings": [
+        "Again",
+        "Hard",
+        "Good",
+        "Easy"
+      ],
+      "steps": [
+        {
+          "rating": "Again",
+          "elapsed_days": 0,
+          "stability": 0.212,
+          "difficulty": 6.4133,
+          "interval": 1,
+          "day": 0
+        },
+        {
+          "rating": "Hard",
+          "elapsed_days": 1,
+          "stability": 1.219217274379578,
+          "difficulty": 7.604209769076838,
+          "interval": 1,
+          "day": 1
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 1,
+          "stability": 3.086306182791782,
+          "difficulty": 7.5918339286046,
+          "interval": 3,
+          "day": 2
+        },
+        {
+          "rating": "Easy",
+          "elapsed_days": 3,
+          "stability": 11.706162022120361,
+          "difficulty": 6.772365417380022,
+          "interval": 12,
+          "day": 5
+        }
+      ]
+    },
+    {
+      "ratings": [
+        "Easy",
+        "Again",
+        "Again",
+        "Good"
+      ],
+      "steps": [
+        {
+          "rating": "Easy",
+          "elapsed_days": 0,
+          "stability": 8.2956,
+          "difficulty": 1.0,
+          "interval": 8,
+          "day": 0
+        },
+        {
+          "rating": "Again",
+          "elapsed_days": 8,
+          "stability": 1.3886324609821161,
+          "difficulty": 7.0269895692968385,
+          "interval": 1,
+          "day": 8
+        },
+        {
+          "rating": "Again",
+          "elapsed_days": 1,
+          "stability": 0.3856724126773965,
+          "difficulty": 9.008020057195637,
+          "interval": 1,
+          "day": 9
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 1,
+          "stability": 1.2724721809838533,
+          "difficulty": 8.994240406435278,
+          "interval": 1,
+          "day": 10
+        }
+      ]
+    },
+    {
+      "ratings": [
+        "Good",
+        "Good",
+        "Good",
+        "Again",
+        "Good",
+        "Good"
+      ],
+      "steps": [
+        {
+          "rating": "Good",
+          "elapsed_days": 0,
+          "stability": 2.3065,
+          "difficulty": 2.118103970459016,
+          "interval": 2,
+          "day": 0
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 2,
+          "stability": 10.964332335820698,
+          "difficulty": 2.111214235785395,
+          "interval": 11,
+          "day": 2
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 11,
+          "stability": 46.28021728755693,
+          "difficulty": 2.1043313908464483,
+          "interval": 46,
+          "day": 13
+        },
+        {
+          "rating": "Again",
+          "elapsed_days": 46,
+          "stability": 2.9325804541638116,
+          "difficulty": 7.389975788014609,
+          "interval": 3,
+          "day": 59
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 3,
+          "stability": 7.778225744797728,
+          "difficulty": 7.377814181523433,
+          "interval": 8,
+          "day": 62
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 8,
+          "stability": 18.7816340167913,
+          "difficulty": 7.365664736638748,
+          "interval": 19,
+          "day": 70
+        }
+      ]
+    },
+    {
+      "ratings": [
+        "Hard",
+        "Easy",
+        "Good"
+      ],
+      "steps": [
+        {
+          "rating": "Hard",
+          "elapsed_days": 0,
+          "stability": 1.2931,
+          "difficulty": 5.112170705601056,
+          "interval": 1,
+          "day": 0
+        },
+        {
+          "rating": "Easy",
+          "elapsed_days": 1,
+          "stability": 7.385511550172746,
+          "difficulty": 3.4641142975548855,
+          "interval": 7,
+          "day": 1
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 7,
+          "stability": 28.063015925172287,
+          "difficulty": 3.455878552554169,
+          "interval": 28,
+          "day": 8
+        }
+      ]
+    },
+    {
+      "ratings": [
+        "Good",
+        "Good"
+      ],
+      "steps": [
+        {
+          "rating": "Good",
+          "elapsed_days": 0,
+          "stability": 2.3065,
+          "difficulty": 2.118103970459016,
+          "interval": 2,
+          "day": 0
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 2,
+          "stability": 10.964332335820698,
+          "difficulty": 2.111214235785395,
+          "interval": 11,
+          "day": 2
+        }
+      ]
+    },
+    {
+      "ratings": [
+        "Easy",
+        "Hard",
+        "Good",
+        "Easy"
+      ],
+      "steps": [
+        {
+          "rating": "Easy",
+          "elapsed_days": 0,
+          "stability": 8.2956,
+          "difficulty": 1.0,
+          "interval": 8,
+          "day": 0
+        },
+        {
+          "rating": "Hard",
+          "elapsed_days": 8,
+          "stability": 26.704183359371363,
+          "difficulty": 4.010608969296839,
+          "interval": 27,
+          "day": 8
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 27,
+          "stability": 85.34020308236191,
+          "difficulty": 4.00182672962438,
+          "interval": 85,
+          "day": 35
+        },
+        {
+          "rating": "Easy",
+          "elapsed_days": 85,
+          "stability": 371.8114834181452,
+          "difficulty": 1.9827451068360853,
+          "interval": 372,
+          "day": 120
+        }
+      ]
+    },
+    {
+      "ratings": [
+        "Again",
+        "Good",
+        "Hard",
+        "Easy",
+        "Good"
+      ],
+      "steps": [
+        {
+          "rating": "Again",
+          "elapsed_days": 0,
+          "stability": 0.212,
+          "difficulty": 6.4133,
+          "interval": 1,
+          "day": 0
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 1,
+          "stability": 1.8867876195204154,
+          "difficulty": 6.402115069296838,
+          "interval": 2,
+          "day": 1
+        },
+        {
+          "rating": "Hard",
+          "elapsed_days": 2,
+          "stability": 4.522347161486749,
+          "difficulty": 7.596784690858309,
+          "interval": 5,
+          "day": 3
+        },
+        {
+          "rating": "Easy",
+          "elapsed_days": 5,
+          "stability": 17.487714022780697,
+          "difficulty": 6.7789704936734,
+          "interval": 17,
+          "day": 8
+        },
+        {
+          "rating": "Good",
+          "elapsed_days": 17,
+          "stability": 41.68142539310382,
+          "difficulty": 6.767419892476565,
+          "interval": 42,
+          "day": 25
+        }
+      ]
+    }
+  ]
+}

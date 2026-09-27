@@ -151,6 +151,7 @@ Use the Wi-Fi firmware release for normal Wi-Fi transfer, weather, NTP/time sync
 - Reader supports TXT and bounded reflowable EPUB files, TOC navigation, bookmarks, per-book resume, Chinese (CJK) text via SD `/fonts` TTF/OTF plus Unifont/GB2312 fallback, in-reader font sizes 16/20/24/32/48/72, typography preferences, paragraph alignment, and FAT 8.3-safe persistence.
 - Voice Notes records PCM16 mono 16 kHz WAV files to SD, supports microphone gain, pause/resume, saved-note playback, titles, timestamps, delete confirmation, storage telemetry, and LAN export.
 - Native Dictionary reuses the Rustmix X4 prefix-shard SD pack and uses BOOT-short `NAV H` / `NAV V` keyboard-axis switching.
+- Lexicon looks up SD `RMXLEX1` dictionaries (English, kana, and pinyin keyboards) and Vocabulary reviews those lists with FSRS-6 or SM-2.
 - Native Calendar loads personal events and the U.S.-only 2026 pack, renders a daily agenda, and supports recovery-safe personal-event creation, editing, and deletion.
 - Wi-Fi transfer portal provides explicit LAN-only SD access with protected configuration paths and atomic file replacement.
 - RTC alarms, weather, unit conversion, file browsing, audio diagnostics, sensors, Lua apps, and native motion games remain available.
@@ -179,8 +180,10 @@ See [`docs/BOARD_CONTRACT.md`](docs/BOARD_CONTRACT.md) for the stable board boun
 | Reader | Continue Reading, Library, Bookmarks | Ready: TXT and bounded reflowable EPUB |
 | Productivity | Calendar | Ready: U.S.-only agenda and personal-event editor |
 | Productivity | Voice Notes | Ready: record, pause/resume, playback, title, delete, export |
+| Productivity | Vocabulary | Ready: FSRS-6 default, optional SM-2, SD progress |
 | Games | SD Lua catalog | Ready: Hello Grid, Sudoku, Minesweeper, Tilt Maze, Motion 2048, Sokoban Tilt |
 | Tools | Dictionary | Ready: native X4 prefix-shard lookup |
+| Tools | Lexicon | Ready: RMXLEX1 lookup, sources, and credits |
 | Tools | File Browser | Ready: bounded read-only SD browser and text preview |
 | Tools | Unit Converter | Ready: offline fixed-point conversions |
 | Settings | Alarms | Ready: RTC schedules, snooze, dismiss |

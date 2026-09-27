@@ -7,7 +7,14 @@
 
 pub mod adpcm;
 pub mod pronounce;
+mod runtime_guard;
 pub mod tone;
+
+pub use runtime_guard::{
+    apply_playback_write, claim_amp_then_start, i2s_tx_status_from_code, AmpEnableHold,
+    AmpEnableLine, AudioStartup, I2sTxStatus, PlaybackWriteError, ESP_ERR_TIMEOUT_CODE,
+    I2S_TX_TIMEOUT_MS,
+};
 
 #[cfg(target_os = "espidf")]
 pub mod board_codec;

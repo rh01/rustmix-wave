@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use embedded_hal::{delay::DelayNs, i2c::I2c};
 use es8311::{ClockConfig, Resolution};
 use esp_idf_svc::hal::{
-    delay::{BLOCK, NON_BLOCK},
+    delay::{TickType, NON_BLOCK},
     gpio::{Output, PinDriver},
     i2s::{I2sBiDir, I2sDriver},
 };
@@ -14,12 +14,36 @@ use crate::voice_notes::{
 };
 
 use super::{
+    apply_playback_write,
     board_codec::{BoardEs8311, CodecProfileSnapshot},
+    i2s_tx_status_from_code,
     tone::{ChimeGenerator, ChimeMode, PCM_CHUNK_BYTES},
-    AudioPlaybackState, AudioSnapshot, AudioUiRequest, AUDIO_MCLK_HZ, AUDIO_SAMPLE_RATE_HZ,
-    AUDIO_VOLUME_STEP_PERCENT, DEFAULT_AUDIO_VOLUME_PERCENT, ES8311_I2C_ADDRESS_HIGH,
-    ES8311_I2C_ADDRESS_LOW, MAX_AUDIO_VOLUME_PERCENT,
+    AmpEnableLine, AudioPlaybackState, AudioSnapshot, AudioUiRequest, I2sTxStatus,
+    PlaybackWriteError, AUDIO_MCLK_HZ, AUDIO_SAMPLE_RATE_HZ, AUDIO_VOLUME_STEP_PERCENT,
+    DEFAULT_AUDIO_VOLUME_PERCENT, ES8311_I2C_ADDRESS_HIGH, ES8311_I2C_ADDRESS_LOW,
+    ESP_ERR_TIMEOUT_CODE, I2S_TX_TIMEOUT_MS, MAX_AUDIO_VOLUME_PERCENT,
 };
+
+const _: () = assert!(ESP_ERR_TIMEOUT_CODE as i64 == esp_idf_svc::sys::ESP_ERR_TIMEOUT as i64);
+
+impl AmpEnableLine for PinDriver<'_, Output> {
+    type Error = esp_idf_svc::sys::EspError;
+
+    fn drive_low(&mut self) -> Result<(), Self::Error> {
+        self.set_low()
+    }
+
+    fn is_low(&self) -> bool {
+        self.is_set_low()
+    }
+}
+
+/// Codec or mute setup failed. The amplifier driver is returned so the caller
+/// can keep GPIO39 driven low instead of dropping the pin.
+pub struct AudioInitError<'d> {
+    pub amplifier: PinDriver<'d, Output>,
+    pub error: anyhow::Error,
+}
 
 /// Own the safe-start playback runtime. The amplifier is held low unless PCM
 /// audio is actively being streamed.
@@ -43,13 +67,16 @@ where
         tx: I2sDriver<'d, I2sBiDir>,
         mut amplifier: PinDriver<'d, Output>,
         delay: &mut D,
-    ) -> Result<Self>
+    ) -> Result<Self, AudioInitError<'d>>
     where
         D: DelayNs,
     {
-        amplifier
-            .set_low()
-            .map_err(|error| anyhow!("failed to disable audio amplifier: {error:?}"))?;
+        if let Err(error) = amplifier.set_low() {
+            return Err(AudioInitError {
+                amplifier,
+                error: anyhow!("failed to disable audio amplifier: {error:?}"),
+            });
+        }
         let clock = ClockConfig {
             mclk_inverted: false,
             sclk_inverted: false,
@@ -75,18 +102,27 @@ where
                 Err(error) => last_error = Some(format!("{error:?}")),
             }
         }
-        let (codec, codec_address, profile) = detected.ok_or_else(|| {
-            anyhow!(
-                "ES8311 probe failed at 0x{ES8311_I2C_ADDRESS_LOW:02X} and 0x{ES8311_I2C_ADDRESS_HIGH:02X}: {}",
-                last_error.unwrap_or_else(|| "unknown codec error".into())
-            )
-        })?;
-        codec
-            .volume_set(&mut bus, DEFAULT_AUDIO_VOLUME_PERCENT, None)
-            .map_err(|error| anyhow!("failed to set ES8311 volume: {error:?}"))?;
-        codec
-            .mute(&mut bus, true)
-            .map_err(|error| anyhow!("failed to mute ES8311: {error:?}"))?;
+        let Some((codec, codec_address, profile)) = detected else {
+            return Err(AudioInitError {
+                amplifier,
+                error: anyhow!(
+                    "ES8311 probe failed at 0x{ES8311_I2C_ADDRESS_LOW:02X} and 0x{ES8311_I2C_ADDRESS_HIGH:02X}: {}",
+                    last_error.unwrap_or_else(|| "unknown codec error".into())
+                ),
+            });
+        };
+        if let Err(error) = codec.volume_set(&mut bus, DEFAULT_AUDIO_VOLUME_PERCENT, None) {
+            return Err(AudioInitError {
+                amplifier,
+                error: anyhow!("failed to set ES8311 volume: {error:?}"),
+            });
+        }
+        if let Err(error) = codec.mute(&mut bus, true) {
+            return Err(AudioInitError {
+                amplifier,
+                error: anyhow!("failed to mute ES8311: {error:?}"),
+            });
+        }
 
         Ok(Self {
             bus,
@@ -172,9 +208,7 @@ where
             self.snapshot.volume_percent,
             self.snapshot.muted,
         );
-        self.tx
-            .write_all(&bytes, BLOCK)
-            .map_err(|error| anyhow!("I2S TX write failed: {error:?}"))?;
+        self.write_playback_pcm(&bytes, "I2S TX write")?;
         if completed_test {
             self.stop_playback()?;
             return Ok(true);
@@ -225,9 +259,7 @@ where
             return Err(anyhow!("pronunciation playback is not active"));
         }
         let stereo_bytes = expand_pcm16_mono_to_stereo(mono, stereo)?;
-        self.tx
-            .write_all(&stereo[..stereo_bytes], BLOCK)
-            .map_err(|error| anyhow!("I2S pronunciation TX write failed: {error:?}"))
+        self.write_playback_pcm(&stereo[..stereo_bytes], "I2S pronunciation TX write")
     }
 
     pub fn finish_pronounce(&mut self) -> Result<()> {
@@ -239,9 +271,7 @@ where
             return Err(anyhow!("voice-note playback is not active"));
         }
         let stereo_bytes = expand_pcm16_mono_to_stereo(mono, stereo)?;
-        self.tx
-            .write_all(&stereo[..stereo_bytes], BLOCK)
-            .map_err(|error| anyhow!("I2S voice-note TX write failed: {error:?}"))
+        self.write_playback_pcm(&stereo[..stereo_bytes], "I2S voice-note TX write")
     }
 
     pub fn finish_voice_note_playback(&mut self) -> Result<()> {
@@ -328,6 +358,38 @@ where
         self.snapshot.muted = true;
         self.snapshot.playback_state = AudioPlaybackState::Error;
         self.snapshot.error = Some(error.into());
+    }
+
+    /// Pronunciation, voice-note playback, and alarm chimes share this write.
+    /// The wait is [`I2S_TX_TIMEOUT_MS`]. A stalled bit clock returns
+    /// `ESP_ERR_TIMEOUT`, and `stop_playback` drops the amplifier.
+    fn write_playback_pcm(&mut self, pcm: &[u8], context: &'static str) -> Result<()> {
+        let timeout = TickType::new_millis(I2S_TX_TIMEOUT_MS).ticks();
+        let (status, failure) = match self.tx.write_all(pcm, timeout) {
+            Ok(()) => (I2sTxStatus::Wrote, None),
+            Err(error) => {
+                let status = i2s_tx_status_from_code(Some(error.code()));
+                let failure = if status == I2sTxStatus::Failed {
+                    Some(format!("{error:?}"))
+                } else {
+                    None
+                };
+                (status, failure)
+            }
+        };
+        match apply_playback_write(status, || self.stop_playback()) {
+            Ok(()) => Ok(()),
+            Err(PlaybackWriteError::Timeout) => {
+                Err(anyhow!("{context} timed out after {I2S_TX_TIMEOUT_MS} ms"))
+            }
+            Err(PlaybackWriteError::Stop(error)) => Err(anyhow!(
+                "{context} timed out after {I2S_TX_TIMEOUT_MS} ms and amplifier shutdown failed: {error:#}"
+            )),
+            Err(PlaybackWriteError::Failed) => Err(anyhow!(
+                "{context} failed: {}",
+                failure.unwrap_or_else(|| "unknown I2S error".into())
+            )),
+        }
     }
 
     fn begin_playback(&mut self, mode: ChimeMode) -> Result<()> {

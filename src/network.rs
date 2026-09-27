@@ -398,7 +398,7 @@ pub mod espidf {
                 .map(|ap| ScannedNetwork {
                     ssid: ap.ssid.to_string(),
                     rssi_dbm: i32::from(ap.signal_strength),
-                    open: ap.auth_method == AuthMethod::None,
+                    open: ap.auth_method == Some(AuthMethod::None),
                 })
                 .collect();
             Ok(collapse_scan_results(mapped))

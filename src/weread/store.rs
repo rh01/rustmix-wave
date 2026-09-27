@@ -11,9 +11,11 @@ use std::{
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     sync::{mpsc, Mutex},
-    thread::ThreadId,
     time::Duration,
 };
+
+#[cfg(test)]
+use std::thread::ThreadId;
 
 use crate::{
     reader::ReaderLayout,

@@ -5881,9 +5881,10 @@ mod tests {
         fs::write(root.join("Later.epu"), "zip").unwrap();
         fs::write(root.join("ignore.bin"), "no").unwrap();
         let books = scan_txt_library(&root).unwrap();
-        assert_eq!(books.len(), 2);
+        // "zip" is a 3-byte odd leftover, not an EPUB the device should open.
+        assert_eq!(books.len(), 1);
         assert_eq!(books[0].title, "Dracula");
-        assert_eq!(books[1].format, BookFormat::Epub);
+        assert_eq!(books[0].format, BookFormat::Text);
     }
 
     #[test]

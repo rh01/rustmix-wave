@@ -458,6 +458,7 @@ fn open_book(
     }
     let mut detail;
     let chapters;
+    let mut progress = None;
     let mut psvts = String::new();
     if session.web_signed_in() {
         maybe_renew(transport, session, ctx)?;
@@ -477,8 +478,13 @@ fn open_book(
             },
             true,
         )?;
-        detail = parse::parse_book_detail(&body_text(&info)?, book_id);
-        let catalog = call(
+        let info_text = body_text(&info)?;
+        let info_truncated = observe_payload("/web/book/info", info.status, &info_text, 0);
+        detail = parse::parse_book_detail(&info_text, book_id);
+        if !info_truncated {
+            progress = parse::parse_progress(&info_text);
+        }
+        let catalog = match call(
             transport,
             ctx,
             Request {
@@ -493,9 +499,28 @@ fn open_book(
                 max_bytes: MAX_JSON_BYTES,
             },
             true,
-        )?;
+        ) {
+            Ok(response) => response,
+            Err(error) => return Err(catalog_limit(error, "/web/book/chapterInfos")),
+        };
         let text = body_text(&catalog)?;
-        chapters = parse::parse_chapters(&text);
+        let truncated = parse::catalog_truncated(&text);
+        chapters = if truncated {
+            Vec::new()
+        } else {
+            parse::parse_chapters(&text)
+        };
+        observe_payload(
+            "/web/book/chapterInfos",
+            catalog.status,
+            &text,
+            chapters.len(),
+        );
+        if truncated {
+            return Err(JobError::Message(
+                "WeRead catalog response was truncated.".into(),
+            ));
+        }
         if let Some(format) = crate::weread::jsonutil::object_string(&text, "format", 16) {
             if let Some(detail) = detail.as_mut() {
                 if detail.format.is_empty() {
@@ -504,38 +529,65 @@ fn open_book(
             }
         }
     } else if session.has_api_key() {
-        let info = gateway(
+        let (info_status, info) = gateway_response(
             transport,
             session,
             ctx,
             "/book/info",
             &[("bookId", book_id)],
         )?;
+        let info_truncated = observe_payload("/book/info", info_status, &info, 0);
         detail = parse::parse_book_detail(&info, book_id);
-        let catalog = gateway(
+        if !info_truncated {
+            progress = parse::parse_progress(&info);
+        }
+        let (catalog_status, catalog) = match gateway_response(
             transport,
             session,
             ctx,
             "/book/chapterinfo",
             &[("bookId", book_id)],
-        )?;
-        chapters = parse::parse_chapters(&catalog);
+        ) {
+            Ok(response) => response,
+            Err(error) => return Err(catalog_limit(error, "/book/chapterinfo")),
+        };
+        let truncated = parse::catalog_truncated(&catalog);
+        chapters = if truncated {
+            Vec::new()
+        } else {
+            parse::parse_chapters(&catalog)
+        };
+        observe_payload(
+            "/book/chapterinfo",
+            catalog_status,
+            &catalog,
+            chapters.len(),
+        );
+        if truncated {
+            return Err(JobError::Message(
+                "WeRead catalog response was truncated.".into(),
+            ));
+        }
     } else {
         return Err(JobError::Message("Sign in to open this book.".into()));
     }
     let detail = detail.ok_or(JobError::Message(
         "WeRead did not return book details.".into(),
     ))?;
-    let mut progress = None;
     if session.has_api_key() {
-        if let Ok(text) = gateway(
+        if let Ok((status, text)) = gateway_response(
             transport,
             session,
             ctx,
             "/book/getprogress",
             &[("bookId", book_id)],
         ) {
-            progress = parse::parse_progress(&text);
+            let truncated = observe_payload("/book/getprogress", status, &text, 0);
+            if !truncated {
+                if let Some(parsed) = parse::parse_progress(&text) {
+                    progress = Some(parsed);
+                }
+            }
         }
     }
     if session.web_signed_in() {
@@ -922,6 +974,16 @@ fn gateway(
     api_name: &str,
     fields: &[(&str, &str)],
 ) -> Result<String, JobError> {
+    gateway_response(transport, session, ctx, api_name, fields).map(|(_, text)| text)
+}
+
+fn gateway_response(
+    transport: &mut dyn Transport,
+    session: &Session,
+    ctx: &mut CallCtx,
+    api_name: &str,
+    fields: &[(&str, &str)],
+) -> Result<(u16, String), JobError> {
     let response = call(
         transport,
         ctx,
@@ -934,7 +996,63 @@ fn gateway(
         },
         true,
     )?;
-    body_text(&response)
+    let status = response.status;
+    body_text(&response).map(|text| (status, text))
+}
+
+/// One catalog or progress diagnostic. The endpoint is a path only: no query
+/// string, no cookies, no request body.
+fn observe_payload(endpoint: &str, status: u16, body: &str, chapters: usize) -> bool {
+    let truncated = parse::catalog_truncated(body);
+    log::info!(
+        "{}",
+        payload_log_line(
+            endpoint,
+            status,
+            body.len(),
+            crate::weread::jsonutil::errcode(body),
+            chapters,
+            truncated
+        )
+    );
+    truncated
+}
+
+fn catalog_limit(error: JobError, endpoint: &str) -> JobError {
+    match error {
+        JobError::Message(message) if message.contains("exceeds size limit") => {
+            log::info!("{}", payload_log_line(endpoint, 0, 0, None, 0, true));
+            JobError::Message("WeRead catalog response was truncated.".into())
+        }
+        other => other,
+    }
+}
+
+fn payload_log_line(
+    endpoint: &str,
+    status: u16,
+    bytes: usize,
+    errcode: Option<i64>,
+    chapters: usize,
+    truncated: bool,
+) -> String {
+    let code = match errcode {
+        Some(code) => code.to_string(),
+        None => "none".into(),
+    };
+    format!(
+        "rustmix-wave=weread-payload endpoint={} status={status} bytes={bytes} errcode={code} chapters={chapters} truncated={truncated}",
+        endpoint_path(endpoint)
+    )
+}
+
+fn endpoint_path(endpoint: &str) -> &str {
+    let without_query = endpoint.split(['?', '#']).next().unwrap_or(endpoint);
+    let Some(scheme) = without_query.find("://") else {
+        return without_query;
+    };
+    let rest = &without_query[scheme + 3..];
+    rest.find('/').map(|slash| &rest[slash..]).unwrap_or("/")
 }
 
 fn authed_get(
@@ -1366,5 +1484,101 @@ mod tests {
         );
         assert_eq!(report.session.skey, "new-key");
         assert_eq!(report.session.skey_unix, unix);
+    }
+
+    #[test]
+    fn payload_log_keeps_the_path_and_drops_query_secrets() {
+        let line = super::payload_log_line(
+            "https://weread.qq.com/web/book/chapterInfos?bookId=secret&wr_skey=cookie",
+            200,
+            4096,
+            Some(0),
+            34,
+            false,
+        );
+        assert_eq!(
+            line,
+            "rustmix-wave=weread-payload endpoint=/web/book/chapterInfos status=200 bytes=4096 errcode=0 chapters=34 truncated=false"
+        );
+        assert!(!line.contains("secret"));
+        assert!(!line.contains("cookie"));
+        assert!(!line.contains('?'));
+        let progress = super::payload_log_line("/book/getprogress", 200, 80, None, 0, true);
+        assert!(progress.contains("endpoint=/book/getprogress"));
+        assert!(progress.contains("errcode=none"));
+        assert!(progress.contains("truncated=true"));
+    }
+
+    #[test]
+    fn large_chapter_object_is_kept_and_truncated_catalog_errors() {
+        let pad = "a".repeat(3 * 1024);
+        let catalog = format!(
+            r#"{{"data":[{{"bookId":"43208843","updated":[{{"chapterUid":7,"chapterIdx":1,"title":"锚点章","anchors":["{pad}"]}}]}}]}}"#
+        );
+        let mut script = Script {
+            steps: vec![
+                json_response(
+                    r#"{"bookId":"43208843","title":"持续交付","author":"乔梁","progress":22,"chapterUid":7,"chapterOffset":2}"#,
+                ),
+                json_response(&catalog),
+            ],
+            index: 0,
+            waits: 0,
+            urls: Vec::new(),
+        };
+        let mut session = Session::default();
+        session.vid = "9".into();
+        session.skey = "tok".into();
+        session.skey_unix = 1_780_488_000;
+        let report = perform(
+            &mut script,
+            Work {
+                generation: 6,
+                job: Job::OpenBook {
+                    book_id: "43208843".into(),
+                },
+                session: session.clone(),
+            },
+            Some(1_780_488_000),
+        );
+        let JobOutput::Book {
+            chapters, progress, ..
+        } = report.result.unwrap()
+        else {
+            panic!("expected book");
+        };
+        assert_eq!(chapters.len(), 1);
+        assert_eq!(chapters[0].uid, "7");
+        assert_eq!(progress.unwrap().progress, 22);
+        assert!(script
+            .urls
+            .iter()
+            .any(|url| url.contains("/web/book/chapterInfos")));
+
+        let mut truncated = Script {
+            steps: vec![
+                json_response(r#"{"bookId":"43208843","title":"持续交付"}"#),
+                json_response(r#"{"updated":[{"chapterUid":1,"title":"第一章""#),
+            ],
+            index: 0,
+            waits: 0,
+            urls: Vec::new(),
+        };
+        let report = perform(
+            &mut truncated,
+            Work {
+                generation: 7,
+                job: Job::OpenBook {
+                    book_id: "43208843".into(),
+                },
+                session,
+            },
+            Some(1_780_488_000),
+        );
+        let Err(JobError::Message(message)) = report.result else {
+            panic!("truncated catalog must be an error");
+        };
+        assert!(message.contains("truncated"));
+        assert!(!message.to_lowercase().contains("no chapters"));
     }
 }

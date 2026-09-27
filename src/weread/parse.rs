@@ -1,10 +1,12 @@
 //! Parsers for shelf, catalog, login, progress, highlights, and notes.
 
 use crate::weread::{
-    jsonutil::{self, array_objects, errcode, is_truthy, object_i64, object_string},
+    jsonutil::{
+        self, array_objects, array_objects_scanned, errcode, is_truthy, object_i64, object_string,
+    },
     limits::{
-        MAX_CHAPTERS, MAX_FIELD_CHARS, MAX_ID_CHARS, MAX_NOTES, MAX_NOTE_CHARS, MAX_SHELF_BOOKS,
-        MAX_TITLE_CHARS,
+        MAX_CHAPTERS, MAX_CHAPTER_OBJECT_BYTES, MAX_FIELD_CHARS, MAX_ID_CHARS, MAX_JSON_BYTES,
+        MAX_NOTES, MAX_NOTE_CHARS, MAX_SHELF_BOOKS, MAX_TITLE_CHARS,
     },
 };
 
@@ -132,7 +134,7 @@ pub fn parse_login_poll(json: &str) -> LoginPoll {
 }
 
 pub fn parse_shelf(json: &str) -> Vec<ShelfBook> {
-    let objects = array_objects(json, "books", MAX_SHELF_BOOKS, 4 * 1024);
+    let objects = array_objects_scanned(json, "books", MAX_SHELF_BOOKS, 4 * 1024);
     objects
         .into_iter()
         .filter_map(parse_shelf_book)
@@ -164,17 +166,20 @@ pub fn parse_book_detail(json: &str, fallback_id: &str) -> Option<BookDetail> {
 }
 
 pub fn parse_chapters(json: &str) -> Vec<ChapterMeta> {
+    if catalog_truncated(json) {
+        return Vec::new();
+    }
     let record = jsonutil::object_raw(json, "data")
         .and_then(|data| {
-            jsonutil::objects_in_array(data, 1, 256 * 1024)
+            jsonutil::objects_in_array(data, 1, MAX_JSON_BYTES)
                 .into_iter()
                 .next()
         })
         .unwrap_or(json);
     let chapters = if jsonutil::object_raw(record, "updated").is_some() {
-        array_objects(record, "updated", MAX_CHAPTERS, 2 * 1024)
+        array_objects_scanned(record, "updated", MAX_CHAPTERS, MAX_CHAPTER_OBJECT_BYTES)
     } else {
-        array_objects(record, "chapters", MAX_CHAPTERS, 2 * 1024)
+        array_objects_scanned(record, "chapters", MAX_CHAPTERS, MAX_CHAPTER_OBJECT_BYTES)
     };
     let mut parsed: Vec<ChapterMeta> = chapters.into_iter().filter_map(parse_chapter).collect();
     parsed.sort_by_key(|chapter| chapter.index);
@@ -182,15 +187,50 @@ pub fn parse_chapters(json: &str) -> Vec<ChapterMeta> {
     parsed
 }
 
+/// A catalog cut off at the response cap is not an empty book.
+#[must_use]
+pub fn catalog_truncated(json: &str) -> bool {
+    !json.trim().is_empty() && !jsonutil::document_complete(json)
+}
+
 pub fn parse_progress(json: &str) -> Option<ReadingProgress> {
-    let book = jsonutil::object_raw(json, "book").unwrap_or(json);
-    let progress = object_i64(book, "progress")?.clamp(0, 100) as u8;
+    if catalog_truncated(json) {
+        return None;
+    }
+    progress_candidates(json)
+        .into_iter()
+        .find_map(progress_from)
+}
+
+fn progress_candidates(json: &str) -> Vec<&str> {
+    let mut candidates = Vec::new();
+    if let Some(data) = jsonutil::object_raw(json, "data") {
+        if let Some(book) = jsonutil::object_raw(data, "book") {
+            candidates.push(book);
+        }
+        if let Some(reading) = jsonutil::object_raw(data, "readingProgress") {
+            candidates.push(reading);
+        }
+        candidates.push(data);
+    }
+    if let Some(book) = jsonutil::object_raw(json, "book") {
+        candidates.push(book);
+    }
+    if let Some(reading) = jsonutil::object_raw(json, "readingProgress") {
+        candidates.push(reading);
+    }
+    candidates.push(json);
+    candidates
+}
+
+fn progress_from(object: &str) -> Option<ReadingProgress> {
+    let progress = object_i64(object, "progress")?.clamp(0, 100) as u8;
     Some(ReadingProgress {
-        chapter_uid: object_i64(book, "chapterUid")
+        chapter_uid: object_i64(object, "chapterUid")
             .map(|value| value.to_string())
-            .or_else(|| object_string(book, "chapterUid", 16))
+            .or_else(|| object_string(object, "chapterUid", 16))
             .unwrap_or_default(),
-        chapter_offset: object_i64(book, "chapterOffset").unwrap_or(0).max(0) as u32,
+        chapter_offset: object_i64(object, "chapterOffset").unwrap_or(0).max(0) as u32,
         progress,
     })
 }
@@ -376,5 +416,67 @@ mod tests {
             classify(200, r#"{"errcode":-2012}"#),
             ResponseClass::Expired
         );
+    }
+
+    #[test]
+    fn chapter_objects_larger_than_two_kib_are_kept() {
+        for pad in [3 * 1024, 20 * 1024] {
+            let anchors = "a".repeat(pad);
+            let json = format!(
+                r#"{{"data":[{{"bookId":"43208843","updated":[{{"chapterUid":7,"chapterIdx":1,"title":"锚点章","wordCount":4,"level":1,"anchors":["{anchors}"]}}]}}]}}"#
+            );
+            assert!(
+                json.len() > 2 * 1024,
+                "fixture must exceed the old 2 KiB object cap"
+            );
+            let chapters = parse_chapters(&json);
+            assert_eq!(chapters.len(), 1, "pad {pad}");
+            assert_eq!(chapters[0].uid, "7");
+            assert_eq!(chapters[0].title, "锚点章");
+            assert!(!chapters[0].title.contains('a'));
+        }
+    }
+
+    #[test]
+    fn truncated_catalog_is_not_an_empty_chapter_list() {
+        let cut = r#"{"updated":[{"chapterUid":1,"chapterIdx":1,"title":"第一章""#;
+        assert!(super::catalog_truncated(cut));
+        assert!(parse_chapters(cut).is_empty());
+        assert!(!super::catalog_truncated(
+            r#"{"updated":[{"chapterUid":1,"chapterIdx":1,"title":"第一章","wordCount":1,"level":1}]}"#
+        ));
+    }
+
+    #[test]
+    fn progress_is_read_from_book_info_and_nested_records() {
+        let nested =
+            parse_progress(r#"{"data":{"book":{"chapterUid":9,"chapterOffset":4,"progress":40}}}"#)
+                .unwrap();
+        assert_eq!(nested.chapter_uid, "9");
+        assert_eq!(nested.chapter_offset, 4);
+        assert_eq!(nested.progress, 40);
+        let info = parse_progress(
+            r#"{"bookId":"43208843","title":"持续交付","progress":12,"chapterUid":3,"chapterOffset":1}"#,
+        )
+        .unwrap();
+        assert_eq!(info.progress, 12);
+        assert_eq!(info.chapter_uid, "3");
+        let reading = parse_progress(
+            r#"{"readingProgress":{"chapterUid":"8","chapterOffset":2,"progress":55}}"#,
+        )
+        .unwrap();
+        assert_eq!(reading.progress, 55);
+        assert_eq!(reading.chapter_uid, "8");
+        assert!(parse_progress(r#"{"data":{"book":{"progress":12,"chapterUid":1}"#).is_none());
+    }
+
+    #[test]
+    fn shelf_progress_survives_a_book_object_over_four_kib() {
+        let intro = "x".repeat(5 * 1024);
+        let shelf = parse_shelf(&format!(
+            r#"{{"books":[{{"bookId":"43208843","title":"持续交付","intro":"{intro}","progress":18}}]}}"#
+        ));
+        assert_eq!(shelf.len(), 1);
+        assert_eq!(shelf[0].progress, Some(18));
     }
 }

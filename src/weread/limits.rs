@@ -18,6 +18,9 @@ pub const MAX_IMAGE_EDGE: u32 = 800;
 pub const MAX_SHELF_BOOKS: usize = 128;
 /// Catalog entries kept for one book.
 pub const MAX_CHAPTERS: usize = 1024;
+/// Preferred per-chapter JSON object size. Larger objects are still scanned
+/// for the scalar fields (`chapterUid`, title, index); nested anchors are not kept.
+pub const MAX_CHAPTER_OBJECT_BYTES: usize = 16 * 1024;
 /// Highlight and note rows.
 pub const MAX_NOTES: usize = 64;
 /// Inline images fetched for one chapter.

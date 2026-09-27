@@ -1,10 +1,11 @@
 //! Display-time Traditional/Simplified conversion.
 //!
 //! The mapping is a compact flash table of one-to-one pairs. It is not copied
-//! into PSRAM. Conversion happens while a page is drawn, so TXT and EPUB byte
-//! offsets and layout caches stay unchanged. The embedded face is a GB2312
-//! subset, so pairs whose traditional form is outside that face are omitted
-//! rather than drawn as a missing glyph.
+//! into PSRAM. Conversion happens while a page is drawn and does not change
+//! byte offsets. The selected script is still part of the layout cache
+//! fingerprint, so a script change names a different TXT or EPUB chapter
+//! cache. The embedded face is a GB2312 subset, so pairs whose traditional
+//! form is outside that face are omitted rather than drawn as a missing glyph.
 
 use crate::fonts;
 

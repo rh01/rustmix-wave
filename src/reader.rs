@@ -85,7 +85,11 @@ pub const READER_EPUB_INDEX_YIELD_EVERY_PAGES: usize = 4;
 pub const READER_EPUB_INDEX_YIELD_MILLIS: u64 = 1;
 
 const READER_PERSISTENCE_VERSION: &str = "1";
-const READER_CACHE_VERSION: &str = "3";
+/// Bumped when the cache fingerprint gains a layout preference. Version 3 is
+/// the chapter-on-demand baseline (path, size, mtime, line count, line width,
+/// font, orientation, alignment). Version 4 also covers letter spacing, line
+/// and paragraph spacing, margins, indent, justification, and Chinese script.
+const READER_CACHE_VERSION: &str = "4";
 const READER_PREFS_VERSION: &str = "2";
 const READER_PREFS_VERSION_V1: &str = "1";
 const CACHE_FNV_OFFSET: u64 = 0xcbf29ce484222325;
@@ -1082,7 +1086,10 @@ impl ReadingPreset {
     }
 }
 
-/// Layout dimensions affecting TXT pagination and cache fingerprints.
+/// Layout dimensions affecting TXT pagination and both cache fingerprints.
+///
+/// TXT anchor files and EPUB chapter files both start from [`book_fingerprint`].
+/// Fields here are the only layout preferences that hash participates in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReaderLayout {
     pub chars_per_line: usize,
@@ -1106,6 +1113,7 @@ pub struct ReaderLayout {
     pub line_spacing: LineSpacing,
     pub paragraph_spacing: ParagraphSpacing,
     pub paragraph_alignment: ParagraphAlignment,
+    pub chinese_script: crate::reader_hanzi::ChineseScript,
 }
 
 impl ReaderLayout {
@@ -1427,6 +1435,7 @@ impl ReaderPreferences {
             line_spacing: self.line_spacing,
             paragraph_spacing: self.paragraph_spacing,
             paragraph_alignment: self.paragraph_alignment,
+            chinese_script: self.chinese_script,
         }
     }
 
@@ -3926,8 +3935,7 @@ impl ReaderUiState {
                     "Chinese: {}",
                     self.preferences.chinese_script.label()
                 ));
-                self.persist_preferences_best_effort();
-                false
+                true
             }
             ReadingPreference::ReadingTheme => {
                 self.preferences.theme = self.preferences.theme.next();
@@ -5022,39 +5030,49 @@ fn decode_windows_1252(byte: u8) -> char {
     }
 }
 
+fn feed_cache_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(CACHE_FNV_PRIME);
+    }
+}
+
+/// Hash preferences that change line breaks or the displayed script.
+///
+/// EPUB chapter caches call [`book_fingerprint`] and then mix in the chapter
+/// range, so this helper is the only place those preferences are recorded.
+fn feed_layout_preferences(hash: &mut u64, layout: &ReaderLayout) {
+    feed_cache_bytes(hash, &layout.letter_spacing_px.to_le_bytes());
+    feed_cache_bytes(hash, &layout.line_spacing_px.to_le_bytes());
+    feed_cache_bytes(hash, &layout.paragraph_gap_lines.to_le_bytes());
+    feed_cache_bytes(hash, &layout.margin_top_px.to_le_bytes());
+    feed_cache_bytes(hash, &layout.margin_bottom_px.to_le_bytes());
+    feed_cache_bytes(hash, &layout.margin_left_px.to_le_bytes());
+    feed_cache_bytes(hash, &layout.margin_right_px.to_le_bytes());
+    feed_cache_bytes(hash, &[u8::from(layout.first_line_indent)]);
+    feed_cache_bytes(hash, &[u8::from(layout.justified)]);
+    feed_cache_bytes(hash, layout.letter_spacing.marker().as_bytes());
+    feed_cache_bytes(hash, layout.line_spacing.marker().as_bytes());
+    feed_cache_bytes(hash, layout.paragraph_spacing.marker().as_bytes());
+    feed_cache_bytes(hash, layout.chinese_script.marker().as_bytes());
+}
+
 fn book_fingerprint(book: &ReaderBook, layout: ReaderLayout) -> u64 {
     let mut hash = CACHE_FNV_OFFSET;
-    fn feed(hash: &mut u64, bytes: &[u8]) {
-        for byte in bytes {
-            *hash ^= u64::from(*byte);
-            *hash = hash.wrapping_mul(CACHE_FNV_PRIME);
-        }
-    }
-    feed(&mut hash, book.path.as_bytes());
-    feed(&mut hash, &book.size_bytes.to_le_bytes());
-    feed(&mut hash, &book.modified_seconds.to_le_bytes());
-    feed(&mut hash, book.format.marker().as_bytes());
-    feed(&mut hash, &layout.lines_per_page.to_le_bytes());
-    feed(&mut hash, &layout.chars_per_line.to_le_bytes());
-    feed(&mut hash, &layout.max_line_width_px.to_le_bytes());
-    feed(&mut hash, &layout.font_size_px.to_le_bytes());
-    feed(&mut hash, &layout.letter_spacing_px.to_le_bytes());
-    feed(&mut hash, &layout.line_spacing_px.to_le_bytes());
-    feed(&mut hash, &layout.paragraph_gap_lines.to_le_bytes());
-    feed(&mut hash, &layout.margin_top_px.to_le_bytes());
-    feed(&mut hash, &layout.margin_bottom_px.to_le_bytes());
-    feed(&mut hash, &layout.margin_left_px.to_le_bytes());
-    feed(&mut hash, &layout.margin_right_px.to_le_bytes());
-    feed(&mut hash, &[u8::from(layout.first_line_indent)]);
-    feed(&mut hash, &[u8::from(layout.justified)]);
-    feed(&mut hash, layout.orientation.marker().as_bytes());
-    feed(&mut hash, layout.font_size.marker().as_bytes());
-    feed(&mut hash, layout.book_font.marker().as_bytes());
-    feed(&mut hash, layout.letter_spacing.marker().as_bytes());
-    feed(&mut hash, layout.line_spacing.marker().as_bytes());
-    feed(&mut hash, layout.paragraph_spacing.marker().as_bytes());
-    feed(&mut hash, layout.paragraph_alignment.marker().as_bytes());
-    feed(&mut hash, READER_CACHE_VERSION.as_bytes());
+    feed_cache_bytes(&mut hash, book.path.as_bytes());
+    feed_cache_bytes(&mut hash, &book.size_bytes.to_le_bytes());
+    feed_cache_bytes(&mut hash, &book.modified_seconds.to_le_bytes());
+    feed_cache_bytes(&mut hash, book.format.marker().as_bytes());
+    feed_cache_bytes(&mut hash, &layout.lines_per_page.to_le_bytes());
+    feed_cache_bytes(&mut hash, &layout.chars_per_line.to_le_bytes());
+    feed_cache_bytes(&mut hash, &layout.max_line_width_px.to_le_bytes());
+    feed_cache_bytes(&mut hash, &layout.font_size_px.to_le_bytes());
+    feed_cache_bytes(&mut hash, layout.orientation.marker().as_bytes());
+    feed_cache_bytes(&mut hash, layout.font_size.marker().as_bytes());
+    feed_cache_bytes(&mut hash, layout.book_font.marker().as_bytes());
+    feed_cache_bytes(&mut hash, layout.paragraph_alignment.marker().as_bytes());
+    feed_layout_preferences(&mut hash, &layout);
+    feed_cache_bytes(&mut hash, READER_CACHE_VERSION.as_bytes());
     hash
 }
 
@@ -5520,19 +5538,19 @@ mod tests {
 
     use super::{
         atomic_replace_text, auto_page_turn_keeps_awake, book_format_from_path,
-        chapter_jump_forward, detect_txt_encoding, is_fat83_safe_file_name, load_location_record,
-        map_page_turn_event, normalize_decoded, paginate_decoded, parse_location_fields,
-        parse_location_record, poll_auto_page_turn, scan_txt_library, serialize_location,
-        serialize_location_fields, with_layout_button_poll, AutoPageTurn, AutoTurnClock, BookFont,
-        BookFontSize, BookFormat, FullRefreshEvery, LetterSpacing, LineSpacing, PageMargin,
-        ParagraphAlignment, ParagraphSpacing, ReaderBook, ReaderChapterPageLabel,
-        ReaderLoadingStage, ReaderLocation, ReaderOrientation, ReaderPreferences, ReaderSession,
-        ReaderTickOutcome, ReaderUiState, ReadingPreference, ReadingPreset, ReadingTheme,
-        TextEncoding, LEGACY_READER_POSITIONS_FILE, READER_BOOKMARKS_FILE,
-        READER_CACHE_OFFSET_LIMIT, READER_EPUB_ANCHOR_INDEX_BYTES_LIMIT,
-        READER_EPUB_INDEX_YIELD_EVERY_PAGES, READER_EPUB_INDEX_YIELD_MILLIS,
-        READER_EPUB_PAGE_ANCHOR_LIMIT, READER_POSITIONS_FILE, READER_PREFS_FILE,
-        READER_RECENT_FILE, READER_STATE_FILE,
+        chapter_cache_fingerprint, chapter_jump_forward, detect_txt_encoding,
+        is_fat83_safe_file_name, load_location_record, map_page_turn_event, normalize_decoded,
+        paginate_decoded, parse_anchor_cache, parse_location_fields, parse_location_record,
+        poll_auto_page_turn, scan_txt_library, serialize_location, serialize_location_fields,
+        with_layout_button_poll, AutoPageTurn, AutoTurnClock, BookFont, BookFontSize, BookFormat,
+        FullRefreshEvery, LetterSpacing, LineSpacing, PageMargin, ParagraphAlignment,
+        ParagraphSpacing, ReaderBook, ReaderChapterPageLabel, ReaderLoadingStage, ReaderLocation,
+        ReaderOrientation, ReaderPreferences, ReaderSession, ReaderTickOutcome, ReaderUiState,
+        ReadingPreference, ReadingPreset, ReadingTheme, TextEncoding, LEGACY_READER_POSITIONS_FILE,
+        READER_BOOKMARKS_FILE, READER_CACHE_OFFSET_LIMIT, READER_CACHE_VERSION,
+        READER_EPUB_ANCHOR_INDEX_BYTES_LIMIT, READER_EPUB_INDEX_YIELD_EVERY_PAGES,
+        READER_EPUB_INDEX_YIELD_MILLIS, READER_EPUB_PAGE_ANCHOR_LIMIT, READER_POSITIONS_FILE,
+        READER_PREFS_FILE, READER_RECENT_FILE, READER_STATE_FILE,
     };
     use crate::buttons::ButtonEvent;
 
@@ -6809,6 +6827,27 @@ mod tests {
         assert_ne!(base.layout(), ragged.layout());
         assert_eq!(ragged.effective_alignment(), ParagraphAlignment::Left);
 
+        let tracked = ReaderPreferences {
+            letter_spacing: LetterSpacing::Px2,
+            ..base
+        };
+        let traditional = ReaderPreferences {
+            chinese_script: crate::reader_hanzi::ChineseScript::Traditional,
+            ..base
+        };
+        assert_eq!(
+            traditional.layout().lines_per_page,
+            base.layout().lines_per_page
+        );
+        assert_eq!(
+            traditional.layout().chinese_script,
+            crate::reader_hanzi::ChineseScript::Traditional
+        );
+        let mut display_only = base;
+        display_only.dark_mode = true;
+        display_only.auto_page_turn = AutoPageTurn::Secs30;
+        assert_eq!(base.layout(), display_only.layout());
+
         let book = ReaderBook {
             path: "BOOK.TXT".into(),
             title: "Book".into(),
@@ -6823,12 +6862,38 @@ mod tests {
             ReaderUiState::cache_file_name_for(&book, gapped.layout()),
             ReaderUiState::cache_file_name_for(&book, indented.layout()),
             ReaderUiState::cache_file_name_for(&book, ragged.layout()),
+            ReaderUiState::cache_file_name_for(&book, tracked.layout()),
+            ReaderUiState::cache_file_name_for(&book, traditional.layout()),
         ];
         for (index, name) in names.iter().enumerate() {
             for other in names.iter().skip(index + 1) {
                 assert_ne!(name, other);
             }
         }
+        assert_ne!(
+            chapter_cache_fingerprint(&book, base.layout(), 1, 0, 40),
+            chapter_cache_fingerprint(&book, traditional.layout(), 1, 0, 40)
+        );
+        assert_ne!(
+            chapter_cache_fingerprint(&book, base.layout(), 1, 0, 40),
+            chapter_cache_fingerprint(&book, tracked.layout(), 1, 0, 40)
+        );
+        assert_eq!(READER_CACHE_VERSION, "4");
+    }
+
+    #[test]
+    fn anchor_cache_rejects_version_three_files() {
+        let book = ReaderBook {
+            path: "BOOK.TXT".into(),
+            title: "Book".into(),
+            format: BookFormat::Text,
+            size_bytes: 40,
+            modified_seconds: 1,
+        };
+        let text = "version=3\nfingerprint=0000000000000001\nbase_page=0\nindexed_through=1\ncomplete=false\noffset=0\n";
+        let error =
+            parse_anchor_cache(text, &book, ReaderPreferences::default().layout()).unwrap_err();
+        assert_eq!(error, "unsupported cache version");
     }
 
     #[test]

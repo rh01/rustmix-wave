@@ -2,14 +2,17 @@
 
 use crate::{
     alarm::AlarmSnapshot,
-    audio::{AudioSnapshot, AudioUiRequest},
+    audio::{
+        pronounce::{pronounce_available, PronounceTarget},
+        AudioSnapshot, AudioUiRequest,
+    },
     board_services::BoardSnapshot,
     buttons::ButtonEvent,
     calendar::{CalendarEditorOutcome, CalendarUiRequest, CalendarUiState},
     dictionary::DictionaryUiState,
     imu::ImuReading,
     imu_events::{ImuControlOutcome, ImuDetectedEvent, ImuEventBridge},
-    lexicon::{ui::LexiconCommand, LexiconUiState},
+    lexicon::{ui::LexiconCommand, LexiconUiState, LEXICON_ROOT},
     lua_runtime::LuaRuntimeUiState,
     network::NetworkSnapshot,
     orientation::DisplayOrientation,
@@ -97,6 +100,8 @@ pub struct AppState {
     power_key_menu_return_route: ScreenRoute,
     power_key_manual_refresh_requested: bool,
     weather_refresh_requested: bool,
+    /// One-shot word clip. The main loop plays it in short I2S chunks.
+    pronounce_request: Option<PronounceTarget>,
 }
 
 impl Default for AppState {
@@ -138,6 +143,7 @@ impl Default for AppState {
             power_key_menu_return_route: ScreenRoute::Home,
             power_key_manual_refresh_requested: false,
             weather_refresh_requested: false,
+            pronounce_request: None,
         }
     }
 }
@@ -401,6 +407,7 @@ impl AppState {
                 match self.lexicon.apply_button(event) {
                     LexiconCommand::OpenEntry => {
                         self.router.navigate_to(ScreenRoute::LexiconEntry);
+                        self.refresh_lexicon_pronounce(true);
                     }
                     LexiconCommand::OpenSources => {
                         self.router.navigate_to(ScreenRoute::LexiconSources);
@@ -458,6 +465,7 @@ impl AppState {
                 }
                 if self.vocab.apply_deck_button(event) {
                     self.router.navigate_to(ScreenRoute::VocabSession);
+                    self.refresh_vocab_pronounce(true);
                 } else if self.vocab.show_stats {
                     self.vocab.show_stats = false;
                     self.router.navigate_to(ScreenRoute::VocabStats);
@@ -467,8 +475,22 @@ impl AppState {
                 if event == ButtonEvent::Select {
                     self.note_select_press();
                 }
+                let before = self
+                    .vocab
+                    .current_item()
+                    .map(|item| (item.dict_slot, item.entry_id));
                 if self.vocab.apply_session_button(event) {
                     self.router.navigate_to(ScreenRoute::VocabStats);
+                } else if event == ButtonEvent::Select
+                    && self.vocab.face == crate::vocab::ui::CardFace::Front
+                {
+                    let after = self
+                        .vocab
+                        .current_item()
+                        .map(|item| (item.dict_slot, item.entry_id));
+                    if before != after {
+                        self.refresh_vocab_pronounce(true);
+                    }
                 }
             }
             ScreenRoute::VocabStats => {}
@@ -715,6 +737,64 @@ impl AppState {
             true
         } else {
             false
+        }
+    }
+
+    /// BOOT short says the open lexicon entry or vocabulary card. Search keeps
+    /// BOOT short for keyboard-axis toggle. A missing clip queues nothing.
+    pub fn apply_pronounce_boot_short_press(&mut self) -> bool {
+        match self.router.current() {
+            ScreenRoute::LexiconEntry => {
+                self.refresh_lexicon_pronounce(false);
+                true
+            }
+            ScreenRoute::VocabSession => {
+                self.refresh_vocab_pronounce(false);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn take_pronounce_request(&mut self) -> Option<PronounceTarget> {
+        self.pronounce_request.take()
+    }
+
+    fn refresh_lexicon_pronounce(&mut self, from_auto: bool) {
+        let target = self.lexicon.entry.as_ref().map(|entry| PronounceTarget {
+            dict_id: entry.dict_id.clone(),
+            entry_id: entry.entry_id,
+        });
+        self.lexicon.pronounce_ready = target.as_ref().is_some_and(|target| {
+            pronounce_available(
+                std::path::Path::new(LEXICON_ROOT),
+                &target.dict_id,
+                target.entry_id,
+            )
+        });
+        self.queue_pronounce(target, from_auto, self.lexicon.pronounce_ready);
+    }
+
+    fn refresh_vocab_pronounce(&mut self, from_auto: bool) {
+        let target = self
+            .vocab
+            .pronounce_target()
+            .map(|(dict_id, entry_id)| PronounceTarget { dict_id, entry_id });
+        self.vocab.pronounce_ready = target.as_ref().is_some_and(|target| {
+            pronounce_available(
+                std::path::Path::new(LEXICON_ROOT),
+                &target.dict_id,
+                target.entry_id,
+            )
+        });
+        self.queue_pronounce(target, from_auto, self.vocab.pronounce_ready);
+    }
+
+    fn queue_pronounce(&mut self, target: Option<PronounceTarget>, from_auto: bool, ready: bool) {
+        if ready && (!from_auto || self.vocab.settings.auto_pronounce) {
+            self.pronounce_request = target;
+        } else if !from_auto {
+            self.pronounce_request = None;
         }
     }
 
@@ -1538,5 +1618,64 @@ mod tests {
         assert_eq!(state.active_route(), ScreenRoute::Vocab);
         state.back();
         assert_eq!(state.active_route(), ScreenRoute::Productivity);
+    }
+
+    #[test]
+    fn pronounce_boot_short_is_quiet_when_the_clip_is_missing() {
+        let mut state = AppState::default();
+        state.router.navigate_to(ScreenRoute::LexiconEntry);
+        state.lexicon.entry = Some(crate::lexicon::ui::ShownEntry {
+            dict_id: "ECDICT".into(),
+            entry_id: 1,
+            headword: "missing".into(),
+            ..crate::lexicon::ui::ShownEntry::default()
+        });
+        assert!(state.apply_pronounce_boot_short_press());
+        assert!(!state.lexicon.pronounce_ready);
+        assert!(state.take_pronounce_request().is_none());
+
+        state.router.navigate_to(ScreenRoute::VocabSession);
+        state.vocab.decks.push(crate::vocab::ui::DeckChoice {
+            name: "N5".into(),
+            title: "N5".into(),
+            dict_id: "JMDICT".into(),
+            path: String::new(),
+            mywords: false,
+        });
+        state.vocab.start_session(vec![(0, 3)], 20_000);
+        assert!(state.apply_pronounce_boot_short_press());
+        assert!(!state.vocab.pronounce_ready);
+        assert!(state.take_pronounce_request().is_none());
+        assert_eq!(state.lexicon.message, "No lexicon on SD");
+    }
+
+    #[test]
+    fn auto_pronounce_queues_only_when_enabled_and_present() {
+        let mut state = AppState::default();
+        state.vocab.settings.auto_pronounce = false;
+        state.lexicon.entry = Some(crate::lexicon::ui::ShownEntry {
+            dict_id: "ECDICT".into(),
+            entry_id: 1,
+            ..crate::lexicon::ui::ShownEntry::default()
+        });
+        state.refresh_lexicon_pronounce(true);
+        assert!(state.take_pronounce_request().is_none());
+    }
+
+    #[test]
+    fn pronounce_queue_respects_auto_and_ready() {
+        let mut state = AppState::default();
+        let target = crate::audio::pronounce::PronounceTarget {
+            dict_id: "ECDICT".into(),
+            entry_id: 4,
+        };
+        state.queue_pronounce(Some(target.clone()), false, true);
+        assert_eq!(state.take_pronounce_request(), Some(target.clone()));
+        state.vocab.settings.auto_pronounce = true;
+        state.queue_pronounce(Some(target.clone()), true, true);
+        assert_eq!(state.take_pronounce_request().unwrap().entry_id, 4);
+        state.vocab.settings.auto_pronounce = false;
+        state.queue_pronounce(Some(target), true, true);
+        assert!(state.take_pronounce_request().is_none());
     }
 }

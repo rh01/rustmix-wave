@@ -14,6 +14,7 @@ from pathlib import Path
 # Allow `python3 tools/lexicon/build_lexicon.py` without installing the package.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from rmxlex.audio_pack import build_audio_pack  # noqa: E402
 from rmxlex.format import build_lexicon, build_wordlist, parse_lexicon, write_meta  # noqa: E402
 from rmxlex.sources import SOURCES  # noqa: E402
 
@@ -76,7 +77,37 @@ def main(argv: list[str] | None = None) -> int:
     verify = sub.add_parser("verify")
     verify.add_argument("lexicon", type=Path)
 
+    audio = sub.add_parser("audio")
+    audio.add_argument("--wordlist", required=True, type=Path)
+    audio.add_argument("--lexicon", required=True, type=Path)
+    audio.add_argument("--voice", required=True)
+    audio.add_argument("--model", type=Path, help="Piper .onnx model for en_US-ljspeech-medium")
+    audio.add_argument("--piper", default="piper", help="Piper executable")
+    audio.add_argument("--out", required=True, type=Path)
+    audio.add_argument(
+        "--synth",
+        action="store_true",
+        help="Write deterministic tones instead of calling Piper or MeloTTS",
+    )
+
     args = parser.parse_args(argv)
+    if args.command == "audio":
+        summary = build_audio_pack(
+            args.wordlist,
+            args.lexicon,
+            args.voice,
+            args.out,
+            synth=args.synth,
+            model=args.model,
+            piper_bin=args.piper,
+        )
+        print(
+            f"wrote {summary['folder']} clips={summary['clips']} "
+            f"pak_bytes={summary['pak_bytes']} voice={summary['voice']} "
+            f"license={summary['license']}"
+        )
+        return 0
+
     if args.command == "verify":
         parsed = parse_lexicon(args.lexicon.read_bytes())
         print(

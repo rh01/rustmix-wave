@@ -30,3 +30,33 @@ JLPT word lists used to build RMXWLS1 decks against JMdict
   https://www.tanos.co.uk/jlpt/sharing/
 
 Do not use kajweb/dict, KyleBing, or mahavivo dumps with this converter.
+
+Pronunciation voices used by tools/lexicon/build_lexicon.py audio
+
+English
+  Voice: Piper en_US-ljspeech-medium
+  Dataset: LJ Speech, public domain, Keith Ito
+  https://keithito.com/LJ-Speech-Dataset/
+  Model card: rhasspy/piper-voices en/en_US/ljspeech/medium
+  The voice was trained from scratch, not from the Lessac checkpoint.
+  Piper engine: MIT, https://github.com/rhasspy/piper
+
+Japanese
+  Voice: MeloTTS Japanese, speaker JP
+  License: MIT
+  MyShell.ai, https://github.com/myshell-ai/MeloTTS
+  https://huggingface.co/myshell-ai/MeloTTS-Japanese
+
+Chinese
+  Voice: MeloTTS Chinese, speaker ZH
+  License: MIT
+  MyShell.ai, https://github.com/myshell-ai/MeloTTS
+  https://huggingface.co/myshell-ai/MeloTTS-Chinese
+
+These Piper voices are refused because their dataset licenses do not permit
+this use: en_US-lessac (Blizzard 2013 research-only), en_US-amy (Lessac
+finetune), ja_JP-hi_fi_captain-medium (CC BY-NC-SA 4.0), and
+zh_CN-huayan-medium (dataset license unknown, Lessac finetune).
+
+Generated clips are not committed. AUDIO.TXT on the card repeats the voice,
+license, and attribution for the pack that was built.

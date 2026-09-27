@@ -43,8 +43,9 @@ mod firmware {
             SAMPLE_LIVE_REFRESH_SECONDS, VOICE_RECORD_SCREEN_REFRESH_SECONDS,
         },
         audio::{
-            espidf::AudioRuntime, AudioSnapshot, AudioUiRequest, AUDIO_MCLK_HZ,
-            AUDIO_SAMPLE_RATE_HZ, DEFAULT_AUDIO_VOLUME_PERCENT,
+            claim_amp_then_start, espidf::AudioRuntime, pronounce::PronounceSession, AmpEnableHold,
+            AudioSnapshot, AudioStartup, AudioUiRequest, AUDIO_MCLK_HZ, AUDIO_SAMPLE_RATE_HZ,
+            DEFAULT_AUDIO_VOLUME_PERCENT,
         },
         board_services::{BoardServices, BoardSnapshot},
         build_info::{FIRMWARE_VERSION, PRODUCT_SLUG, UI_SHELL_MILESTONE},
@@ -61,6 +62,7 @@ mod firmware {
         framebuffer::FrameBuffer,
         games::dirty_regions::MAX_DIRTY_REGIONS,
         imu_events::IMU_EVENT_SAMPLE_INTERVAL_MS,
+        lexicon::LEXICON_ROOT,
         lua_runtime::{catalog::LUA_APPS_DIRECTORY, loader::LUA_LOADER_WORKER_STACK_BYTES},
         network::{
             espidf::NetworkRuntime, NetworkLogFingerprint, NetworkSnapshot, WifiConnectionState,
@@ -278,61 +280,116 @@ mod firmware {
 
         // Bidirectional ES8311 Voice Notes milestone. The uploaded BSP uses I2S0 with
         // MCLK GPIO13, BCLK GPIO14, WS GPIO47, ESP-to-codec DOUT GPIO48,
-        // codec-to-ESP DIN GPIO21 and amplifier GPIO39. Start muted with the
-        // amplifier disabled; audio failure remains non-fatal.
+        // codec-to-ESP DIN GPIO21 and amplifier GPIO39. Claim GPIO39 and drive it
+        // low before I2S or codec setup. Audio failure stays non-fatal, but the
+        // owned PinDriver must remain in `amp_enable_hold` so the NS4150B enable
+        // is not released when init returns an ES8311 NACK or an I2S error.
         info!("rustmix-wave=audio-init status=starting codec=es8311 address=0x18 wire-write=0x30");
-        let audio_attempt = (|| -> Result<_> {
-            let i2s_config = StdConfig::new(
-                I2sChannelConfig::new().auto_clear(true),
-                StdClkConfig::new(
-                    AUDIO_SAMPLE_RATE_HZ,
-                    ClockSource::default(),
-                    MclkMultiple::M384,
-                ),
-                StdSlotConfig::philips_slot_default(DataBitWidth::Bits16, SlotMode::Stereo),
-                StdGpioConfig::default(),
-            );
-            let mut i2s = I2sDriver::<I2sBiDir>::new_std_bidir(
-                peripherals.i2s0,
-                &i2s_config,
-                peripherals.pins.gpio14,
-                peripherals.pins.gpio21,
-                peripherals.pins.gpio48,
-                Some(peripherals.pins.gpio13),
-                peripherals.pins.gpio47,
-            )?;
-            i2s.tx_enable()?;
-            i2s.rx_enable()?;
-            let amplifier = PinDriver::output(peripherals.pins.gpio39)?;
-            AudioRuntime::initialize(shared_i2c.clone(), i2s, amplifier, &mut FreeRtosDelay)
-        })();
-        let (mut audio_runtime, initial_audio_snapshot) = match audio_attempt {
-            Ok(runtime) => {
-                let snapshot = runtime.snapshot();
-                info!(
-                    "rustmix-wave=audio-codec status=ready codec=es8311 address={} wire-write={} mclk-hz={AUDIO_MCLK_HZ}",
-                    snapshot.codec_address_label(),
-                    snapshot.codec_address.map_or_else(|| "--".into(), |address| format!("0x{:02X}", address << 1))
-                );
-                let profile = runtime.profile();
-                info!(
-                    "rustmix-wave=audio-codec-profile status=ready source=waveshare-esp-codec-dev-parity gpio44=0x{:02X} dac-reference=ready system14=0x{:02X} adc15=0x{:02X} adc17=0x{:02X} gp45=0x{:02X}",
-                    profile.gpio44,
-                    profile.system14,
-                    profile.adc15,
-                    profile.adc17,
-                    profile.gp45
-                );
-                info!("rustmix-wave=audio-i2s status=ready direction=bidir sample-rate={AUDIO_SAMPLE_RATE_HZ} bits=16 tx-channels=2 rx-channels=2 voice-wav-channels=1 mclk-gpio=13 bclk-gpio=14 ws-gpio=47 dout-gpio=48 din-gpio=21");
-                info!("rustmix-wave=audio-amp status=ready gpio=39 default=off");
-                info!("rustmix-wave=audio-subsystem-ready mute=true volume={DEFAULT_AUDIO_VOLUME_PERCENT}");
-                (Some(runtime), snapshot)
-            }
+        let claimed_amplifier = PinDriver::output(peripherals.pins.gpio39);
+        let (mut audio_runtime, amp_enable_hold, initial_audio_snapshot) = match claimed_amplifier {
             Err(error) => {
-                warn!("rustmix-wave=audio-init status=unavailable codec=es8311 error={error:#}");
-                (None, AudioSnapshot::unavailable(format!("{error:#}")))
+                warn!(
+                    "rustmix-wave=audio-init status=unavailable codec=es8311 error=failed to claim GPIO39: {error:?}"
+                );
+                (
+                    None,
+                    None,
+                    AudioSnapshot::unavailable(format!("failed to claim GPIO39: {error:?}")),
+                )
+            }
+            Ok(amplifier) => {
+                let startup = claim_amp_then_start(
+                    amplifier,
+                    |error| anyhow::anyhow!("failed to drive amplifier GPIO39 low: {error:?}"),
+                    |amplifier| {
+                        // I2S setup does not own the amplifier. On failure the
+                        // same PinDriver is returned to AmpEnableHold.
+                        let i2s = (|| -> Result<_> {
+                            let i2s_config = StdConfig::new(
+                                I2sChannelConfig::new().auto_clear(true),
+                                StdClkConfig::new(
+                                    AUDIO_SAMPLE_RATE_HZ,
+                                    ClockSource::default(),
+                                    MclkMultiple::M384,
+                                ),
+                                StdSlotConfig::philips_slot_default(
+                                    DataBitWidth::Bits16,
+                                    SlotMode::Stereo,
+                                ),
+                                StdGpioConfig::default(),
+                            );
+                            let mut i2s = I2sDriver::<I2sBiDir>::new_std_bidir(
+                                peripherals.i2s0,
+                                &i2s_config,
+                                peripherals.pins.gpio14,
+                                peripherals.pins.gpio21,
+                                peripherals.pins.gpio48,
+                                Some(peripherals.pins.gpio13),
+                                peripherals.pins.gpio47,
+                            )?;
+                            i2s.tx_enable()?;
+                            i2s.rx_enable()?;
+                            Ok(i2s)
+                        })();
+                        let i2s = match i2s {
+                            Ok(i2s) => i2s,
+                            Err(error) => return Err((amplifier, error)),
+                        };
+                        match AudioRuntime::initialize(
+                            shared_i2c.clone(),
+                            i2s,
+                            amplifier,
+                            &mut FreeRtosDelay,
+                        ) {
+                            Ok(runtime) => Ok(runtime),
+                            Err(failed) => Err((failed.amplifier, failed.error)),
+                        }
+                    },
+                );
+                match startup {
+                    AudioStartup::Ready(runtime) => {
+                        let snapshot = runtime.snapshot();
+                        info!(
+                            "rustmix-wave=audio-codec status=ready codec=es8311 address={} wire-write={} mclk-hz={AUDIO_MCLK_HZ}",
+                            snapshot.codec_address_label(),
+                            snapshot.codec_address.map_or_else(|| "--".into(), |address| format!("0x{:02X}", address << 1))
+                        );
+                        let profile = runtime.profile();
+                        info!(
+                            "rustmix-wave=audio-codec-profile status=ready source=waveshare-esp-codec-dev-parity gpio44=0x{:02X} dac-reference=ready system14=0x{:02X} adc15=0x{:02X} adc17=0x{:02X} gp45=0x{:02X}",
+                            profile.gpio44,
+                            profile.system14,
+                            profile.adc15,
+                            profile.adc17,
+                            profile.gp45
+                        );
+                        info!("rustmix-wave=audio-i2s status=ready direction=bidir sample-rate={AUDIO_SAMPLE_RATE_HZ} bits=16 tx-channels=2 rx-channels=2 voice-wav-channels=1 mclk-gpio=13 bclk-gpio=14 ws-gpio=47 dout-gpio=48 din-gpio=21");
+                        info!("rustmix-wave=audio-amp status=ready gpio=39 default=off");
+                        info!("rustmix-wave=audio-subsystem-ready mute=true volume={DEFAULT_AUDIO_VOLUME_PERCENT}");
+                        (Some(runtime), None, snapshot)
+                    }
+                    AudioStartup::Failed { hold, error } => {
+                        let hold: AmpEnableHold<_> = hold;
+                        warn!(
+                            "rustmix-wave=audio-init status=unavailable codec=es8311 error={error:#}"
+                        );
+                        (
+                            None,
+                            Some(hold),
+                            AudioSnapshot::unavailable(format!("{error:#}")),
+                        )
+                    }
+                }
             }
         };
+        // Keep the failed-init driver in this frame for the rest of `run`.
+        // Assigning the hold to a discarded binding would drop GPIO39 immediately.
+        if let Some(hold) = amp_enable_hold.as_ref() {
+            info!(
+                "rustmix-wave=audio-amp status=held-low gpio=39 level-low={} owner=AmpEnableHold",
+                hold.is_driven_low()
+            );
+        }
 
         let spi_driver_config = SpiDriverConfig::new().dma(Dma::Auto(4096));
         let spi_driver = SpiDriver::new(
@@ -579,6 +636,7 @@ mod firmware {
         }
         let mut voice_recording: Option<VoiceRecordingSession> = None;
         let mut voice_playback: Option<VoicePlaybackSession> = None;
+        let mut pronounce_playback: Option<PronounceSession> = None;
         let mut voice_stereo_buffer = vec![0_u8; VOICE_PCM_STEREO_CAPTURE_BYTES];
         let mut voice_mono_buffer = vec![0_u8; VOICE_PCM_MONO_CHUNK_BYTES];
         info!("rustmix-wave=open-meteo-weather-forecast-ready");
@@ -889,7 +947,29 @@ mod firmware {
                 }
             }
 
+            if (voice_recording.is_some() || voice_playback.is_some())
+                && pronounce_playback.is_some()
+            {
+                stop_pronounce(
+                    &mut pronounce_playback,
+                    &mut audio_runtime,
+                    &mut state,
+                    "voice-notes",
+                );
+            }
+
             if voice_recording.is_none() && voice_playback.is_none() {
+                pump_pronounce(
+                    &mut pronounce_playback,
+                    &mut audio_runtime,
+                    &mut state,
+                    &mut voice_mono_buffer,
+                    &mut voice_stereo_buffer,
+                );
+            }
+
+            if voice_recording.is_none() && voice_playback.is_none() && pronounce_playback.is_none()
+            {
                 if let Some(runtime) = audio_runtime.as_mut() {
                     match runtime.tick() {
                         Ok(changed) => {
@@ -1010,6 +1090,14 @@ mod firmware {
                             if voice_playback.is_some() {
                                 stop_voice_note_playback(
                                     &mut voice_playback,
+                                    &mut audio_runtime,
+                                    &mut state,
+                                    "alarm-trigger",
+                                );
+                            }
+                            if pronounce_playback.is_some() {
+                                stop_pronounce(
+                                    &mut pronounce_playback,
                                     &mut audio_runtime,
                                     &mut state,
                                     "alarm-trigger",
@@ -1624,7 +1712,17 @@ mod firmware {
                     } else {
                         state.apply_lua_game_boot_short_press()
                     };
-                    if calendar_agenda_context || keyboard_context || lua_game_context {
+                    let pronounce_context =
+                        if calendar_agenda_context || keyboard_context || lua_game_context {
+                            false
+                        } else {
+                            state.apply_pronounce_boot_short_press()
+                        };
+                    if calendar_agenda_context
+                        || keyboard_context
+                        || lua_game_context
+                        || pronounce_context
+                    {
                         if calendar_agenda_context {
                             info!("rustmix-wave=calendar-agenda route=selected-day outcome=opened");
                         }
@@ -2601,6 +2699,118 @@ mod firmware {
             state.alarms.hardware_programmed
         );
         outcome
+    }
+
+    fn pump_pronounce<'d, I2C>(
+        pronounce_playback: &mut Option<PronounceSession>,
+        audio_runtime: &mut Option<AudioRuntime<'d, I2C>>,
+        state: &mut AppState,
+        mono: &mut [u8],
+        stereo: &mut [u8],
+    ) where
+        I2C: embedded_hal::i2c::I2c,
+        I2C::Error: core::fmt::Debug,
+    {
+        if pronounce_playback.is_none() {
+            if let Some(target) = state.take_pronounce_request() {
+                match PronounceSession::open(
+                    std::path::Path::new(LEXICON_ROOT),
+                    &target.dict_id,
+                    target.entry_id,
+                ) {
+                    Ok(Some(session)) => {
+                        let started = match audio_runtime.as_mut() {
+                            Some(runtime) => match runtime.begin_pronounce() {
+                                Ok(()) => {
+                                    info!(
+                                        "rustmix-wave=pronounce status=start dict={} entry={}",
+                                        target.dict_id, target.entry_id
+                                    );
+                                    state.update_audio_snapshot(runtime.snapshot());
+                                    true
+                                }
+                                Err(error) => {
+                                    warn!("rustmix-wave=pronounce status=start-failed error={error:#}");
+                                    let _ = runtime.finish_pronounce();
+                                    state.update_audio_snapshot(runtime.snapshot());
+                                    false
+                                }
+                            },
+                            None => {
+                                info!("rustmix-wave=pronounce status=skipped reason=codec-unavailable");
+                                false
+                            }
+                        };
+                        if started {
+                            *pronounce_playback = Some(session);
+                        }
+                    }
+                    Ok(None) => {
+                        info!(
+                            "rustmix-wave=pronounce status=missing dict={} entry={}",
+                            target.dict_id, target.entry_id
+                        );
+                    }
+                    Err(error) => {
+                        warn!("rustmix-wave=pronounce status=unreadable error={error:#}");
+                    }
+                }
+            }
+        }
+
+        let mut finished = false;
+        let mut failed = None;
+        if let Some(session) = pronounce_playback.as_mut() {
+            let limit = 640.min(mono.len()) & !1;
+            match session.read_pcm16_mono(&mut mono[..limit]) {
+                Ok(0) => finished = true,
+                Ok(bytes) => {
+                    let write = audio_runtime.as_mut().ok_or_else(|| {
+                        anyhow::anyhow!("audio runtime unavailable during pronunciation")
+                    });
+                    let write = write.and_then(|runtime| {
+                        runtime.write_pronounce_pcm16_mono(&mono[..bytes], stereo)
+                    });
+                    if let Err(error) = write {
+                        failed = Some(format!("{error:#}"));
+                    }
+                }
+                Err(error) => failed = Some(format!("{error:#}")),
+            }
+        }
+        if finished || failed.is_some() {
+            let reason = if let Some(error) = failed {
+                warn!("rustmix-wave=pronounce status=failed error={error}");
+                "failed"
+            } else {
+                info!("rustmix-wave=pronounce status=completed");
+                "completed"
+            };
+            stop_pronounce(pronounce_playback, audio_runtime, state, reason);
+        }
+    }
+
+    fn stop_pronounce<'d, I2C>(
+        session: &mut Option<PronounceSession>,
+        audio_runtime: &mut Option<AudioRuntime<'d, I2C>>,
+        state: &mut AppState,
+        reason: &str,
+    ) where
+        I2C: embedded_hal::i2c::I2c,
+        I2C::Error: core::fmt::Debug,
+    {
+        if session.take().is_none() {
+            return;
+        }
+        if let Some(runtime) = audio_runtime.as_mut() {
+            if let Err(error) = runtime.finish_pronounce() {
+                warn!("rustmix-wave=pronounce status=stop-failed reason={reason} error={error:#}");
+                runtime.record_failure(format!("{error:#}"));
+            }
+            state.update_audio_snapshot(runtime.snapshot());
+            log_audio_snapshot(&state.audio);
+        }
+        info!("rustmix-wave=pronounce status=stopped reason={reason}");
     }
 
     fn apply_audio_request<'d, I2C>(

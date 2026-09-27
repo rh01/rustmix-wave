@@ -151,7 +151,7 @@ Use the Wi-Fi firmware release for normal Wi-Fi transfer, weather, NTP/time sync
 - Reader supports TXT and bounded reflowable EPUB files, TOC navigation, bookmarks, per-book resume, Chinese (CJK) text via SD `/fonts` TTF/OTF plus Unifont/GB2312 fallback, in-reader font sizes 16/20/24/32/48/72, typography preferences, paragraph alignment, and FAT 8.3-safe persistence.
 - Voice Notes records PCM16 mono 16 kHz WAV files to SD, supports microphone gain, pause/resume, saved-note playback, titles, timestamps, delete confirmation, storage telemetry, and LAN export.
 - Native Dictionary reuses the Rustmix X4 prefix-shard SD pack and uses BOOT-short `NAV H` / `NAV V` keyboard-axis switching.
-- Lexicon looks up SD `RMXLEX1` dictionaries (English, kana, and pinyin keyboards) and Vocabulary reviews those lists with FSRS-6 or SM-2.
+- Lexicon looks up SD `RMXLEX1` dictionaries (English, kana, and pinyin keyboards) and Vocabulary reviews those lists with FSRS-6 or SM-2. Optional SD clips pronounce the current word.
 - Native Calendar loads personal events and the U.S.-only 2026 pack, renders a daily agenda, and supports recovery-safe personal-event creation, editing, and deletion.
 - Wi-Fi transfer portal provides explicit LAN-only SD access with protected configuration paths and atomic file replacement.
 - SoftAP captive setup (`Rustmix-Setup`, `http://192.168.4.1`) provisions Wi-Fi from a phone when `WIFI.TXT` is missing or STA join fails, while SD `WIFI.TXT` remains a first-class manual path.

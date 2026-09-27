@@ -5,6 +5,7 @@
 
 use crate::weread::{
     bitmap::{self, MonoBitmap},
+    body::body_transfer_error,
     crypto, decode,
     limits::{
         DOWNLOAD_CLASSIFY_BYTES, MAX_CHAPTER_IMAGES, MAX_HTML_BYTES, MAX_IMAGE_BYTES,
@@ -44,6 +45,20 @@ pub struct StreamedPart {
     /// Leading bytes used to tell a zip, a txt envelope, and a shard apart.
     pub prefix: Vec<u8>,
     pub total: usize,
+    /// Negative when the response has no Content-Length.
+    pub content_length: i64,
+    pub chunked: bool,
+    /// True after the terminal chunk, or when a Content-Length body is complete.
+    pub terminal_chunk: bool,
+}
+
+/// Mark a job cancelled and close the live HTTP client.
+///
+/// The flag alone is checked between reads. Closing the client is what makes
+/// a blocked `esp_http_client_read` return instead of waiting out the timeout.
+pub fn signal_cancel(flag: &std::sync::atomic::AtomicBool, close_client: &mut dyn FnMut()) {
+    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    close_client();
 }
 
 pub trait Transport {
@@ -1126,9 +1141,17 @@ fn stream_part(
             },
             part,
         )
-        .map_err(|error| JobError::Message(trim_message(&error)))?;
+        .map_err(transport_job_error)?;
     if streamed.total > MAX_SHARD_BYTES {
         return Err(JobError::Message("response exceeds size limit".into()));
+    }
+    if let Some(error) = body_transfer_error(
+        streamed.content_length,
+        streamed.total,
+        streamed.chunked,
+        streamed.terminal_chunk,
+    ) {
+        return Err(JobError::Message(error.into()));
     }
     session.absorb_set_cookie(&streamed.set_cookie);
     let prefix = String::from_utf8_lossy(
@@ -1357,17 +1380,19 @@ fn renew(
     let previous_skey = session.skey.clone();
     session.absorb_set_cookie(&response.set_cookie);
     let text = body_text(&response).unwrap_or_default();
-    if parse::renewal_succeeded(&text) {
-        if session.skey != previous_skey {
-            if let Some(now) = ctx.unix {
-                session.skey_unix = now;
-            }
-        }
-        Ok(())
-    } else {
+    if !parse::renewal_succeeded(&text) {
         session.expire_web();
-        Err(JobError::Expired)
+        return Err(JobError::Expired);
     }
+    if session.skey == previous_skey || session.skey.is_empty() {
+        return Err(JobError::Message(
+            "WeRead session renewal did not return a new key.".into(),
+        ));
+    }
+    if let Some(now) = ctx.unix {
+        session.skey_unix = now;
+    }
+    Ok(())
 }
 
 fn call(
@@ -1394,9 +1419,7 @@ fn call(
             ));
         }
     }
-    let response = transport
-        .call(&request)
-        .map_err(|error| JobError::Message(trim_message(&error)))?;
+    let response = transport.call(&request).map_err(transport_job_error)?;
     if let Some(len) = response.content_length {
         if len > request.max_bytes {
             return Err(JobError::Message("response exceeds size limit".into()));
@@ -1404,6 +1427,13 @@ fn call(
     }
     if response.body.len() > request.max_bytes {
         return Err(JobError::Message("response exceeds size limit".into()));
+    }
+    let declared = response
+        .content_length
+        .map(|len| i64::try_from(len).unwrap_or(i64::MAX))
+        .unwrap_or(-1);
+    if let Some(error) = body_transfer_error(declared, response.body.len(), false, true) {
+        return Err(JobError::Message(error.into()));
     }
     let text = String::from_utf8_lossy(&response.body);
     match parse::classify(response.status, &text) {
@@ -1438,6 +1468,14 @@ fn decode_pair(first: &[u8], second: &[u8]) -> Result<String, JobError> {
     let bytes =
         decode::decode_shards(&[&a, &b]).map_err(|error| JobError::Message(error.into()))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn transport_job_error(error: String) -> JobError {
+    if error == "cancelled" {
+        JobError::Cancelled
+    } else {
+        JobError::Message(trim_message(&error))
+    }
 }
 
 fn trim_message(value: &str) -> String {
@@ -1525,7 +1563,12 @@ mod tests {
         let shard = seal_plain("<p>Hello 微信</p>");
         let mut reader = Script {
             steps: vec![
-                json_response(r#"{"succ":1}"#),
+                Response {
+                    status: 200,
+                    body: br#"{"succ":1}"#.to_vec(),
+                    set_cookie: "wr_skey=tok2; Path=/".into(),
+                    content_length: Some(10),
+                },
                 Response {
                     status: 200,
                     body: format!(r#"{{"reader":{{"psvts":"ps-token"}}}}"#).into_bytes(),
@@ -1663,7 +1706,7 @@ mod tests {
     }
 
     #[test]
-    fn renewal_keeps_skey_unix_until_wr_skey_changes() {
+    fn renewal_without_a_new_skey_is_an_error() {
         let unix = 1_780_488_000;
         let mut unchanged = Script {
             steps: vec![
@@ -1692,9 +1735,49 @@ mod tests {
             },
             Some(unix),
         );
+        let Err(JobError::Message(message)) = report.result else {
+            panic!("renewal without wr_skey must fail");
+        };
+        assert!(message.contains("new key"));
         assert_eq!(report.session.skey, "old-key");
         assert_eq!(report.session.skey_unix, 1);
+        assert!(unchanged
+            .urls
+            .iter()
+            .all(|url| url.contains("/web/login/renewal")));
+        assert!(!unchanged.urls.iter().any(|url| url.contains("shelf")));
 
+        let mut same_key = Script {
+            steps: vec![Response {
+                status: 200,
+                body: br#"{"succ":1}"#.to_vec(),
+                set_cookie: "wr_skey=old-key; Path=/".into(),
+                content_length: Some(10),
+            }],
+            index: 0,
+            waits: 0,
+            urls: Vec::new(),
+        };
+        let report = perform(
+            &mut same_key,
+            Work {
+                generation: 3,
+                job: Job::Shelf,
+                session: session.clone(),
+            },
+            Some(unix),
+        );
+        assert!(matches!(report.result, Err(JobError::Message(_))));
+        assert_eq!(report.session.skey_unix, 1);
+    }
+
+    #[test]
+    fn renewal_updates_skey_unix_when_wr_skey_changes() {
+        let unix = 1_780_488_000;
+        let mut session = Session::default();
+        session.vid = "9".into();
+        session.skey = "old-key".into();
+        session.skey_unix = 1;
         let mut rotated = Script {
             steps: vec![
                 Response {
@@ -1720,6 +1803,82 @@ mod tests {
         );
         assert_eq!(report.session.skey, "new-key");
         assert_eq!(report.session.skey_unix, unix);
+    }
+
+    #[test]
+    fn cancel_sets_the_flag_and_closes_the_client() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        let mut closed = false;
+        super::signal_cancel(&flag, &mut || closed = true);
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(closed);
+    }
+
+    #[test]
+    fn truncated_and_unchunked_downloads_are_not_stored() {
+        let mut short = RecordingStream {
+            steps: vec![Response {
+                status: 200,
+                body: b"AAAA".to_vec(),
+                set_cookie: String::new(),
+                content_length: Some(100),
+            }],
+            index: 0,
+            urls: Vec::new(),
+            chunk_lens: Vec::new(),
+        };
+        let report = perform(
+            &mut short,
+            Work {
+                generation: 1,
+                job: chapter_job(false),
+                session: stream_session(),
+            },
+            Some(1_780_488_000),
+        );
+        let Err(JobError::Message(message)) = report.result else {
+            panic!("short Content-Length must not be stored");
+        };
+        assert!(message.contains("Content-Length"));
+
+        struct OpenChunk;
+        impl Transport for OpenChunk {
+            fn idle(&mut self) {}
+            fn call(&mut self, _request: &Request) -> Result<Response, String> {
+                Err("unused".into())
+            }
+            fn streaming_download(&self) -> bool {
+                true
+            }
+            fn call_stream(
+                &mut self,
+                _request: &Request,
+                _part: &'static str,
+            ) -> Result<StreamedPart, String> {
+                Ok(StreamedPart {
+                    status: 200,
+                    set_cookie: String::new(),
+                    prefix: b"AAAA".to_vec(),
+                    total: 4,
+                    content_length: -1,
+                    chunked: true,
+                    terminal_chunk: false,
+                })
+            }
+        }
+        let report = perform(
+            &mut OpenChunk,
+            Work {
+                generation: 2,
+                job: chapter_job(false),
+                session: stream_session(),
+            },
+            Some(1_780_488_000),
+        );
+        let Err(JobError::Message(message)) = report.result else {
+            panic!("missing terminal chunk must not be stored");
+        };
+        assert!(message.contains("terminal chunk"));
     }
 
     #[test]
@@ -1858,11 +2017,21 @@ mod tests {
                 .body
                 .len()
                 .min(crate::weread::limits::DOWNLOAD_CLASSIFY_BYTES);
+            let content_length = response
+                .content_length
+                .map(|len| i64::try_from(len).unwrap_or(i64::MAX))
+                .unwrap_or(-1);
+            let terminal_chunk = response
+                .content_length
+                .is_none_or(|len| response.body.len() == len);
             Ok(StreamedPart {
                 status: response.status,
                 set_cookie: response.set_cookie,
                 prefix: response.body[..prefix_len].to_vec(),
                 total: response.body.len(),
+                content_length,
+                chunked: false,
+                terminal_chunk,
             })
         }
     }

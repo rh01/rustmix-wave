@@ -218,11 +218,42 @@ pub fn parse_lexicon(data: &[u8]) -> Result<ParsedLexicon> {
     })
 }
 
+/// Smallest page-index record: key length, one key byte, and a page offset.
+const MIN_PAGE_INDEX_RECORD: usize = 1 + 1 + 4;
+/// Smallest key-page record: key length, one key byte, and an entry id.
+const MIN_KEY_RECORD: usize = 1 + 1 + 4;
+
+/// `None` when `value` does not fit in an unsigned integer of `width_bits`.
+#[must_use]
+pub fn fits_unsigned_width(value: u64, width_bits: u32) -> bool {
+    if width_bits >= 64 {
+        true
+    } else if width_bits >= 32 {
+        value <= u64::from(u32::MAX)
+    } else {
+        let shift = 64 - width_bits;
+        value.wrapping_shl(shift) >> shift == value
+    }
+}
+
 pub fn parse_page_index(
     blob: &[u8],
     page_count: u32,
     keys_off: u32,
 ) -> Result<Vec<PageIndexEntry>> {
+    let max_pages = blob.len() / MIN_PAGE_INDEX_RECORD;
+    if page_count as usize > max_pages {
+        bail!("page count exceeds index");
+    }
+    let page_span = u64::from(page_count)
+        .checked_mul(PAGE_SIZE as u64)
+        .ok_or_else(|| anyhow::anyhow!("page span overflow"))?;
+    let key_end = u64::from(keys_off)
+        .checked_add(page_span)
+        .ok_or_else(|| anyhow::anyhow!("page span overflow"))?;
+    if !fits_unsigned_width(key_end, 32) {
+        bail!("page span overflow");
+    }
     let mut pages = Vec::with_capacity(page_count as usize);
     let mut offset = 0;
     for index in 0..page_count {
@@ -264,6 +295,10 @@ pub fn parse_key_page(page: &[u8]) -> Result<Vec<KeyRecord>> {
         bail!("short key page");
     }
     let count = u16::from_le_bytes(page[0..2].try_into().unwrap()) as usize;
+    let max_records = (PAGE_SIZE - 2) / MIN_KEY_RECORD;
+    if count > max_records {
+        bail!("record count exceeds page");
+    }
     let mut offset = 2;
     let mut records = Vec::with_capacity(count);
     for _ in 0..count {
@@ -347,7 +382,10 @@ fn read_u32(data: &[u8], offset: usize) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{crc32, parse_entry, parse_key_page, parse_lexicon, PAGE_SIZE};
+    use super::{
+        crc32, fits_unsigned_width, parse_entry, parse_key_page, parse_lexicon, parse_page_index,
+        PAGE_SIZE,
+    };
 
     fn mini() -> Vec<u8> {
         include_bytes!("../../tests/fixtures/lexicon/MINI.LEX").to_vec()
@@ -418,6 +456,32 @@ mod tests {
         let sum = crc32(&data[..60]);
         data[60..64].copy_from_slice(&sum.to_le_bytes());
         assert!(parse_lexicon(&data).is_err());
+    }
+
+    #[test]
+    fn hostile_page_count_is_rejected_before_allocation() {
+        let error = parse_page_index(&[], u32::MAX, 0).unwrap_err();
+        assert!(error.to_string().contains("page count exceeds index"));
+        assert!(!fits_unsigned_width(
+            u64::from(u32::MAX) * PAGE_SIZE as u64,
+            32
+        ));
+        let mut header = vec![0u8; 64];
+        header[..8].copy_from_slice(b"RMXLEX1\0");
+        header[8..10].copy_from_slice(&1u16.to_le_bytes());
+        header[20..24].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+        header[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+        let sum = crc32(&header[..60]);
+        header[60..64].copy_from_slice(&sum.to_le_bytes());
+        assert!(parse_lexicon(&header).is_err());
+    }
+
+    #[test]
+    fn hostile_key_page_count_is_rejected_before_allocation() {
+        let mut page = vec![0u8; PAGE_SIZE];
+        page[0..2].copy_from_slice(&u16::MAX.to_le_bytes());
+        let error = parse_key_page(&page).unwrap_err();
+        assert!(error.to_string().contains("record count exceeds page"));
     }
 
     #[test]

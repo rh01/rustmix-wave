@@ -13,6 +13,24 @@ pub struct WordListFile {
     pub entry_ids: Vec<u32>,
 }
 
+/// End offset of the id table, or `None` when `offset + count * 4` does not fit
+/// in an unsigned integer of `width_bits`.
+#[must_use]
+pub fn checked_span(offset: u64, count: u64, width_bits: u32) -> Option<u64> {
+    let bytes = count.checked_mul(4)?;
+    let end = offset.checked_add(bytes)?;
+    let limit = if width_bits >= 64 {
+        u64::MAX
+    } else {
+        u64::from(u32::MAX)
+    };
+    if bytes > limit || end > limit {
+        None
+    } else {
+        Some(end)
+    }
+}
+
 pub fn parse_wordlist(data: &[u8]) -> Result<WordListFile> {
     if data.len() < 16 || &data[..8] != MAGIC {
         bail!("bad word list magic");
@@ -49,18 +67,19 @@ pub fn parse_wordlist(data: &[u8]) -> Result<WordListFile> {
     if offset + 4 > data.len() {
         bail!("truncated word list");
     }
-    let count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+    let count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
     offset += 4;
-    let end = offset
-        .checked_add(
-            count
-                .checked_mul(4)
-                .ok_or_else(|| anyhow::anyhow!("count overflow"))?,
-        )
-        .ok_or_else(|| anyhow::anyhow!("count overflow"))?;
-    if end + 4 != data.len() {
+    let Some(end) = checked_span(offset as u64, u64::from(count), usize::BITS) else {
+        bail!("count overflow");
+    };
+    let end = usize::try_from(end).map_err(|_| anyhow::anyhow!("count overflow"))?;
+    let Some(crc_end) = end.checked_add(4) else {
+        bail!("count overflow");
+    };
+    if crc_end != data.len() {
         bail!("word list length mismatch");
     }
+    let count = count as usize;
     let mut entry_ids = Vec::with_capacity(count);
     for index in 0..count {
         let start = offset + index * 4;
@@ -82,7 +101,7 @@ pub fn parse_wordlist(data: &[u8]) -> Result<WordListFile> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_wordlist;
+    use super::{checked_span, parse_wordlist};
 
     #[test]
     fn mini_wordlist_round_trip_ids() {
@@ -107,5 +126,25 @@ mod tests {
     #[test]
     fn truncated_wordlist_errors() {
         assert!(parse_wordlist(b"RMXWLS1").is_err());
+    }
+
+    #[test]
+    fn huge_count_is_rejected_before_allocation() {
+        assert_eq!(checked_span(18, u64::from(u32::MAX), 32), None);
+        let mut data = Vec::new();
+        data.extend_from_slice(b"RMXWLS1\0");
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.push(1);
+        data.push(b'A');
+        data.push(1);
+        data.push(b'B');
+        data.extend_from_slice(&u32::MAX.to_le_bytes());
+        let error = parse_wordlist(&data).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("overflow") || message.contains("mismatch") || message.contains("crc"),
+            "{message}"
+        );
     }
 }

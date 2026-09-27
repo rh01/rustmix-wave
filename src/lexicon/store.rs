@@ -279,4 +279,20 @@ mod tests {
         assert_eq!(index.header.entry_count, 6);
         assert!(index.header.pidx_len < super::PAGE_INDEX_WORKER_THRESHOLD as u32);
     }
+
+    #[test]
+    fn hostile_page_count_header_is_rejected() {
+        let mut header = vec![0u8; 64];
+        header[..8].copy_from_slice(b"RMXLEX1\0");
+        header[8..10].copy_from_slice(&1u16.to_le_bytes());
+        header[20..24].copy_from_slice(&4096u32.to_le_bytes());
+        header[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+        let sum = crate::lexicon::crc32(&header[..60]);
+        header[60..64].copy_from_slice(&sum.to_le_bytes());
+        let path = std::env::temp_dir().join(format!("rmx-hostile-{}.lex", std::process::id()));
+        std::fs::write(&path, &header).unwrap();
+        let error = load_index(&path).unwrap_err();
+        assert!(error.to_string().contains("page count exceeds index"));
+        let _ = std::fs::remove_file(&path);
+    }
 }

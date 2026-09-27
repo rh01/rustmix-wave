@@ -22,7 +22,7 @@ from rmxlex.format import (  # noqa: E402
 from rmxlex.normalize import normalize_key  # noqa: E402
 from rmxlex.sources.cedict import CedictSource, display_pinyin  # noqa: E402
 from rmxlex.sources.ecdict import EcdictSource, is_core  # noqa: E402
-from rmxlex.sources.jlpt import JlptSource  # noqa: E402
+from rmxlex.sources.jlpt import JLPT_ATTRIBUTION, JlptSource, match_entry  # noqa: E402
 from rmxlex.sources.jmdict import JmdictSource  # noqa: E402
 from rmxlex.sources.kanjidic import KanjidicSource  # noqa: E402
 
@@ -86,8 +86,12 @@ class JmdictTests(unittest.TestCase):
         self.assertEqual(cat.flags & 1, 1)
         gloss = _field_text(cat, FIELD_DEF_EN)
         self.assertEqual(gloss, ["cat; feline"])
+        self.assertEqual(_field_text(cat, 4), ["noun (common) (futsuumeishi)"])
+        hello = built.lexicon.entries[1]
+        self.assertEqual(_field_text(hello, 4), ["interjection (kandoushi)"])
         self.assertIn("CC BY-SA 4.0", built.meta["license"])
         self.assertIn("EDRDG", built.meta["attribution"])
+        self.assertIn(JLPT_ATTRIBUTION, built.meta["attribution"])
 
     def test_full_includes_uncommon(self) -> None:
         built = JmdictSource().build({"in": FIXTURES / "jmdict_sample.xml", "full": True, "source_date": "fixture"})
@@ -125,6 +129,7 @@ class KanjidicTests(unittest.TestCase):
         self.assertIn("strokes=13", info)
         self.assertNotIn("skip", info.lower())
         self.assertNotIn("2-3-10", info)
+        self.assertEqual(_field_text(built.lexicon.entries[0], FIELD_DEF_EN), ["work"])
         full = KanjidicSource().build({"in": FIXTURES / "kanjidic_sample.xml", "full": True, "source_date": "fixture"})
         self.assertEqual(len(full.lexicon.entries), 2)
         self.assertIn("EDRDG", built.meta["attribution"])
@@ -146,6 +151,18 @@ class JlptTests(unittest.TestCase):
         self.assertEqual(len(built.wordlists[0].entry_ids), 2)
         self.assertIn("未収録", built.reports["unmatched.txt"])
         self.assertNotIn("猫", built.reports["unmatched.txt"].split("未収録")[0])
+
+    def test_kanji_and_reading_must_agree(self) -> None:
+        hashi = normalize_key("はし").encode()
+        bridge = normalize_key("橋").encode()
+        chopsticks = normalize_key("箸").encode()
+        index = {bridge: [1], chopsticks: [2], hashi: [1, 2]}
+        self.assertEqual(match_entry(index, "橋", "はし"), 1)
+        self.assertIsNone(match_entry({bridge: [1], hashi: [2]}, "橋", "はし"))
+        self.assertEqual(match_entry({hashi: [2]}, "", "はし"), 2)
+        self.assertIn("Creative Commons BY", JLPT_ATTRIBUTION)
+        self.assertIn("jamsinclair/open-anki-jlpt-decks (MIT)", JLPT_ATTRIBUTION)
+        self.assertIn("https://www.tanos.co.uk/jlpt/sharing/", JLPT_ATTRIBUTION)
 
 
 if __name__ == "__main__":

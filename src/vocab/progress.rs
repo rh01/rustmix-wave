@@ -137,6 +137,25 @@ pub fn encode_progress(progress: &ProgressFile) -> Vec<u8> {
     bytes
 }
 
+/// Total file length for `count` records, or `None` when the product does not
+/// fit in an unsigned integer of `width_bits` (32 on the ESP32).
+#[must_use]
+pub fn progress_span_bytes(count: u32, width_bits: u32) -> Option<u64> {
+    let records = u64::from(count).checked_mul(RECORD_LEN as u64)?;
+    let body = records.checked_add(16)?;
+    let total = body.checked_add(4)?;
+    let limit = if width_bits >= 64 {
+        u64::MAX
+    } else {
+        u64::from(u32::MAX)
+    };
+    if records > limit || body > limit || total > limit {
+        None
+    } else {
+        Some(total)
+    }
+}
+
 pub fn decode_progress(bytes: &[u8]) -> Result<ProgressFile> {
     if bytes.len() < 16 || &bytes[..8] != MAGIC {
         bail!("bad progress magic");
@@ -146,16 +165,21 @@ pub fn decode_progress(bytes: &[u8]) -> Result<ProgressFile> {
         bail!("unsupported progress version");
     }
     let algo = Algo::from_file_code(u16::from_le_bytes(bytes[10..12].try_into().unwrap()));
-    let count = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-    let body = 16 + count * RECORD_LEN;
-    if body + 4 != bytes.len() {
+    let count_u32 = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    let Some(total) = progress_span_bytes(count_u32, usize::BITS) else {
+        bail!("progress length overflow");
+    };
+    if total != bytes.len() as u64 {
         bail!("progress length mismatch");
     }
+    let body =
+        usize::try_from(total - 4).map_err(|_| anyhow::anyhow!("progress length overflow"))?;
     let expected = crc32(&bytes[..body]);
     let actual = u32::from_le_bytes(bytes[body..body + 4].try_into().unwrap());
     if expected != actual {
         bail!("bad progress crc");
     }
+    let count = count_u32 as usize;
     let mut cards = Vec::with_capacity(count);
     for index in 0..count {
         let start = 16 + index * RECORD_LEN;
@@ -364,8 +388,9 @@ pub fn temp_vocab_dir(name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_progress, encode_progress, load_progress, load_settings, save_progress,
-        temp_vocab_dir, ProgressFile, StoredCard, PROGRESS_BAK, PROGRESS_BIN, SETTINGS_FILE,
+        crc32, decode_progress, encode_progress, load_progress, load_settings, progress_span_bytes,
+        save_progress, temp_vocab_dir, ProgressFile, StoredCard, MAGIC, PROGRESS_BAK, PROGRESS_BIN,
+        SETTINGS_FILE,
     };
     use crate::vocab::scheduler::Algo;
     use std::fs;
@@ -420,6 +445,24 @@ mod tests {
         assert!(dir.join(PROGRESS_BAK).is_file());
         assert_eq!(load_progress(&dir).unwrap().cards[0].reps, 9);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wrapped_progress_count_is_rejected_on_32_bit_width() {
+        assert_eq!(progress_span_bytes(0x0800_0000, 32), None);
+        assert!(progress_span_bytes(0x0800_0000, 64).is_some());
+        let mut bytes = vec![0u8; 20];
+        bytes[..8].copy_from_slice(MAGIC);
+        bytes[8..10].copy_from_slice(&1u16.to_le_bytes());
+        bytes[12..16].copy_from_slice(&0x0800_0000u32.to_le_bytes());
+        let sum = crc32(&bytes[..16]);
+        bytes[16..20].copy_from_slice(&sum.to_le_bytes());
+        let error = decode_progress(&bytes).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("overflow") || message.contains("mismatch"),
+            "{message}"
+        );
     }
 
     #[test]

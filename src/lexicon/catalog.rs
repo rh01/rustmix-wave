@@ -94,8 +94,12 @@ pub fn scan_catalog(root: &Path) -> Result<LexiconCatalog> {
             if catalog.lists.len() >= MAX_LISTS {
                 break;
             }
-            let bytes = read_bounded(&path, 1024 * 1024)?;
-            let parsed = parse_wordlist(&bytes)?;
+            let Ok(bytes) = read_bounded(&path, 1024 * 1024) else {
+                continue;
+            };
+            let Ok(parsed) = parse_wordlist(&bytes) else {
+                continue;
+            };
             let name = path
                 .file_stem()
                 .and_then(|value| value.to_str())
@@ -178,6 +182,28 @@ mod tests {
         assert_eq!(catalog.dicts[0].license, "MIT");
         assert_eq!(catalog.lists.len(), 1);
         assert_eq!(catalog.lists[0].dict_id, "MINI");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bad_word_list_does_not_hide_dictionaries() {
+        let root = std::env::temp_dir().join(format!("rmx-cat-bad-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("ECDICT")).unwrap();
+        fs::write(root.join("ECDICT/DICT.LEX"), b"unused").unwrap();
+        fs::write(root.join("ECDICT/META.TXT"), "id=ECDICT\nlicense=MIT\n").unwrap();
+        fs::create_dir_all(root.join("LISTS")).unwrap();
+        fs::write(
+            root.join("LISTS/GOOD.WLS"),
+            include_bytes!("../../tests/fixtures/lexicon/MINI.WLS"),
+        )
+        .unwrap();
+        fs::write(root.join("LISTS/BAD.WLS"), b"not-a-word-list").unwrap();
+        let catalog = scan_catalog(&root).unwrap();
+        assert_eq!(catalog.dicts.len(), 1);
+        assert_eq!(catalog.dicts[0].id, "ECDICT");
+        assert_eq!(catalog.lists.len(), 1);
+        assert_eq!(catalog.lists[0].name, "GOOD");
         let _ = fs::remove_dir_all(&root);
     }
 

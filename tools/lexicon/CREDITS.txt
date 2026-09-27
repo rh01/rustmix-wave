@@ -25,12 +25,9 @@ CC-CEDICT
   https://cc-cedict.org/wiki/
 
 JLPT word lists used to build RMXWLS1 decks against JMdict
-  Community lists associated with Tanos / Jonathan Waller
-  Machine-readable CSV: jamsinclair/open-anki-jlpt-decks (MIT)
+  JLPT vocabulary lists: Jonathan Waller, tanos.co.uk (Creative Commons BY, https://www.tanos.co.uk/jlpt/sharing/); CSV packaging: jamsinclair/open-anki-jlpt-decks (MIT)
   https://github.com/jamsinclair/open-anki-jlpt-decks
-
-Open English WordNet (CC BY 4.0) is a permitted future source. This tree does
-not download or convert it. A source plugin slot is reserved and not registered.
+  https://www.tanos.co.uk/jlpt/sharing/
 
 Do not use kajweb/dict, KyleBing, or mahavivo dumps with this converter.
 

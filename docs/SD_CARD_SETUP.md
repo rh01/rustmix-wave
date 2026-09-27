@@ -225,7 +225,7 @@ python3 -B tools/lexicon/build_lexicon.py verify \
   build/lexicon-sd/RUSTMIX/LEXICON/ECDICT/DICT.LEX
 ```
 
-Copy `build/lexicon-sd/RUSTMIX/LEXICON` to `/RUSTMIX/LEXICON` on the card, or upload that directory with the Wi-Fi transfer portal. Create `/RUSTMIX/VOCAB` on the device by opening Vocabulary; the trainer writes `PROGRESS.BIN` through `PROGRESS.TMP`. Licenses and attribution are in each `META.TXT` and in `tools/lexicon/CREDITS.txt`. The Lexicon sources screen shows the same credits on device. ECDICT is MIT. JMdict, KANJIDIC2, and CC-CEDICT are CC BY-SA 4.0 and require that attribution. JLPT deck CSVs from jamsinclair are MIT; the underlying JLPT lists are credited to Tanos / Jonathan Waller.
+Copy `build/lexicon-sd/RUSTMIX/LEXICON` to `/RUSTMIX/LEXICON` on the card, or upload that directory with the Wi-Fi transfer portal. Create `/RUSTMIX/VOCAB` on the device by opening Vocabulary; the trainer writes `PROGRESS.BIN` through `PROGRESS.TMP`. Licenses and attribution are in each `META.TXT` and in `tools/lexicon/CREDITS.txt`. The Lexicon sources screen shows the same credits on device. ECDICT is MIT. JMdict, KANJIDIC2, and CC-CEDICT are CC BY-SA 4.0 and require that attribution. JLPT vocabulary lists: Jonathan Waller, tanos.co.uk (Creative Commons BY, https://www.tanos.co.uk/jlpt/sharing/); CSV packaging: jamsinclair/open-anki-jlpt-decks (MIT).
 
 ## Pronunciation audio
 

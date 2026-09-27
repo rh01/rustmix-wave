@@ -828,17 +828,22 @@ impl AppState {
     }
 
     /// Advance loads the main loop polls instead of waiting on: a Lua app
-    /// start and a large dictionary index. Returns true when the screen should
+    /// start, a large dictionary index, and library EPUB titles. Returns true when the screen should
     /// be redrawn.
     pub fn poll_background_loads(&mut self) -> bool {
         let lua = self.poll_lua_open();
         let lexicon = self.lexicon.tick();
-        lua || lexicon
+        let titles = self.reader.poll_titles() && self.router.current() == ScreenRoute::Library;
+        lua || lexicon || titles
     }
 
     /// Finish a Lua app load the catalog started. Returns true when the screen
     /// should be redrawn.
     pub fn poll_lua_open(&mut self) -> bool {
+        if self.lua_runtime.is_opening() && self.router.current() != ScreenRoute::LuaApps {
+            self.lua_runtime.cancel_open();
+            return false;
+        }
         let Some(opened) = self.lua_runtime.poll_open() else {
             return false;
         };
@@ -1707,6 +1712,35 @@ mod tests {
         assert!(state.lua_runtime.catalog.warning.is_some());
         state.back();
         assert_eq!(state.active_route(), ScreenRoute::Games);
+    }
+
+    #[test]
+    fn leaving_the_lua_catalog_drops_a_pending_app_open() {
+        let root = std::env::temp_dir().join(format!("rustmix-lua-leave-{}", std::process::id()));
+        let app = root.join("HGRID");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("APP.TOM"),
+            "id=\"hello_grid\"\nname=\"Hello Grid\"\nkind=\"game\"\nentry=\"MAIN.LUA\"\n",
+        )
+        .unwrap();
+        std::fs::write(app.join("MAIN.LUA"), "ui.grid(80, 220, 4, 4, 64, 64)\n").unwrap();
+        let mut state = AppState::default();
+        state.home_selected = 2;
+        state.apply(ButtonEvent::Select);
+        state.apply(ButtonEvent::Select);
+        assert_eq!(state.active_route(), ScreenRoute::LuaApps);
+        state.lua_runtime.refresh_catalog_from_root(&root, true);
+        state.apply(ButtonEvent::Select);
+        assert!(state.lua_runtime.is_opening());
+        state.back();
+        assert_eq!(state.active_route(), ScreenRoute::Games);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!state.poll_background_loads());
+        assert!(!state.lua_runtime.is_opening());
+        assert!(state.lua_runtime.session.is_none());
+        assert_eq!(state.active_route(), ScreenRoute::Games);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

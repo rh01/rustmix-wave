@@ -180,6 +180,18 @@ impl LuaRuntimeUiState {
         self.opening.0.is_some()
     }
 
+    /// Drop a pending load after the user left the catalog. The loader thread
+    /// finishes on its own; its session is discarded instead of installed.
+    pub fn cancel_open(&mut self) {
+        let Some(pending) = self.opening.0.take() else {
+            return;
+        };
+        let entry_id = pending.borrow().1.clone();
+        self.push_diagnostic(format!(
+            "rustmix-wave=lua-app-open id={entry_id} status=cancelled reason=left-catalog"
+        ));
+    }
+
     /// `Some(true)` once the pending app opened, `Some(false)` if it failed,
     /// `None` while it is still loading or when nothing is loading.
     pub fn poll_open(&mut self) -> Option<bool> {
@@ -461,6 +473,18 @@ mod tests {
         assert!(opened);
         assert!(!runtime.is_opening());
         assert!(runtime.session.is_some());
+
+        runtime.session = None;
+        assert!(!runtime.apply_catalog_button(ButtonEvent::Select));
+        assert!(runtime.is_opening());
+        runtime.cancel_open();
+        assert!(!runtime.is_opening());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(runtime.poll_open(), None);
+        assert!(
+            runtime.session.is_none(),
+            "a cancelled load is never installed"
+        );
         assert!(!runtime.take_diagnostics().is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -27,12 +27,18 @@ pub enum ScreenRoute {
     VoiceNotes,
     VoiceNoteDetails,
     VoiceNoteRecording,
+    Vocab,
+    VocabSession,
+    VocabStats,
     GamesTbd,
     LuaApps,
     LuaGame,
     LuaGameError,
     Files,
     Dictionary,
+    Lexicon,
+    LexiconEntry,
+    LexiconSources,
     UnitConverter,
     Alarms,
     Audio,
@@ -84,12 +90,18 @@ impl ScreenRoute {
             Self::VoiceNotes => "Voice Notes",
             Self::VoiceNoteDetails => "Voice Note",
             Self::VoiceNoteRecording => "Record Voice Note",
+            Self::Vocab => "Vocabulary",
+            Self::VocabSession => "Vocabulary Session",
+            Self::VocabStats => "Vocabulary Stats",
             Self::GamesTbd => "TBD",
             Self::LuaApps => "SD Lua Apps",
             Self::LuaGame => "Lua App",
             Self::LuaGameError => "Lua App Error",
             Self::Files => "File Browser",
             Self::Dictionary => "Dictionary",
+            Self::Lexicon => "Lexicon",
+            Self::LexiconEntry => "Lexicon Entry",
+            Self::LexiconSources => "Lexicon Sources",
             Self::UnitConverter => "Unit Converter",
             Self::Alarms => "Alarms",
             Self::Audio => "Audio",
@@ -141,12 +153,18 @@ impl ScreenRoute {
             Self::VoiceNotes => "voice-notes",
             Self::VoiceNoteDetails => "voice-note-details",
             Self::VoiceNoteRecording => "voice-note-recording",
+            Self::Vocab => "vocab",
+            Self::VocabSession => "vocab-session",
+            Self::VocabStats => "vocab-stats",
             Self::GamesTbd => "games-tbd",
             Self::LuaApps => "lua-apps",
             Self::LuaGame => "lua-game",
             Self::LuaGameError => "lua-game-error",
             Self::Files => "file-browser",
             Self::Dictionary => "dictionary",
+            Self::Lexicon => "lexicon",
+            Self::LexiconEntry => "lexicon-entry",
+            Self::LexiconSources => "lexicon-sources",
             Self::UnitConverter => "unit-converter",
             Self::Alarms => "alarms",
             Self::Audio => "audio",
@@ -198,15 +216,19 @@ impl ScreenRoute {
             Self::ReaderOptions => Some(Self::ReaderPage),
             Self::ReaderPreferences => Some(Self::ReaderOptions),
             Self::ReaderToc => Some(Self::ReaderOptions),
-            Self::Calendar | Self::VoiceNotes => Some(Self::Productivity),
+            Self::Calendar | Self::VoiceNotes | Self::Vocab => Some(Self::Productivity),
             Self::CalendarAgenda => Some(Self::Calendar),
             Self::CalendarEventDetails => Some(Self::CalendarAgenda),
             Self::CalendarEventEditor => Some(Self::CalendarAgenda),
             Self::CalendarDeleteConfirmation => Some(Self::CalendarEventDetails),
             Self::VoiceNoteDetails | Self::VoiceNoteRecording => Some(Self::VoiceNotes),
+            Self::VocabSession | Self::VocabStats => Some(Self::Vocab),
             Self::GamesTbd | Self::LuaApps => Some(Self::Games),
             Self::LuaGame | Self::LuaGameError => Some(Self::LuaApps),
-            Self::Files | Self::Dictionary | Self::UnitConverter => Some(Self::Tools),
+            Self::Files | Self::Dictionary | Self::Lexicon | Self::UnitConverter => {
+                Some(Self::Tools)
+            }
+            Self::LexiconEntry | Self::LexiconSources => Some(Self::Lexicon),
             Self::PowerKeyMenu => Some(Self::Home),
             Self::Alarms
             | Self::Audio
@@ -329,6 +351,18 @@ mod tests {
         );
         assert_eq!(ScreenRoute::WifiSetup.parent(), Some(ScreenRoute::Network));
         assert_eq!(ScreenRoute::Home.parent(), None);
+        assert_eq!(ScreenRoute::Lexicon.parent(), Some(ScreenRoute::Tools));
+        assert_eq!(
+            ScreenRoute::LexiconEntry.parent(),
+            Some(ScreenRoute::Lexicon)
+        );
+        assert_eq!(
+            ScreenRoute::LexiconSources.parent(),
+            Some(ScreenRoute::Lexicon)
+        );
+        assert_eq!(ScreenRoute::Vocab.parent(), Some(ScreenRoute::Productivity));
+        assert_eq!(ScreenRoute::VocabSession.parent(), Some(ScreenRoute::Vocab));
+        assert_eq!(ScreenRoute::VocabStats.parent(), Some(ScreenRoute::Vocab));
     }
 
     #[test]

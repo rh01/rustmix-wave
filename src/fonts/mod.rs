@@ -222,8 +222,12 @@ pub fn ui_cjk_px(line_height: u8) -> u8 {
 #[must_use]
 pub fn unicode_advance(character: char, px: u8, latin_fallback: u8) -> i32 {
     if character == '\n' || character == '\r' {
-        0
-    } else if can_render_unicode(character) {
+        return 0;
+    }
+    if let Some(bitmap) = unifont::native_bitmap(character) {
+        return i32::from(unifont::advance_px(bitmap, px));
+    }
+    if can_render_unicode(character) {
         i32::from(px)
     } else {
         i32::from(latin_fallback)
@@ -238,6 +242,17 @@ pub fn can_render_unicode(character: char) -> bool {
     is_cjk_codepoint(character)
         || matches!(character as u32, 0x2010..=0x2027)
         || unifont::contains(character)
+        || sd_font_contains(character)
+}
+
+fn sd_font_contains(character: char) -> bool {
+    let Ok(guard) = engine().lock() else {
+        return false;
+    };
+    guard
+        .sd_faces
+        .iter()
+        .any(|face| face.contains_char(character))
 }
 
 /// Measure mixed Latin + CJK text. ASCII uses `latin_advance`; everything else
@@ -309,7 +324,7 @@ where
     }
     if let Some(bitmap) = unifont::native_bitmap(character) {
         blit_unifont(display, baseline, bitmap, px, color, bounds)?;
-        return Ok(Some(px.max(1)));
+        return Ok(Some(unifont::advance_px(bitmap, px)));
     }
     Ok(None)
 }
@@ -414,7 +429,7 @@ where
 mod tests {
     use super::{
         clamp_reader_px, is_cjk_codepoint, is_preserved_book_character, measure_mixed,
-        pack_glyph_count, truncate_to_width, READER_FONT_SIZE_STEPS,
+        pack_glyph_count, truncate_to_width, unifont, READER_FONT_SIZE_STEPS,
     };
 
     #[test]
@@ -439,5 +454,30 @@ mod tests {
         let clipped = truncate_to_width(text, 40, 48, 16, |_| 8);
         assert!(clipped.ends_with("..."));
         assert!(clipped.chars().count() < text.chars().count());
+    }
+
+    #[test]
+    fn unifont_half_width_advance_matches_draw() {
+        use super::{can_render_unicode, draw_mixed_char, unicode_advance};
+        use embedded_graphics::{pixelcolor::BinaryColor, prelude::Point};
+
+        let bitmap = unifont::native_bitmap('中').unwrap();
+        let expected = unifont::advance_px(bitmap, 16);
+        assert_eq!(expected, 16);
+        assert_eq!(unicode_advance('中', 16, 8), i32::from(expected));
+        let mut frame = crate::framebuffer::FrameBuffer::new_white();
+        let drawn = draw_mixed_char(
+            &mut frame,
+            Point::new(8, 20),
+            '中',
+            16,
+            BinaryColor::On,
+            None,
+        )
+        .unwrap();
+        assert_eq!(drawn, Some(expected));
+        if unifont::contains('ə') {
+            assert!(can_render_unicode('ə'));
+        }
     }
 }

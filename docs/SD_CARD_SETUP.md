@@ -27,6 +27,15 @@ Use a FAT-formatted SD card. Rustmix Wave mounts it at `/sdcard` and expects the
     CALENDAR/
       EVENTS.TXT
       US2026.TXT
+  LEXICON/
+    ECDICT/
+      DICT.LEX
+      META.TXT
+    LISTS/
+      *.WLS
+  VOCAB/
+    PROGRESS.BIN
+    SETTINGS.TXT
 ```
 
 ## Install bundled examples
@@ -187,6 +196,42 @@ Verify representative lookups:
 ```bash
 ./scripts/verify-dictionary-x4-pack.sh /Volumes/YOUR_SD_CARD
 ```
+
+## Lexicon and vocabulary packs
+
+Build the SD tree on a computer. The script downloads ECDICT, JMdict, KANJIDIC2, CC-CEDICT, and the JLPT CSV lists into a cache, then writes `RUSTMIX/LEXICON` and `RUSTMIX/LEXICON/LISTS`. It is not part of CI. Raw dumps stay in the cache and must not be committed.
+
+```bash
+./scripts/build-lexicon-pack.sh /path/to/output
+```
+
+Equivalent steps, with an explicit UTC source date:
+
+```bash
+mkdir -p build/lexicon-cache build/lexicon-sd
+# Place or download ecdict.csv, JMdict_e.gz, kanjidic2.xml.gz, cedict.txt.gz,
+# and build/lexicon-cache/jlpt/n1.csv through n5.csv. See scripts/build-lexicon-pack.sh
+# for the source URLs.
+export PYTHONDONTWRITEBYTECODE=1
+python3 -B tools/lexicon/build_lexicon.py ecdict \
+  --in build/lexicon-cache/ecdict.csv --out build/lexicon-sd --source-date "$(date -u +%F)"
+python3 -B tools/lexicon/build_lexicon.py jmdict \
+  --in build/lexicon-cache/JMdict_e.gz --out build/lexicon-sd --source-date "$(date -u +%F)"
+python3 -B tools/lexicon/build_lexicon.py cedict \
+  --in build/lexicon-cache/cedict.txt.gz --out build/lexicon-sd --source-date "$(date -u +%F)"
+python3 -B tools/lexicon/build_lexicon.py kanjidic \
+  --in build/lexicon-cache/kanjidic2.xml.gz --out build/lexicon-sd --source-date "$(date -u +%F)"
+python3 -B tools/lexicon/build_lexicon.py jlpt \
+  --in-dir build/lexicon-cache/jlpt \
+  --jmdict build/lexicon-sd/RUSTMIX/LEXICON/JMDICT/DICT.LEX \
+  --out build/lexicon-sd
+python3 -B tools/lexicon/build_lexicon.py verify \
+  build/lexicon-sd/RUSTMIX/LEXICON/ECDICT/DICT.LEX
+```
+
+Copy `build/lexicon-sd/RUSTMIX/LEXICON` to `/RUSTMIX/LEXICON` on the card, or upload that directory with the Wi-Fi transfer portal. Create `/RUSTMIX/VOCAB` on the device by opening Vocabulary; the trainer writes `PROGRESS.BIN` through `PROGRESS.TMP`. Licenses and attribution are in each `META.TXT` and in `tools/lexicon/CREDITS.txt`. The Lexicon sources screen shows the same credits on device. ECDICT is MIT. JMdict, KANJIDIC2, and CC-CEDICT are CC BY-SA 4.0 and require that attribution. JLPT vocabulary lists: Jonathan Waller, tanos.co.uk (Creative Commons BY, https://www.tanos.co.uk/jlpt/sharing/); CSV packaging: jamsinclair/open-anki-jlpt-decks (MIT).
+
+Optional IPA glyphs and Japanese kana are not in the committed Unifont bitmap. See `docs/licenses/FONT_NOTICES.md`.
 
 ## U.S.-only Calendar pack
 

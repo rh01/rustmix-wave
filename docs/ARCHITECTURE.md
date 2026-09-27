@@ -179,6 +179,37 @@ Recording streams through `VOICE###.TMP`, finalizes a PCM16 mono 16 kHz WAV head
 
 The native engine enforces bounded query and shard sizes, validates relative shard paths, performs exact lookup with prefix fallback, and cycles wildcard matches. `src/keyboard_navigation.rs` supplies shared H/V keyboard-grid navigation.
 
+## Lexicon boundary
+
+`src/lexicon/` is a separate multilingual lookup path. It does not replace the X4 dictionary. PC-side `tools/lexicon/build_lexicon.py` writes compact `RMXLEX1` dictionaries and `RMXWLS1` word lists. The device stores only the index and reopens `DICT.LEX` per lookup. Page indexes larger than 64 KiB open on the existing named worker (`lexicon-open`, 32 KiB stack). Indexes larger than 256 KiB are rejected.
+
+```text
+/sdcard/RUSTMIX/LEXICON/<ID>/
+  DICT.LEX
+  META.TXT
+/sdcard/RUSTMIX/LEXICON/LISTS/
+  *.WLS
+```
+
+IDs are FAT 8.3 stems such as `ECDICT`, `JMDICT`, `CEDICT`, and `KANJI`. The sources screen shows `META.TXT` plus the static credits in `tools/lexicon/CREDITS.txt` even when the card is empty. Card flips and lookup redraws use the existing panel-refresh coordinator: partial updates, with a global refresh every 32 partials. No separate lexicon refresh path is required.
+
+## Vocabulary boundary
+
+`src/vocab/` schedules reviews from those word lists. The default algorithm is FSRS-6 with empty learning and relearning steps and fuzzing off, so every interval is a whole day (minimum 1, maximum 36500). SM-2 is optional via `SETTINGS.TXT`. Progress floats are stored as `u32` bit patterns so `AppState` can stay `Eq`.
+
+```text
+/sdcard/RUSTMIX/VOCAB/
+  PROGRESS.BIN
+  PROGRESS.TMP
+  PROGRESS.BAK
+  REVIEW.LOG
+  SETTINGS.TXT
+  DICTS.TXT
+  MYWORDS.TXT
+```
+
+Writes go to `PROGRESS.TMP`, then `PROGRESS.BIN` is renamed to `PROGRESS.BAK`, then `PROGRESS.TMP` becomes `PROGRESS.BIN`. A corrupt `PROGRESS.BIN` falls back to `PROGRESS.BAK`. If the RTC is missing or its clock integrity was lost, the trainer shows `时钟未设置` and does not schedule. `VOCAB/PROGRESS.TMP` and `VOCAB/PROGRESS.BAK` are protected from the Wi-Fi portal.
+
 ## Calendar boundary
 
 `src/calendar.rs` owns Gregorian date math, bounded SD event parsing, daily agenda state, and personal-event persistence.
@@ -212,6 +243,8 @@ VOICE/META.TXT
 VOICE/SETTINGS.TXT
 APPS/CALENDAR/EVENTS.TMP
 APPS/CALENDAR/EVENTS.BAK
+VOCAB/PROGRESS.TMP
+VOCAB/PROGRESS.BAK
 ```
 
 ## Games and Lua boundary

@@ -16,6 +16,32 @@ from pathlib import Path
 MAGIC = b"UGB1"
 
 
+def ipa_codepoints() -> set[int]:
+    """IPA Extensions, spacing modifiers, and phonetic extensions."""
+    codepoints: set[int] = set()
+    codepoints.update(range(0x0250, 0x02B0))
+    codepoints.update(range(0x02B0, 0x0300))
+    codepoints.update(range(0x1D00, 0x1DC0))
+    return codepoints
+
+
+def jis0208_codepoints() -> set[int]:
+    """JIS X 0208 characters via the EUC-JP encoding of ku-ten cells."""
+    codepoints: set[int] = set()
+    for row in range(1, 95):
+        for cell in range(1, 95):
+            raw = bytes([row + 0xA0, cell + 0xA0])
+            try:
+                text = raw.decode("euc_jp")
+            except UnicodeDecodeError:
+                continue
+            for character in text:
+                code = ord(character)
+                if code >= 0x80:
+                    codepoints.add(code)
+    return codepoints
+
+
 def gb2312_codepoints() -> set[int]:
     codepoints: set[int] = set()
     for lead in range(0xA1, 0xF8):
@@ -88,9 +114,23 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--hex", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument(
+        "--with-ipa",
+        action="store_true",
+        help="Add IPA and phonetic-extension glyphs (about 14 KiB)",
+    )
+    parser.add_argument(
+        "--with-jis0208",
+        action="store_true",
+        help="Add JIS X 0208 glyphs missing from GB2312 (about 100 KiB; check app partition headroom)",
+    )
     args = parser.parse_args()
 
     wanted = gb2312_codepoints()
+    if args.with_ipa:
+        wanted.update(ipa_codepoints())
+    if args.with_jis0208:
+        wanted.update(jis0208_codepoints())
     glyphs = parse_unifont_hex(args.hex)
     selected = []
     missing = 0

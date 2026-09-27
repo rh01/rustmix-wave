@@ -37,6 +37,18 @@ Run this checklist after a release build or any cross-cutting runtime change.
 4. Press BOOT briefly and confirm `NAV H` / `NAV V` switches without moving the selected key.
 5. Hold BOOT and confirm hierarchical Back.
 
+## Lexicon and vocabulary
+
+These checks need a release build on the device. Host tests do not flash firmware or measure the app partition.
+
+1. Run `cargo +esp build --release` and compare the app ELF size with the app partition. If headroom is tight, do not rebuild Unifont with `--with-jis0208`.
+2. Copy a generated `/RUSTMIX/LEXICON` tree to the card.
+3. Open `Tools > Lexicon`, search an English headword, and confirm the result appears in under 300 ms.
+4. Open `SRC` and confirm ECDICT, JMdict, KANJIDIC2, and CC-CEDICT credits are visible.
+5. Open `Productivity > Vocabulary` with the RTC set, flip one card, rate it Good, and power off. Confirm `PROGRESS.BIN` still contains the review after boot.
+6. Clear or unset the RTC and confirm the trainer shows `时钟未设置` instead of scheduling.
+7. Flip several cards and confirm ghosting stays within the normal partial-refresh policy.
+
 ## Calendar
 
 1. Open `Productivity > Calendar`.

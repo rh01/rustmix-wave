@@ -13,3 +13,11 @@ fi
 printf 'host-test-native-target=%s\n' "$HOST_TRIPLE"
 cargo +stable test --target "$HOST_TRIPLE" --lib
 echo 'host-test-native-target-isolation=ok'
+
+export PYTHONDONTWRITEBYTECODE=1
+python3 -B -m unittest discover -s tools/lexicon/tests
+if find . -name '__pycache__' -not -path './target/*' -print -quit | grep -q .; then
+  echo 'python-cache=failed' >&2
+  exit 1
+fi
+echo 'lexicon-converter-tests=ok'

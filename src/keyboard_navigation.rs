@@ -76,6 +76,13 @@ impl KeyboardGridNavigation {
         self.axis = self.axis.toggled();
     }
 
+    /// Move the highlight without changing the active axis.
+    pub fn jump_to(&mut self, index: usize) {
+        if index < self.total_keys {
+            self.selected = index;
+        }
+    }
+
     pub fn move_previous(&mut self) {
         match self.axis {
             KeyboardNavigationAxis::Horizontal => self.move_horizontal(false),

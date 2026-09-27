@@ -100,11 +100,11 @@ fn load_espidf(prefs: &mut ReaderPreferences) -> bool {
             }
         }
         let face_key = CString::new(KEY_BOOK_FONT).expect("nvs face key");
-        let mut buf = [0i8; 40];
+        // ESP-IDF 5.4 bindings use unsigned `c_char` on Xtensa.
+        let mut buf = [0u8; 40];
         let mut len = buf.len();
         if nvs_get_str(handle, face_key.as_ptr(), buf.as_mut_ptr(), &mut len) == ESP_OK {
-            let bytes =
-                core::slice::from_raw_parts(buf.as_ptr() as *const u8, len.saturating_sub(1));
+            let bytes = &buf[..len.saturating_sub(1)];
             if let Ok(text) = core::str::from_utf8(bytes) {
                 if let Ok(font) = BookFont::parse(text) {
                     prefs.apply_parsed_book_font(font, text);

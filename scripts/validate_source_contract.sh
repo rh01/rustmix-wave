@@ -271,6 +271,7 @@ for module in (
     'reader', 'reader_nvs', 'fonts', 'epub', 'voice_notes', 'voice_note_metadata', 'wifi_transfer',
     'wifi_setup', 'wifi_nvs',
     'alarm', 'sleep_mode', 'sleep_images', 'sleep_network', 'lua_runtime', 'games',
+    'lexicon', 'vocab',
 ):
     assert f'pub mod {module};' in lib, f'library module missing: {module}'
 
@@ -280,6 +281,7 @@ for marker in (
     'rustmix-wave=calendar-personal-event-editor-ready',
     'rustmix-wave=calendar-us-events-daily-agenda-ready',
     'rustmix-wave=offline-dictionary-x4-pack-native-foundation-ready',
+    'rustmix-wave=lexicon-vocab-ready',
     'rustmix-wave=voice-notes-organizer-controls-export-ready',
     'rustmix-wave=wifi-transfer-web-portal-ready',
     'rustmix-wave=wifi-softap-setup-ready',
@@ -354,6 +356,7 @@ for protected in (
     'WIFI.TXT', 'ALARMS.TXT', 'DISPLAY.TXT', 'WEATHER.TXT',
     'VOICE/META.TXT', 'VOICE/SETTINGS.TXT',
     'APPS/CALENDAR/EVENTS.TMP', 'APPS/CALENDAR/EVENTS.BAK',
+    'VOCAB/PROGRESS.TMP', 'VOCAB/PROGRESS.BAK',
 ):
     assert f'"{protected}"' in wifi, f'protected portal path missing: {protected}'
 PY

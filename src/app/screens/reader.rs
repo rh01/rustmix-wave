@@ -207,7 +207,7 @@ fn library_entry_columns(
             .and_then(|bookmark| reader.bookmark_display_chapter_page(bookmark))
         {
             LibraryEntryColumns {
-                badge: format!("CH {}", chapter.chapter_number),
+                badge: format!("CH {}", chapter.chapter_text()),
                 suffix: format!("P {}", chapter.page_text()),
             }
         } else {
@@ -230,7 +230,7 @@ fn bookmark_entry_columns(
 ) -> LibraryEntryColumns {
     if let Some(chapter) = reader.bookmark_display_chapter_page(bookmark) {
         LibraryEntryColumns {
-            badge: format!("CH {}", chapter.chapter_number),
+            badge: format!("CH {}", chapter.chapter_text()),
             suffix: format!("P {}", chapter.page_text()),
         }
     } else {
@@ -325,7 +325,7 @@ pub fn render_loading(
     let message = loading.map_or("Preparing reader...", |value| value.message.as_str());
     Text::new(&truncate(message, 52), Point::new(24, 356), body).draw(display)?;
     Text::new(
-        "The current page opens before full indexing.",
+        "The current chapter opens before the rest of the book.",
         Point::new(24, 410),
         body,
     )
@@ -888,6 +888,7 @@ mod tests {
             page_index: 11,
             epub_chapter: Some(ReaderChapterPageLabel {
                 chapter_number: 4,
+                chapter_count: 10,
                 page_number: 3,
                 page_count: 12,
                 approximate: false,
@@ -897,7 +898,7 @@ mod tests {
         assert_eq!(
             bookmark_entry_columns(&reader, &bookmark),
             super::LibraryEntryColumns {
-                badge: "CH 4".into(),
+                badge: "CH 4/10".into(),
                 suffix: "P 3/12".into(),
             }
         );

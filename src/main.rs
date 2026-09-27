@@ -772,7 +772,7 @@ mod firmware {
         info!("rustmix-wave=reader-epub-reflowable-foundation-ready archive=zip-central-directory compression=stored,deflate package=container-xml,opf spine=xhtml reflow=bounded-utf8 cache=ram-nearby-pages");
         info!("rustmix-wave=reader-epub-toc-ready sources=epub3-nav,epub2-ncx,fallback-spine route=reader-toc selection=byte-offset");
         info!("rustmix-wave=reader-epub-parser-stack-isolation-ready worker=epub-parser stack-bytes=65536 main-task-stack-bytes=16384 policy=short-lived-worker-join");
-        info!("rustmix-wave=reader-epub-chapter-aware-presentation-ready page-label=chapter,page-of-total bookmarks=chapter,page-of-total library-title=opf-metadata fallback=fat-filename txt-path=preserved");
+        info!("rustmix-wave=reader-epub-chapter-on-demand-ready page-label=chapter-i-of-n,page-within-chapter bookmarks=chapter,page-of-total layout=current-spine-item library-title=opf-metadata fallback=fat-filename txt-path=preserved");
         info!("rustmix-wave=reader-epub-watchdog-memory-pressure-repair-ready index-yield-every-pages=4 index-yield-ms=1 session-release=before-book-open layout-rebuild=move-document toc-jump=no-document-clone parser-worker-stack-bytes=65536 title-worker-stack-bytes=32768");
         info!("rustmix-wave=reader-eink-font-pack-ready fonts=inter,atkinson-hyperlegible,serif,literata,cjk-unifont,sd-ttf-otf atkinson-source=atkinson-hyperlegible-next-medium literata-source=literata-medium glyphs=printable-ascii+gb2312-unifont persisted-keys=serif,atkinson-hyperlegible,cjk-unifont,sd-cjk cache-fingerprint=book-font epub-repagination=layout-rebuild bookmarks=byte-offset txt-epub-aligned=true cjk=sd-fonts-or-unifont-fallback");
         info!("rustmix-wave=lua-runtime-foundation-ready mode=bootstrap-static,event-bridge root={LUA_APPS_DIRECTORY} manifest=APP.TOM entry=MAIN.LUA script-max-bytes=65536 vm-callbacks=sudoku,minesweeper,tilt-maze,motion-2048,sokoban-tilt-bounded-native");
@@ -1716,7 +1716,10 @@ mod firmware {
                 && last_reader_tick.elapsed() >= Duration::from_millis(250)
             {
                 let previous_route = state.active_route();
-                let outcome = state.tick_reader();
+                let outcome = waveshare_epd397_rust_app::reader::with_layout_button_poll(
+                    &mut || buttons.any_pressed().unwrap_or(false),
+                    || state.tick_reader(),
+                );
                 match outcome {
                     ReaderTickOutcome::LoadingStageChanged => {
                         info!(
@@ -1735,6 +1738,9 @@ mod firmware {
                         if let Some(session) = state.reader.session.as_ref() {
                             info!("rustmix-wave=reader-background-cache indexed-percent={} pages={} complete={} truncated={}", session.progress_percent(), session.indexed_page_count(), session.index_complete, session.index_truncated);
                         }
+                    }
+                    ReaderTickOutcome::ReadingPositionChanged => {
+                        info!("rustmix-wave=reader-chapter-edge status=page-ready");
                     }
                     ReaderTickOutcome::Failed => {
                         warn!(
@@ -1768,6 +1774,7 @@ mod firmware {
                 if state.panel_awake
                     && (outcome == ReaderTickOutcome::LoadingStageChanged
                         || outcome == ReaderTickOutcome::FirstPageReady
+                        || outcome == ReaderTickOutcome::ReadingPositionChanged
                         || outcome == ReaderTickOutcome::Failed
                         || state.active_route() != previous_route)
                 {
@@ -2083,7 +2090,10 @@ mod firmware {
                         apply_audio_request(&mut audio_runtime, &mut state, request);
                     }
                 } else {
-                    state.apply(event);
+                    waveshare_epd397_rust_app::reader::with_layout_button_poll(
+                        &mut || buttons.any_pressed().unwrap_or(false),
+                        || state.apply(event),
+                    );
                     log_lua_runtime_events(&mut state);
                     if state.active_route() == ScreenRoute::Files {
                         storage_browser.refresh();

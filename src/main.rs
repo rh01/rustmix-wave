@@ -1674,6 +1674,7 @@ mod firmware {
                         &mut frame,
                         &mut state,
                         &mut panel_refresh,
+                        &mut previous_panel_frame,
                         RefreshRequest::Normal,
                     )?;
                 }

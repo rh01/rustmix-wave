@@ -16,7 +16,10 @@ use std::{
     collections::BTreeMap,
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
-    path::Path,
+    panic::AssertUnwindSafe,
+    path::{Path, PathBuf},
+    sync::{mpsc, Mutex},
+    time::Duration,
 };
 
 use miniz_oxide::inflate::decompress_to_vec;
@@ -220,55 +223,164 @@ struct ManifestItem {
     properties: String,
 }
 
-/// Parse one EPUB on a short-lived dedicated worker stack. The Reader keeps
-/// its existing synchronous staged-loading contract, while archive parsing,
-/// DEFLATE expansion and XHTML flattening no longer consume the firmware main
-/// task's 16 KB stack budget.
-pub fn open_epub_on_worker(path: impl AsRef<Path>) -> Result<EpubDocument, String> {
-    let path = path.as_ref().to_path_buf();
-    log::info!(
-        "rustmix-wave=epub-parser-worker status=starting stack-bytes={}",
-        EPUB_PARSER_WORKER_STACK_BYTES
-    );
-    let worker = std::thread::Builder::new()
-        .name("epub-parser".into())
-        .stack_size(EPUB_PARSER_WORKER_STACK_BYTES)
-        .spawn(move || open_epub(path))
-        .map_err(|error| {
-            let message = format!("EPUB parser worker start failed: {error}");
-            log::warn!("rustmix-wave=epub-parser-worker status=start-failed error={message}");
-            message
-        })?;
-    let result = worker.join().map_err(|_| {
-        let message = "EPUB parser worker panicked".to_string();
-        log::warn!("rustmix-wave=epub-parser-worker status=panicked");
-        message
-    })?;
-    match &result {
-        Ok(document) => log::info!(
-            "rustmix-wave=epub-parser-worker status=completed spine-items={} toc-entries={} text-bytes={}",
-            document.spine_count,
-            document.toc.len(),
-            document.text_size_bytes()
-        ),
-        Err(error) => log::warn!("rustmix-wave=epub-parser-worker status=failed error={error}"),
-    }
-    result
+/// One internal-RAM thread for EPUB title scans and opens.
+///
+/// `JoinHandle::join` is never called. On ESP-IDF an aborted child never stores
+/// its result, and `std` then hits `expect("threads should not terminate
+/// unexpectedly")` in the caller — which is the firmware main task. A missing
+/// or late reply is a normal error. The stack stays in internal RAM: this
+/// thread reads the SD card, and a PSRAM stack cannot call FATFS.
+const EPUB_TITLE_TIMEOUT: Duration = Duration::from_secs(8);
+const EPUB_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+
+enum EpubJob {
+    Title(PathBuf),
+    Open(PathBuf),
+    #[cfg(test)]
+    Panic,
 }
 
-/// Read only the OPF title on a lightweight bounded worker stack. Library scans
-/// remain safe on the firmware main task and fall back to the FAT filename when
-/// metadata cannot be read.
+enum EpubReply {
+    Title(Result<String, String>),
+    Open(Result<EpubDocument, String>),
+}
+
+#[cfg(test)]
+pub(crate) static TITLE_WORKER_PATHS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn epub_worker_slot(
+) -> &'static Mutex<Option<crate::runtime_worker::LongLivedWorker<EpubJob, EpubReply>>> {
+    static SLOT: Mutex<Option<crate::runtime_worker::LongLivedWorker<EpubJob, EpubReply>>> =
+        Mutex::new(None);
+    &SLOT
+}
+
+fn reset_epub_worker() {
+    let mut slot = epub_worker_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = None;
+}
+
+fn epub_worker() -> Result<crate::runtime_worker::LongLivedWorker<EpubJob, EpubReply>, String> {
+    let mut slot = epub_worker_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot.is_none() {
+        log::info!(
+            "rustmix-wave=epub-worker status=starting stack-bytes={EPUB_PARSER_WORKER_STACK_BYTES}"
+        );
+        let worker = crate::runtime_worker::LongLivedWorker::spawn(
+            "epub-worker",
+            EPUB_PARSER_WORKER_STACK_BYTES,
+            handle_epub_job,
+        )
+        .map_err(|error| format!("EPUB worker start failed: {error}"))?;
+        *slot = Some(worker);
+    }
+    Ok(slot.as_ref().unwrap().clone())
+}
+
+fn handle_epub_job(job: EpubJob) -> EpubReply {
+    let opened = matches!(job, EpubJob::Open(_));
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| match job {
+        EpubJob::Title(path) => {
+            #[cfg(test)]
+            TITLE_WORKER_PATHS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(path.display().to_string());
+            EpubReply::Title(read_epub_title(&path))
+        }
+        EpubJob::Open(path) => {
+            log::info!(
+                "rustmix-wave=epub-parser-worker status=starting stack-bytes={EPUB_PARSER_WORKER_STACK_BYTES}"
+            );
+            let result = open_epub(&path);
+            match &result {
+                Ok(document) => log::info!(
+                    "rustmix-wave=epub-parser-worker status=completed spine-items={} toc-entries={} text-bytes={}",
+                    document.spine_count,
+                    document.toc.len(),
+                    document.text_size_bytes()
+                ),
+                Err(error) => {
+                    log::warn!("rustmix-wave=epub-parser-worker status=failed error={error}")
+                }
+            }
+            EpubReply::Open(result)
+        }
+        #[cfg(test)]
+        EpubJob::Panic => panic!("epub title worker test panic"),
+    }));
+    match result {
+        Ok(reply) => reply,
+        Err(_) => {
+            log::warn!("rustmix-wave=epub-worker status=panicked");
+            if opened {
+                EpubReply::Open(Err("EPUB worker panicked".into()))
+            } else {
+                EpubReply::Title(Err("EPUB worker panicked".into()))
+            }
+        }
+    }
+}
+
+fn submit_epub_job(job: EpubJob, timeout: Duration) -> Result<EpubReply, String> {
+    let worker = epub_worker()?;
+    let inbox = match worker.submit(job) {
+        Ok(inbox) => inbox,
+        Err(_) => {
+            reset_epub_worker();
+            return Err("EPUB worker stopped".into());
+        }
+    };
+    match inbox.recv_timeout(timeout) {
+        Ok(reply) => Ok(reply),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            reset_epub_worker();
+            Err("EPUB worker timed out".into())
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            reset_epub_worker();
+            Err("EPUB worker stopped".into())
+        }
+    }
+}
+
+/// Parse one EPUB on the long-lived worker. The caller blocks on a channel,
+/// not on `JoinHandle::join`, so a dead worker cannot abort the main task.
+pub fn open_epub_on_worker(path: impl AsRef<Path>) -> Result<EpubDocument, String> {
+    match submit_epub_job(
+        EpubJob::Open(path.as_ref().to_path_buf()),
+        EPUB_OPEN_TIMEOUT,
+    )? {
+        EpubReply::Open(result) => result,
+        EpubReply::Title(Err(error)) => Err(error),
+        EpubReply::Title(Ok(_)) => Err("EPUB worker returned an unexpected result".into()),
+    }
+}
+
+/// Read only the OPF title on the long-lived worker. A panic, timeout, or
+/// missing reply is an error the library scan turns into the FAT filename.
 pub fn read_epub_title_on_worker(path: impl AsRef<Path>) -> Result<String, String> {
-    let path = path.as_ref().to_path_buf();
-    let worker = std::thread::Builder::new()
-        .name("epub-title".into())
-        .stack_size(EPUB_TITLE_WORKER_STACK_BYTES)
-        .spawn(move || read_epub_title(path))
-        .map_err(|error| format!("EPUB title worker start failed: {error}"))?;
-    worker
-        .join()
-        .map_err(|_| "EPUB title worker panicked".to_string())?
+    match submit_epub_job(
+        EpubJob::Title(path.as_ref().to_path_buf()),
+        EPUB_TITLE_TIMEOUT,
+    )? {
+        EpubReply::Title(result) => result,
+        EpubReply::Open(Err(error)) => Err(error),
+        EpubReply::Open(Ok(_)) => Err("EPUB worker returned an unexpected result".into()),
+    }
+}
+
+#[cfg(test)]
+pub fn title_worker_panic_is_an_error() -> Result<String, String> {
+    match submit_epub_job(EpubJob::Panic, Duration::from_secs(2))? {
+        EpubReply::Title(result) => result,
+        EpubReply::Open(Err(error)) => Err(error),
+        EpubReply::Open(Ok(_)) => Err("EPUB worker returned an unexpected result".into()),
+    }
 }
 
 /// Read one OPF metadata title without flattening the spine or slurping the
@@ -1216,6 +1328,34 @@ mod tests {
     fn title_worker_uses_a_smaller_bounded_stack() {
         assert_eq!(EPUB_TITLE_WORKER_STACK_BYTES, 32 * 1024);
         assert!(EPUB_TITLE_WORKER_STACK_BYTES < EPUB_PARSER_WORKER_STACK_BYTES);
+    }
+
+    #[test]
+    fn title_worker_panic_is_an_error_and_the_next_read_still_runs() {
+        let error = super::title_worker_panic_is_an_error().unwrap_err();
+        assert!(error.contains("panicked"), "{error}");
+        let path = temp_epub("after-panic");
+        let bytes = stored_zip(&[
+            (
+                "META-INF/container.xml",
+                "<container><rootfiles><rootfile full-path='book.opf'/></rootfiles></container>",
+            ),
+            (
+                "book.opf",
+                "<package><metadata><dc:title>After Panic</dc:title></metadata></package>",
+            ),
+        ]);
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(read_epub_title_on_worker(&path).unwrap(), "After Panic");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn missing_worker_reply_is_a_failure() {
+        let (sender, inbox) = std::sync::mpsc::channel::<Result<String, String>>();
+        drop(sender);
+        let error = inbox.recv_timeout(std::time::Duration::from_millis(20));
+        assert!(error.is_err());
     }
 
     #[test]

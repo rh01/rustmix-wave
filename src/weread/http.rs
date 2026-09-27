@@ -134,9 +134,11 @@ fn poll_report(job: &mut Inflight) -> Option<Report> {
         Ok(mut report) => {
             if let Some(download) = job.download.take() {
                 let succeeded = report.result.is_ok();
-                if let Err(error) =
-                    offline::complete_download(download, succeeded, job.write_error.take())
-                {
+                if let Err(error) = crate::weread::store::complete_download(
+                    download,
+                    succeeded,
+                    job.write_error.take(),
+                ) {
                     if report.result.is_ok() {
                         report.result = Err(JobError::Message(error));
                     }
@@ -686,7 +688,7 @@ fn http_call(
         return Err("response exceeds size limit".into());
     }
     let mut body = BoundedBody::new(declared, request.max_bytes)?;
-    let mut chunk = [0_u8; 2048];
+    let mut chunk = vec![0_u8; 2048];
     arm_body_timeout(client.raw);
     loop {
         let (step, read) = read_body_chunk(&mut client, cancel, &mut chunk)?;

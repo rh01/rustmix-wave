@@ -26,7 +26,7 @@ use crate::{
         offline::{self, CachedChapter},
         parse::{BookDetail, ChapterMeta, NoteLine, ReadingProgress, ShelfBook},
         session::{self, Session},
-        text,
+        store, text,
     },
 };
 
@@ -741,7 +741,7 @@ impl WereadUi {
         self.chapter_pos = self.chapter_pos.min(self.chapters.len() - 1);
         let chapter = self.chapters[self.chapter_pos].clone();
         if mounted {
-            if let Some(cached) = offline::load_chapter(&sd_root(), &self.book_id, chapter.index) {
+            if let Some(cached) = store::load_chapter(&sd_root(), &self.book_id, chapter.index) {
                 self.images.clear();
                 self.show_text(&cached.text, layout);
                 self.place_open_page();
@@ -780,10 +780,9 @@ impl WereadUi {
     }
 
     fn show_text(&mut self, text: &str, layout: ReaderLayout) {
-        let blocks = text::blocks_from_markup(text);
         self.chapter_source = text.to_string();
         let measures = self.image_measures(layout);
-        self.pages = text::paginate_blocks(&blocks, layout, &measures);
+        self.pages = store::paginate_chapter(text, layout, measures).unwrap_or_default();
         self.paginated_layout = Some(layout);
     }
 
@@ -1535,7 +1534,7 @@ impl WereadUi {
                 }
                 if mounted {
                     if let Some(chapter) = self.chapters.get(self.chapter_pos) {
-                        if let Err(error) = offline::save_chapter(
+                        if let Err(error) = store::save_chapter(
                             &sd_root(),
                             &self.book_id,
                             &CachedChapter {

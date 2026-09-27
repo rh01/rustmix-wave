@@ -15,6 +15,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     ptr::NonNull,
+    sync::Mutex,
     time::{Duration, UNIX_EPOCH},
 };
 
@@ -3255,7 +3256,10 @@ impl ReaderUiState {
         if removed > 0 {
             log::info!("rustmix-wave=epub-legacy-index status=removed count={removed}");
         }
-        match scan_txt_library(&self.books_root) {
+        match scan_library(
+            Path::new(&self.books_root),
+            Some(Path::new(&self.state_root)),
+        ) {
             Ok(books) => {
                 self.books = books;
                 self.library_error = None;
@@ -4697,7 +4701,110 @@ impl ReaderUiState {
 /// Scan one bounded Reader library. TXT and EPUB/EPU rows open through the
 /// shared staged Reader architecture.
 pub fn scan_txt_library(root: impl AsRef<Path>) -> Result<Vec<ReaderBook>, String> {
-    let root = root.as_ref();
+    scan_library(root.as_ref(), None)
+}
+
+const TITLE_FAILURE_FILE: &str = "BADTITLE.TXT";
+const TITLE_FAILURE_LIMIT: usize = 128;
+
+fn title_failures() -> &'static Mutex<Vec<String>> {
+    static FAILURES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    &FAILURES
+}
+
+fn title_failure_key(path: &Path, size: u64, modified: u64) -> String {
+    format!(
+        "{size}\t{modified}\t{}",
+        path.to_string_lossy().replace(['\n', '\r'], " ")
+    )
+}
+
+fn merge_title_failures(state_root: Option<&Path>) {
+    let Some(root) = state_root else {
+        return;
+    };
+    let Ok(text) = read_capped_string(&root.join(TITLE_FAILURE_FILE), 16 * 1024) else {
+        return;
+    };
+    let mut slot = title_failures()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("version=") {
+            continue;
+        }
+        if !slot.iter().any(|existing| existing == line) {
+            slot.push(line.to_string());
+        }
+    }
+    if slot.len() > TITLE_FAILURE_LIMIT {
+        let drop_count = slot.len() - TITLE_FAILURE_LIMIT;
+        slot.drain(0..drop_count);
+    }
+}
+
+fn title_failure_known(key: &str) -> bool {
+    title_failures()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .any(|existing| existing == key)
+}
+
+fn remember_title_failure(state_root: Option<&Path>, key: String) {
+    {
+        let mut slot = title_failures()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !slot.iter().any(|existing| existing == &key) {
+            slot.push(key);
+        }
+        if slot.len() > TITLE_FAILURE_LIMIT {
+            let drop_count = slot.len() - TITLE_FAILURE_LIMIT;
+            slot.drain(0..drop_count);
+        }
+    }
+    let Some(root) = state_root else {
+        return;
+    };
+    let body = {
+        let slot = title_failures()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut body = String::from("version=1\n");
+        for entry in slot.iter() {
+            body.push_str(entry);
+            body.push('\n');
+        }
+        body
+    };
+    let _ = atomic_replace_text(&root.join(TITLE_FAILURE_FILE), &body);
+}
+
+/// AppleDouble sidecars, transfer leftovers, empty files, and tiny odd-length
+/// objects are not books. A finished EPUB may itself be an odd number of
+/// bytes, so those are parsed; a title-worker failure is blacklisted instead
+/// of being retried on every boot.
+pub fn library_entry_skipped(name: &str, size: u64) -> bool {
+    name.starts_with("._") || name.to_ascii_uppercase().ends_with(".TMP") || size == 0
+}
+
+fn epub_bytes_skipped(size: u64, path: &Path) -> bool {
+    size % 2 == 1 && (size < 64 || !starts_with_zip_local_header(path))
+}
+
+fn starts_with_zip_local_header(path: &Path) -> bool {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut magic = [0_u8; 4];
+    file.read_exact(&mut magic).is_ok() && magic == *b"PK\x03\x04"
+}
+
+fn scan_library(root: &Path, state_root: Option<&Path>) -> Result<Vec<ReaderBook>, String> {
+    merge_title_failures(state_root);
     let mut books = Vec::new();
     let entries =
         fs::read_dir(root).map_err(|error| format!("Books folder unavailable: {error}"))?;
@@ -4706,11 +4813,21 @@ pub fn scan_txt_library(root: impl AsRef<Path>) -> Result<Vec<ReaderBook>, Strin
         if !path.is_file() {
             continue;
         }
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        let metadata = entry.metadata().ok();
+        let size_bytes = metadata.as_ref().map_or(0, |meta| meta.len());
+        if library_entry_skipped(name, size_bytes) {
+            continue;
+        }
         let Some(format) = book_format_from_path(&path) else {
             continue;
         };
-        let metadata = entry.metadata().ok();
-        let size_bytes = metadata.as_ref().map_or(0, |meta| meta.len());
+        if format == BookFormat::Epub && epub_bytes_skipped(size_bytes, &path) {
+            continue;
+        }
         let modified_seconds = metadata
             .and_then(|meta| meta.modified().ok())
             .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
@@ -4721,13 +4838,21 @@ pub fn scan_txt_library(root: impl AsRef<Path>) -> Result<Vec<ReaderBook>, Strin
             .unwrap_or("Untitled book")
             .to_string();
         let title = if format == BookFormat::Epub {
-            // One bounded metadata read per book. The main task is blocked in
-            // the worker join, so pause first and never slurp the whole ZIP.
+            // One bounded metadata read per book. The reply arrives on a
+            // channel; a dead title worker cannot panic this task.
             pause_between_library_books();
-            read_epub_title_on_worker(&path)
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or(fallback_title)
+            let key = title_failure_key(&path, size_bytes, modified_seconds);
+            if title_failure_known(&key) {
+                fallback_title
+            } else {
+                match read_epub_title_on_worker(&path) {
+                    Ok(title) if !title.trim().is_empty() => title,
+                    _ => {
+                        remember_title_failure(state_root, key);
+                        fallback_title
+                    }
+                }
+            }
         } else {
             fallback_title
         };
@@ -6545,6 +6670,77 @@ mod tests {
             .collect();
         assert_eq!(titles, vec!["Alpha", "Beta"]);
         assert!(super::LIBRARY_SCAN_PAUSES.with(|count| count.get()) >= 2);
+        let _ = fs::remove_dir_all(books);
+        let _ = fs::remove_dir_all(state);
+    }
+
+    #[test]
+    fn library_skips_partial_files_and_blacklists_a_bad_epub() {
+        let books = temp_dir("library-junk-books");
+        let state = temp_dir("library-junk-state");
+        fs::create_dir_all(&state).unwrap();
+        let good = stored_zip(&[
+            (
+                "META-INF/container.xml",
+                "<container><rootfiles><rootfile full-path='book.opf'/></rootfiles></container>",
+            ),
+            (
+                "book.opf",
+                "<package><metadata><dc:title>Kept</dc:title></metadata></package>",
+            ),
+        ]);
+        fs::write(books.join("kept.epub"), &good).unwrap();
+        fs::write(books.join("._kept.epub"), &good).unwrap();
+        fs::write(books.join("NOTE.TMP"), b"partial").unwrap();
+        fs::write(books.join("empty.txt"), b"").unwrap();
+        fs::write(books.join("odd.epub"), b"PK\x03\x04xyz").unwrap();
+        let mut broken = b"PK\x03\x04".to_vec();
+        broken.extend(std::iter::repeat(0_u8).take(60));
+        let broken_path = books.join("broken-title-blacklist.epub");
+        fs::write(&broken_path, &broken).unwrap();
+        let hits = || {
+            crate::epub::TITLE_WORKER_PATHS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .filter(|path| path.ends_with("broken-title-blacklist.epub"))
+                .count()
+        };
+        let before = hits();
+        let mut reader = ReaderUiState::with_roots(
+            books.to_string_lossy().into_owned(),
+            state.to_string_lossy().into_owned(),
+        );
+        reader.refresh_library();
+        reader.refresh_library();
+        let titles: Vec<_> = reader
+            .books
+            .iter()
+            .map(|book| book.title.as_str())
+            .collect();
+        assert!(titles.contains(&"Kept"), "{titles:?}");
+        assert!(
+            titles.iter().any(|title| title.contains("broken-title")),
+            "{titles:?}"
+        );
+        assert!(!titles.iter().any(|title| title.starts_with("._")));
+        assert!(!titles
+            .iter()
+            .any(|title| title.eq_ignore_ascii_case("NOTE")));
+        assert!(!titles
+            .iter()
+            .any(|title| title.eq_ignore_ascii_case("empty")));
+        assert!(!titles.iter().any(|title| title.eq_ignore_ascii_case("odd")));
+        assert_eq!(
+            hits(),
+            before + 1,
+            "a blacklisted EPUB must not be parsed again"
+        );
+        let blacklist = fs::read_to_string(state.join("BADTITLE.TXT")).unwrap();
+        assert!(
+            blacklist.contains("broken-title-blacklist.epub"),
+            "{blacklist}"
+        );
         let _ = fs::remove_dir_all(books);
         let _ = fs::remove_dir_all(state);
     }

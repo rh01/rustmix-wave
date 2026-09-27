@@ -824,7 +824,7 @@ fn read_raw_file(path: &Path) -> Option<(String, Vec<Vec<u8>>)> {
         let mut buf = Vec::new();
         buf.try_reserve_exact(len).ok()?;
         let mut left = len;
-        let mut chunk = [0u8; DOWNLOAD_CHUNK_BYTES];
+        let mut chunk = vec![0_u8; DOWNLOAD_CHUNK_BYTES];
         while left > 0 {
             let take = chunk.len().min(left);
             file.read_exact(&mut chunk[..take]).ok()?;

@@ -3230,10 +3230,10 @@ mod firmware {
     fn maintain_wifi_setup_server(
         runtime: &mut NetworkRuntime,
         setup_server: &mut Option<WifiSetupServer>,
-        transfer_server: &mut Option<WifiTransferServer>,
+        _transfer_server: &mut Option<WifiTransferServer>,
         network_config: &mut Option<NetworkConfig>,
         state: &mut AppState,
-        storage_browser: &mut StorageBrowser,
+        _storage_browser: &mut StorageBrowser,
         mounted: bool,
     ) -> bool {
         if setup_server.is_none() {

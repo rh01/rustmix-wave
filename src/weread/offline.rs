@@ -163,12 +163,13 @@ pub struct ChapterDownload {
 impl ChapterDownload {
     pub fn begin(root: &Path, book_id: &str, uid: &str, index: u32) -> Result<Self, String> {
         let dir = book_dir(root, book_id);
-        fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        fs::create_dir_all(&dir).map_err(|error| explain_storage_error(&error.to_string()))?;
         let temp_path = dir.join("CHAP.TMP");
-        let mut file = File::create(&temp_path).map_err(|error| error.to_string())?;
+        let mut file =
+            File::create(&temp_path).map_err(|error| explain_storage_error(&error.to_string()))?;
         let header = format!("WRRAW1\nuid={}\nidx={index}\ntitle=\n---\n", one_line(uid));
         file.write_all(header.as_bytes())
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| explain_storage_error(&error.to_string()))?;
         Ok(Self {
             file: Some(file),
             temp_path,
@@ -200,7 +201,8 @@ impl ChapterDownload {
         if self.final_path.exists() {
             let _ = fs::rename(&self.final_path, &self.backup_path);
         }
-        fs::rename(&self.temp_path, &self.final_path).map_err(|error| error.to_string())?;
+        fs::rename(&self.temp_path, &self.final_path)
+            .map_err(|error| explain_storage_error(&error.to_string()))?;
         self.committed = true;
         Ok(())
     }
@@ -222,10 +224,13 @@ impl ChapterDownload {
             .as_mut()
             .ok_or("chapter download file is closed")?;
         file.write_all(format!("PART {name}\n").as_bytes())
-            .map_err(|error| error.to_string())?;
-        self.part_len_pos = Some(file.stream_position().map_err(|error| error.to_string())?);
+            .map_err(|error| explain_storage_error(&error.to_string()))?;
+        self.part_len_pos = Some(
+            file.stream_position()
+                .map_err(|error| explain_storage_error(&error.to_string()))?,
+        );
         file.write_all(b"00000000\n")
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| explain_storage_error(&error.to_string()))?;
         self.part_len = 0;
         self.part_open = true;
         Ok(())
@@ -245,7 +250,8 @@ impl ChapterDownload {
             .file
             .as_mut()
             .ok_or("chapter download file is closed")?;
-        file.write_all(bytes).map_err(|error| error.to_string())?;
+        file.write_all(bytes)
+            .map_err(|error| explain_storage_error(&error.to_string()))?;
         self.part_len += bytes.len();
         Ok(())
     }
@@ -258,16 +264,18 @@ impl ChapterDownload {
             .file
             .as_mut()
             .ok_or("chapter download file is closed")?;
-        let end = file.stream_position().map_err(|error| error.to_string())?;
+        let end = file
+            .stream_position()
+            .map_err(|error| explain_storage_error(&error.to_string()))?;
         let pos = self
             .part_len_pos
             .ok_or("chapter download length placeholder is missing")?;
         file.seek(SeekFrom::Start(pos))
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| explain_storage_error(&error.to_string()))?;
         file.write_all(format!("{:08X}\n", self.part_len).as_bytes())
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| explain_storage_error(&error.to_string()))?;
         file.seek(SeekFrom::Start(end))
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| explain_storage_error(&error.to_string()))?;
         self.part_open = false;
         self.part_len_pos = None;
         Ok(())
@@ -302,7 +310,7 @@ pub fn complete_download(
 
 pub fn save_chapter(root: &Path, book_id: &str, chapter: &CachedChapter) -> Result<(), String> {
     let dir = book_dir(root, book_id);
-    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    fs::create_dir_all(&dir).map_err(|error| explain_storage_error(&error.to_string()))?;
     let name = chapter_name(chapter.index);
     let mut body = format!(
         "WRCH1\nuid={}\nidx={}\ntitle={}\n---\n",
@@ -326,6 +334,78 @@ pub fn save_chapter(root: &Path, book_id: &str, chapter: &CachedChapter) -> Resu
         &dir.join("CHAP.BAK"),
         body.as_bytes(),
     )
+    .map_err(|error| explain_storage_error(&error))
+}
+
+/// Turn a filesystem error into a short status string.
+///
+/// A full card is named directly. Other FAT failures stay visible instead of
+/// looking like a successful save.
+#[must_use]
+pub fn explain_storage_error(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("no space")
+        || lower.contains("enospc")
+        || lower.contains("disk full")
+        || lower.contains("not enough space")
+        || lower.contains("os error 28")
+    {
+        return "SD card full".into();
+    }
+    if lower.contains("sd card full") || lower.starts_with("sd card write failed") {
+        return error.chars().take(80).collect();
+    }
+    let detail: String = error
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(60)
+        .collect();
+    format!("SD card write failed: {detail}")
+}
+
+/// Chapters that failed their retries. A reboot must not fetch them again.
+pub fn save_download_skip(root: &Path, book_id: &str, indexes: &[u32]) -> Result<(), String> {
+    let dir = book_dir(root, book_id);
+    fs::create_dir_all(&dir).map_err(|error| explain_storage_error(&error.to_string()))?;
+    let mut body = String::from("WRSKIP1\n");
+    for index in indexes.iter().take(MAX_CHAPTERS) {
+        body.push_str(&index.to_string());
+        body.push('\n');
+    }
+    atomic_write(
+        &dir.join("SKIP.TXT"),
+        &dir.join("SKIP.TMP"),
+        &dir.join("SKIP.BAK"),
+        body.as_bytes(),
+    )
+    .map_err(|error| explain_storage_error(&error))
+}
+
+#[must_use]
+pub fn load_download_skip(root: &Path, book_id: &str) -> Vec<u32> {
+    let Ok(bytes) = read_capped(&book_dir(root, book_id).join("SKIP.TXT"), 16 * 1024) else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    if !text
+        .lines()
+        .next()
+        .is_some_and(|line| line.trim() == "WRSKIP1")
+    {
+        return Vec::new();
+    }
+    let mut indexes = Vec::new();
+    for line in text.lines().skip(1) {
+        if indexes.len() >= MAX_CHAPTERS {
+            break;
+        }
+        if let Ok(index) = line.trim().parse::<u32>() {
+            if !indexes.contains(&index) {
+                indexes.push(index);
+            }
+        }
+    }
+    indexes
 }
 
 pub fn load_chapter(root: &Path, book_id: &str, index: u32) -> Option<CachedChapter> {
@@ -813,6 +893,23 @@ mod tests {
         assert!(error.contains("failed"));
         assert!(!super::book_dir(&dir, &book).join("CHAP.TMP").exists());
         assert!(!super::chapter_cached(&dir, &book, 2));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storage_errors_name_a_full_card_and_skipped_chapters_survive() {
+        assert_eq!(
+            super::explain_storage_error("No space left on device (os error 28)"),
+            "SD card full"
+        );
+        assert_eq!(
+            super::explain_storage_error("SD card write failed: busy"),
+            "SD card write failed: busy"
+        );
+        let (dir, book) = temp_book();
+        super::save_download_skip(&dir, &book, &[3, 9, 3]).unwrap();
+        assert_eq!(super::load_download_skip(&dir, &book), vec![3, 9]);
+        assert!(super::load_download_skip(&dir, "missing").is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 }

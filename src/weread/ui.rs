@@ -187,7 +187,12 @@ impl WereadUi {
         self.busy || matches!(self.phase, Phase::Login | Phase::Download) || self.pending.is_some()
     }
 
-    /// True while a shelf, login, chapter, or progress upload still needs Wi-Fi.
+    /// True while a shelf, login, chapter, download, or progress upload still needs Wi-Fi.
+    ///
+    /// A download stays true for the whole book, including the pause between
+    /// chapters and the main-task SD write. Power management uses this for the
+    /// station, the active SD clock, and blocking auto deep sleep.
+    /// `HttpJobs::busy` is only the in-flight HTTPS call.
     #[must_use]
     pub fn needs_radio(&self) -> bool {
         self.holds_panel() || self.progress_arm
@@ -413,7 +418,7 @@ impl WereadUi {
                     } else {
                         self.download_cancel = false;
                         self.download_attempts = 0;
-                        self.download_skip.clear();
+                        self.download_skip = offline::load_download_skip(&sd_root(), &self.book_id);
                         self.download_last_error.clear();
                         self.download_done = self.count_cached(mounted);
                         self.phase = Phase::Download;
@@ -836,6 +841,10 @@ impl WereadUi {
             let index = chapter.index;
             if !self.download_skip.contains(&index) {
                 self.download_skip.push(index);
+                if mounted {
+                    let _ =
+                        offline::save_download_skip(&sd_root(), &self.book_id, &self.download_skip);
+                }
             }
         }
         self.download_attempts = 0;
@@ -1120,7 +1129,7 @@ impl WereadUi {
                 }
                 if mounted {
                     if let Some(chapter) = self.chapters.get(self.chapter_pos) {
-                        let _ = offline::save_chapter(
+                        if let Err(error) = offline::save_chapter(
                             &sd_root(),
                             &self.book_id,
                             &CachedChapter {
@@ -1129,7 +1138,22 @@ impl WereadUi {
                                 title: chapter.title.clone(),
                                 text,
                             },
-                        );
+                        ) {
+                            if downloading {
+                                self.retry_or_skip_download(now_ms, mounted, &error);
+                                return ServiceOutcome {
+                                    refresh: true,
+                                    route: None,
+                                    touch_activity: false,
+                                };
+                            }
+                            self.status = error;
+                            return ServiceOutcome {
+                                refresh: true,
+                                route: None,
+                                touch_activity: false,
+                            };
+                        }
                     }
                     if !downloading {
                         self.remember_local_progress(mounted);
@@ -1167,6 +1191,21 @@ impl WereadUi {
                 self.chapter_source = String::new();
                 self.paginated_layout = None;
                 if self.phase == Phase::Download && !self.download_cancel {
+                    let index = self
+                        .chapters
+                        .get(self.chapter_pos)
+                        .map(|chapter| chapter.index);
+                    let on_card = index.is_some_and(|index| {
+                        mounted && offline::chapter_cached(&sd_root(), &self.book_id, index)
+                    });
+                    if mounted && !on_card {
+                        self.retry_or_skip_download(now_ms, mounted, "SD card write failed");
+                        return ServiceOutcome {
+                            refresh: true,
+                            route: None,
+                            touch_activity: false,
+                        };
+                    }
                     self.download_attempts = 0;
                     self.download_done = self.count_cached(mounted);
                     self.queue_next_download(mounted, now_ms.saturating_add(MIN_REQUEST_GAP_MS));
@@ -1971,5 +2010,167 @@ mod tests {
         large.font_size = BookFontSize::Px72;
         assert!(ui.sync_layout(large.layout()));
         assert!(ui.pages.len() > pages);
+    }
+
+    #[test]
+    fn download_stays_on_the_radio_between_chapters() {
+        let mut ui = signed_in();
+        ui.phase = super::Phase::Download;
+        ui.busy = false;
+        ui.pending = Some(Job::Chapter {
+            book_id: "b".into(),
+            chapter_uid: "2".into(),
+            chapter_idx: 2,
+            psvts: String::new(),
+            fetch_images: false,
+        });
+        assert!(ui.needs_radio());
+        ui.phase = super::Phase::Book;
+        ui.pending = None;
+        ui.busy = false;
+        ui.progress_arm = false;
+        assert!(!ui.needs_radio());
+    }
+
+    fn chapter_report(ui: &WereadUi, generation: u64, error: JobError) -> Report {
+        Report {
+            generation,
+            job: Job::Chapter {
+                book_id: ui.book_id.clone(),
+                chapter_uid: "1".into(),
+                chapter_idx: 1,
+                psvts: String::new(),
+                fetch_images: false,
+            },
+            session: ui.session.clone(),
+            result: Err(error),
+        }
+    }
+
+    #[test]
+    fn sd_write_failure_retries_then_skips_and_is_remembered() {
+        let _sd = sd_root_lock();
+        let dir = std::env::temp_dir().join(format!("weread-sd-fail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("not-a-directory");
+        fs::write(&blocker, b"x").unwrap();
+        std::env::set_var("WEREAD_SD_ROOT", &blocker);
+        let mut ui = signed_in();
+        ui.book_id = "43208843".into();
+        ui.phase = super::Phase::Download;
+        ui.chapters = vec![chapter("1", 1, "One"), chapter("2", 2, "Two")];
+        ui.generation = 8;
+        let layout = ReaderPreferences::default().layout();
+        ui.apply_report(
+            Report {
+                generation: 8,
+                job: Job::Chapter {
+                    book_id: ui.book_id.clone(),
+                    chapter_uid: "1".into(),
+                    chapter_idx: 1,
+                    psvts: String::new(),
+                    fetch_images: false,
+                },
+                session: ui.session.clone(),
+                result: Ok(JobOutput::Chapter {
+                    blocks: Vec::new(),
+                    text: "hello".into(),
+                    images: Vec::new(),
+                    psvts: String::new(),
+                    format: "txt".into(),
+                }),
+            },
+            layout,
+            true,
+            1_000,
+        );
+        assert_eq!(ui.download_attempts, 1);
+        assert!(ui.status.contains("SD card"));
+        assert!(!ui.status.contains("Saved"));
+        match &ui.pending {
+            Some(Job::Chapter { chapter_idx, .. }) => assert_eq!(*chapter_idx, 1),
+            other => panic!("expected a retry of the same chapter, got {other:?}"),
+        }
+
+        std::env::set_var("WEREAD_SD_ROOT", &dir);
+        ui.apply_report(
+            chapter_report(&ui, 8, JobError::Message("SD card full".into())),
+            layout,
+            true,
+            2_000,
+        );
+        assert_eq!(ui.download_attempts, 2);
+        assert!(ui.status.contains("SD card full"));
+        ui.apply_report(
+            chapter_report(&ui, 8, JobError::Message("SD card full".into())),
+            layout,
+            true,
+            3_000,
+        );
+        assert!(ui.download_skip.contains(&1));
+        match &ui.pending {
+            Some(Job::Chapter { chapter_idx, .. }) => assert_eq!(*chapter_idx, 2),
+            other => panic!("expected the next chapter, got {other:?}"),
+        }
+        let skip =
+            fs::read_to_string(offline::book_dir(&dir, "43208843").join("SKIP.TXT")).unwrap();
+        assert!(skip.contains("WRSKIP1"));
+        assert!(skip.lines().any(|line| line.trim() == "1"));
+
+        let mut again = signed_in();
+        again.book_id = "43208843".into();
+        again.chapters = ui.chapters.clone();
+        again.book_cursor = 3;
+        assert_eq!(
+            again.on_button(ScreenRoute::WeReadBook, ButtonEvent::Select, layout, true),
+            Some(ScreenRoute::WeReadDownload)
+        );
+        assert!(again.download_skip.contains(&1));
+        match &again.pending {
+            Some(Job::Chapter { chapter_idx, .. }) => assert_eq!(*chapter_idx, 2),
+            other => panic!("reboot must skip the saved failure, got {other:?}"),
+        }
+        assert!(again.needs_radio());
+        std::env::remove_var("WEREAD_SD_ROOT");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stored_chapter_without_a_file_is_not_reported_as_saved() {
+        let _sd = sd_root_lock();
+        let dir = std::env::temp_dir().join(format!("weread-sd-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("WEREAD_SD_ROOT", &dir);
+        let mut ui = signed_in();
+        ui.book_id = "43208843".into();
+        ui.phase = super::Phase::Download;
+        ui.chapters = vec![chapter("1", 1, "One")];
+        ui.generation = 4;
+        ui.apply_report(
+            Report {
+                generation: 4,
+                job: Job::Chapter {
+                    book_id: ui.book_id.clone(),
+                    chapter_uid: "1".into(),
+                    chapter_idx: 1,
+                    psvts: String::new(),
+                    fetch_images: false,
+                },
+                session: ui.session.clone(),
+                result: Ok(JobOutput::ChapterStored {
+                    psvts: String::new(),
+                }),
+            },
+            ReaderPreferences::default().layout(),
+            true,
+            10,
+        );
+        assert_eq!(ui.download_attempts, 1);
+        assert!(ui.status.contains("SD card write failed"));
+        assert!(!ui.status.contains("Saved"));
+        std::env::remove_var("WEREAD_SD_ROOT");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

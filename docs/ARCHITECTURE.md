@@ -306,10 +306,9 @@ Heavy operations are deliberately moved away from the main task:
 
 `src/runtime_worker.rs` logs memory snapshots before and after generic named workers, joins the short-lived thread, maps worker-start and panic failures into explicit errors, and returns a compact result to the main loop.
 
-`src/runtime_memory.rs` records:
+`src/runtime_memory.rs` records the calling task's unused stack. Main-task logs name that figure `main-stack-high-water-bytes`. The `weread-http` worker logs `worker-stack-free-bytes` against its 32 KiB stack and warns when less than one eighth remains. Heap fields are:
 
 ```text
-main-stack-high-water-bytes
 heap-free-internal-bytes
 heap-largest-internal-block-bytes
 heap-free-psram-bytes

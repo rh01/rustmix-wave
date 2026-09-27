@@ -33,7 +33,7 @@ use esp_idf_svc::sys::{
 
 use crate::{
     reader::ReaderLayout,
-    runtime_memory::log_runtime_memory,
+    runtime_memory::{log_runtime_memory, log_worker_memory},
     runtime_worker::LongLivedWorker,
     weread::{
         body::BoundedBody,
@@ -299,7 +299,11 @@ fn start_worker() -> Result<LongLivedWorker<QueuedJob, Report>, std::io::Error> 
         "weread-http",
         WEREAD_HTTP_WORKER_STACK_BYTES,
         |job: QueuedJob| {
-            log_runtime_memory("weread-http-before-job");
+            log_worker_memory(
+                "weread-http-before-job",
+                "weread-http",
+                WEREAD_HTTP_WORKER_STACK_BYTES,
+            );
             let report = {
                 let mut transport = EspTransport {
                     gap: true,
@@ -312,7 +316,11 @@ fn start_worker() -> Result<LongLivedWorker<QueuedJob, Report>, std::io::Error> 
                 report
             };
             log::info!("rustmix-wave=weread-http status=client-released");
-            log_runtime_memory("weread-http-after-job");
+            log_worker_memory(
+                "weread-http-after-job",
+                "weread-http",
+                WEREAD_HTTP_WORKER_STACK_BYTES,
+            );
             report
         },
     )

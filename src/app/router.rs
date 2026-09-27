@@ -70,6 +70,8 @@ pub enum ScreenRoute {
     WeatherDetails,
     /// Battery, radio, and sleep estimate. Reached from Device Info.
     DeviceInfoPower,
+    /// Shown when a Wi-Fi feature is opened without a station. BOOT cancels.
+    WifiPrompt,
 }
 
 impl ScreenRoute {
@@ -141,6 +143,7 @@ impl ScreenRoute {
             Self::Weather => "Weather",
             Self::WeatherDetails => "Weather details",
             Self::DeviceInfoPower => "Power",
+            Self::WifiPrompt => "Wi-Fi Needed",
         }
     }
 
@@ -212,6 +215,7 @@ impl ScreenRoute {
             Self::Weather => "weather",
             Self::WeatherDetails => "weather-details",
             Self::DeviceInfoPower => "device-info-power",
+            Self::WifiPrompt => "wifi-prompt",
         }
     }
 
@@ -280,6 +284,7 @@ impl ScreenRoute {
             Self::MotionDetails => Some(Self::MotionEvents),
             Self::NetworkDetails | Self::WifiTransfer | Self::WifiSetup => Some(Self::Network),
             Self::WeatherDetails => Some(Self::Weather),
+            Self::WifiPrompt => Some(Self::Home),
         }
     }
 
@@ -394,6 +399,7 @@ impl ScreenRoute {
             62 => Self::Weather,
             63 => Self::WeatherDetails,
             64 => Self::DeviceInfoPower,
+            65 => Self::WifiPrompt,
             _ => return None,
         })
     }

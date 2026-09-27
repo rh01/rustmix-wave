@@ -21,8 +21,8 @@ use crate::{
     },
     orientation::OrientedFrameBuffer,
     reader::{
-        BookFormat, ParagraphAlignment, ReaderLibraryTab, ReaderLoadingStage, ReaderOption,
-        ReadingPreference, ReadingTheme,
+        BookFontSize, BookFormat, ParagraphAlignment, ReaderLibraryTab, ReaderLoadingStage,
+        ReaderOption, ReadingPreference, ReadingTheme,
     },
 };
 
@@ -631,6 +631,7 @@ pub fn render_preferences(
         crate::reader::PreferenceMenu::Controls => "CONTROLS",
     };
     draw_header(display, state.display, "READING PREFERENCES", subtitle)?;
+    draw_preference_preview(display, state)?;
     let font_label = state.reader.book_font_display_label();
     for (index, preference) in state.reader.preference_rows().iter().copied().enumerate() {
         let owned;
@@ -640,6 +641,7 @@ pub fn render_preferences(
             | ReadingPreference::DisplayMenu
             | ReadingPreference::StatusMenu
             | ReadingPreference::ControlsMenu => ">>>",
+            ReadingPreference::Done => "APPLY",
             ReadingPreference::Presets => {
                 owned = state
                     .reader
@@ -693,11 +695,29 @@ pub fn render_preferences(
             "",
         )?;
     }
-    draw_footer(
-        display,
-        state.display,
-        "UP/DOWN MOVE  SELECT CHANGE  HOLD BOOT BACK",
-    )
+    let footer = if state.reader.layout_changes_pending() {
+        "UP/DOWN MOVE  SELECT CHANGE  DONE APPLIES"
+    } else {
+        "UP/DOWN MOVE  SELECT CHANGE  HOLD BOOT BACK"
+    };
+    draw_footer(display, state.display, footer)
+}
+
+fn draw_preference_preview(
+    display: &mut OrientedFrameBuffer<'_>,
+    state: &AppState,
+) -> Result<(), Infallible> {
+    let prefs = state.reader.preferences;
+    let sample = reader_body_style(prefs.book_font, BookFontSize::Px20, prefs.theme)
+        .with_tracking(prefs.letter_spacing.pixels());
+    let caption = format!(
+        "{}  {}",
+        prefs.font_size.label(),
+        prefs.letter_spacing.label()
+    );
+    Text::new("Aa Bb", Point::new(24, 112), sample).draw(display)?;
+    Text::new(&caption, Point::new(250, 112), state.display.detail_style()).draw(display)?;
+    Ok(())
 }
 
 fn on_off(value: bool) -> &'static str {
@@ -1151,6 +1171,7 @@ mod tests {
             epub_document: None,
             resume: None,
             message: "Preparing".into(),
+            anchor_by_offset: false,
         });
         render_loading(&mut display, &state).unwrap();
     }

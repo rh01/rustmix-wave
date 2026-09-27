@@ -784,7 +784,7 @@ mod firmware {
         info!("rustmix-wave=voice-notes-organizer-controls-export-ready gain-persistence=SETTINGS.TXT metadata=META.TXT titles=friendly-sidecar filenames=fat83-wav recording-date-time=rtc-local storage=esp-vfs-fat-info delete-confirmation=true pause-resume=rx-discard export=wifi-transfer-shortcut");
         info!("rustmix-wave=offline-dictionary-x4-pack-native-foundation-ready root={DICTIONARY_ROOT} index=INDEX.TXT shards=DATA/*.JSN shard-max-bytes={DICTIONARY_SHARD_MAX_BYTES} lookup=exact-prefix-fallback wildcard=true ui=native-rust");
         info!("rustmix-wave=lexicon-vocab-ready root=/sdcard/RUSTMIX/LEXICON format=RMXLEX1 lists=RMXWLS1 vocab=/sdcard/RUSTMIX/VOCAB scheduler=fsrs6,sm2");
-        info!("rustmix-wave=weread-reader-ready root=/sdcard/RUSTMIX/WEREAD login=qr-web chapter=signed-e progress=web-upload offline=sd-text notes=official-gateway worker=weread-http stack-bytes={WEREAD_HTTP_WORKER_STACK_BYTES}");
+        info!("rustmix-wave=weread-reader-ready root=/sdcard/RUSTMIX/WEREAD login=qr-web chapter=signed-e progress=web-upload offline=sd-text notes=official-gateway worker=weread-http-long-lived stack-bytes={WEREAD_HTTP_WORKER_STACK_BYTES} stack-caps=psram download-retry=chapter font=reader-prefs");
         info!("rustmix-wave=dictionary-keyboard-boot-axis-navigation-ready short-press=boot toggle=horizontal,vertical default-axis=horizontal selected-key=preserved long-press=hierarchical-back helper=keyboard-grid-navigation");
         info!(
             "rustmix-wave=voice-notes-catalog status=completed notes={} root={VOICE_NOTES_ROOT}",

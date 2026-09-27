@@ -168,7 +168,7 @@ Reader writes use FAT 8.3-safe `.TMP` and `.BAK` siblings. Bookmarks retain byte
 /sdcard/RUSTMIX/WEREAD/<8HEX>/PROG.TXT
 ```
 
-The main loop runs at most one WeRead job per iteration, then returns to button polling. Login polls and whole-book downloads are separate jobs. Chapter bytes and images are heap allocations checked against a cap before `Vec` reserve; allocations above 16 KiB use PSRAM.
+The main loop runs at most one WeRead job per iteration, then returns to button polling. Login polls and whole-book downloads are separate jobs on one long-lived worker, so a chapter download does not allocate another pthread stack. That worker's stack is in PSRAM and does not call NVS or the SD card. Chapter bytes and images are heap allocations checked against a cap before `Vec` reserve; allocations above 16 KiB use PSRAM. A failed chapter is retried, then skipped, instead of stopping the book. The chapter view uses the TXT/EPUB font face and size, including SD faces from `/RUSTMIX/FONTS`.
 
 ## Voice Notes boundary
 
@@ -299,7 +299,7 @@ Heavy operations are deliberately moved away from the main task:
 | Full EPUB parse | short-lived `epub-parser` thread | 64 KiB worker stack | heap-owned bounded EPUB document |
 | EPUB title lookup during library scans | short-lived EPUB title thread | 32 KiB worker stack | compact title string |
 | HTTPS weather fetch | `runtime_worker::run_named_worker("weather-fetch", ...)` | 64 KiB worker stack, bounded 8 KiB response | parsed weather snapshot or classified error |
-| WeRead HTTPS job | `runtime_worker::NamedWorkerHandle::spawn("weread-http", ...)` polled from the main loop | 96 KiB worker stack, capped JSON/HTML/shard/image bodies | one login, shelf, chapter, progress, notes, or cover result |
+| WeRead HTTPS job | one long-lived `weread-http` thread, channel queue, polled from the main loop | 32 KiB PSRAM pthread stack (`esp_pthread_set_cfg` + `MALLOC_CAP_SPIRAM`), capped JSON/HTML/shard/image bodies, HTTP client cleaned up between jobs | one login, shelf, chapter, progress, notes, or cover result |
 | Lua app open | `runtime_worker::run_named_worker("lua-loader", ...)` | 32 KiB worker stack, bounded script size | compact native Lua session and canvas |
 | Wi-Fi transfer portal | ESP-IDF HTTP server task | 24 KiB task stack, 4 KiB streaming chunks, 64 MiB upload cap | compact lifecycle snapshot |
 | Voice Notes PCM record/playback | cooperative main-loop chunks | bounded I2S RX/TX buffers, streamed `.TMP` finalization | compact UI progress snapshots |
@@ -313,6 +313,7 @@ main-stack-high-water-bytes
 heap-free-internal-bytes
 heap-largest-internal-block-bytes
 heap-free-psram-bytes
+heap-largest-psram-block-bytes
 ```
 
 This makes memory pressure visible in monitor logs and prevents stack-heavy parsing, TLS, or Lua loading from silently consuming the main-loop stack.

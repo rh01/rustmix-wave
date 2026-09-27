@@ -1079,11 +1079,16 @@ impl AppState {
     /// Navigate one level toward Home. The hardware runtime calls this after a
     /// validated GPIO0 BOOT-button long press.
     fn apply_weread(&mut self, event: ButtonEvent) {
+        if self.router.current() == ScreenRoute::WeReadRead && self.weread.text_prefs {
+            self.apply_weread_text_prefs(event);
+            return;
+        }
         if event == ButtonEvent::Select {
             self.note_select_press();
         }
         let layout = self.reader.preferences.layout();
         let previous = self.router.current();
+        let opened_text = self.router.current() == ScreenRoute::WeReadRead;
         if let Some(route) = self
             .weread
             .on_button(previous, event, layout, self.storage.mounted)
@@ -1091,10 +1096,48 @@ impl AppState {
             self.router.navigate_to(route);
             self.weread.note_route(previous, route);
         }
+        if opened_text && self.weread.text_prefs {
+            self.reader.refresh_font_catalog();
+        }
+    }
+
+    fn apply_weread_text_prefs(&mut self, event: ButtonEvent) {
+        const ROWS: usize = 2;
+        match event {
+            ButtonEvent::Up => {
+                self.weread.text_pref_cursor = self
+                    .weread
+                    .text_pref_cursor
+                    .checked_sub(1)
+                    .unwrap_or(ROWS - 1);
+            }
+            ButtonEvent::Down => {
+                self.weread.text_pref_cursor = (self.weread.text_pref_cursor + 1) % ROWS;
+            }
+            ButtonEvent::Select => {
+                self.note_select_press();
+                if self.weread.text_pref_cursor == 0 {
+                    self.reader.cycle_shared_book_font_size();
+                } else {
+                    self.reader.cycle_shared_book_font();
+                }
+                let layout = self.reader.preferences.layout();
+                self.weread.repaginate(layout);
+                if let Some(message) = self.reader.last_message.clone() {
+                    self.weread.status = message;
+                }
+            }
+        }
     }
 
     pub fn back(&mut self) {
         let previous = self.router.current();
+        if self.router.current() == ScreenRoute::WeReadRead && self.weread.text_prefs {
+            self.weread.text_prefs = false;
+            let layout = self.reader.preferences.layout();
+            self.weread.repaginate(layout);
+            return;
+        }
         if self.router.current() == ScreenRoute::PowerKeyMenu {
             self.close_power_key_menu();
             return;
@@ -1584,6 +1627,37 @@ mod tests {
         assert_eq!(state.active_route(), ScreenRoute::ReaderPreferences);
         state.back();
         assert_eq!(state.active_route(), ScreenRoute::ReaderOptions);
+    }
+
+    #[test]
+    fn weread_chapter_select_reuses_reader_font_settings() {
+        use crate::reader::BookFontSize;
+
+        let mut state = AppState::default();
+        state.router.navigate_to(ScreenRoute::WeReadRead);
+        state.weread.chapter_source = "abcd ".repeat(80);
+        let layout = state.reader.preferences.layout();
+        state.weread.repaginate(layout);
+        let before = state.weread.pages.len();
+        state.apply(ButtonEvent::Select);
+        assert!(state.weread.text_prefs);
+        assert_eq!(state.active_route(), ScreenRoute::WeReadRead);
+        let size = state.reader.preferences.font_size;
+        state.apply(ButtonEvent::Select);
+        assert_eq!(state.reader.preferences.font_size, BookFontSize::Px32);
+        assert_ne!(state.reader.preferences.font_size, size);
+        assert_ne!(state.weread.pages.len(), before);
+        state.apply(ButtonEvent::Down);
+        state.apply(ButtonEvent::Select);
+        assert_ne!(
+            state.reader.preferences.book_font,
+            crate::reader::BookFont::Serif
+        );
+        state.back();
+        assert!(!state.weread.text_prefs);
+        assert_eq!(state.active_route(), ScreenRoute::WeReadRead);
+        state.back();
+        assert_eq!(state.active_route(), ScreenRoute::WeReadBook);
     }
     #[test]
     fn productivity_voice_notes_opens_recording_route_and_queues_start() {

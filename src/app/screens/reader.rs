@@ -619,6 +619,45 @@ pub fn render_preferences(
     )
 }
 
+/// Font face and size rows from the TXT/EPUB reading-preferences editor.
+///
+/// WeRead uses the same labels, values, and footer so both readers share one
+/// setting. Theme and orientation stay on the full preferences screen.
+pub fn render_weread_font_settings(
+    display: &mut OrientedFrameBuffer<'_>,
+    state: &AppState,
+) -> Result<(), Infallible> {
+    draw_header(
+        display,
+        state.display,
+        "READING PREFERENCES",
+        "FONT AND SIZE",
+    )?;
+    let rows = [ReadingPreference::BookFontSize, ReadingPreference::BookFont];
+    let font_label = state.reader.book_font_display_label();
+    for (index, preference) in rows.into_iter().enumerate() {
+        let badge = match preference {
+            ReadingPreference::BookFontSize => state.reader.preferences.font_size.label(),
+            ReadingPreference::BookFont => font_label.as_str(),
+            _ => "",
+        };
+        draw_row(
+            display,
+            state,
+            156 + index as i32 * 78,
+            state.weread.text_pref_cursor == index,
+            preference.label(),
+            badge,
+            "",
+        )?;
+    }
+    draw_footer(
+        display,
+        state.display,
+        "UP/DOWN MOVE  SELECT CHANGE  HOLD BOOT BACK",
+    )
+}
+
 pub fn render_toc(
     display: &mut OrientedFrameBuffer<'_>,
     state: &AppState,

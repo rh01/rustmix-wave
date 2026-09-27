@@ -2495,6 +2495,34 @@ impl ReaderUiState {
         self.request_layout_rebuild()
     }
 
+    /// Cycle the shared book font size and persist it without reopening a TXT/EPUB.
+    ///
+    /// WeRead reads the same preferences. An open local session keeps its page
+    /// cache and adopts the new layout metrics for later rebuilds.
+    pub fn cycle_shared_book_font_size(&mut self) {
+        self.preferences.font_size = self.preferences.font_size.next();
+        self.last_message = Some(format!(
+            "Book font size: {}",
+            self.preferences.font_size.label()
+        ));
+        self.persist_shared_typography();
+    }
+
+    /// Cycle the shared book face, including SD faces under `/RUSTMIX/FONTS`.
+    pub fn cycle_shared_book_font(&mut self) {
+        self.refresh_font_catalog();
+        self.cycle_book_font_choice();
+        self.last_message = Some(format!("Book font: {}", self.book_font_display_label()));
+        self.persist_shared_typography();
+    }
+
+    fn persist_shared_typography(&mut self) {
+        self.persist_preferences_best_effort();
+        if let Some(session) = self.session.as_mut() {
+            session.layout = self.preferences.layout();
+        }
+    }
+
     fn cycle_book_font_choice(&mut self) {
         let next = match self.preferences.book_font {
             BookFont::Inter => BookFont::AtkinsonHyperlegible,

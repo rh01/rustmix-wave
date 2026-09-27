@@ -38,6 +38,9 @@ pub const LOGIN_POLL_MS: u64 = 2_000;
 pub const LOGIN_TIMEOUT_MS: u64 = 180_000;
 pub const PROGRESS_DELAY_MS: u64 = 5_000;
 pub const HTTP_TIMEOUT_SECS: u64 = 20;
+/// First try plus two retries. A failed chapter does not cancel the book.
+pub const DOWNLOAD_ATTEMPTS: u8 = 3;
+pub const DOWNLOAD_RETRY_MS: u64 = 1_000;
 
 pub const WEREAD_ROOT: &str = "/sdcard/RUSTMIX/WEREAD";
 pub const WEREAD_CONFIG_PATH: &str = "/sdcard/RUSTMIX/WEREAD.TXT";

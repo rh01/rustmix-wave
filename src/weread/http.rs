@@ -1,15 +1,20 @@
-//! One bounded WeRead HTTPS job on a short-lived worker.
+//! One bounded WeRead HTTPS job on a single long-lived worker.
 //!
-//! The main loop polls the worker. Response bodies are allocated only after
-//! `Content-Length` is known to fit the job cap. Allocations above the internal
-//! heap threshold land in PSRAM. Every `Set-Cookie` is kept; the ESP-IDF Rust
+//! The main loop polls the worker. A channel carries each job so a chapter
+//! download does not call `pthread_create` again. The worker stack is allocated
+//! from PSRAM; this task must not touch NVS or the SD card (those run on the
+//! main task, whose stack stays in internal RAM). Response bodies are allocated
+//! only after `Content-Length` is known to fit the job cap. Allocations above
+//! the internal heap threshold land in PSRAM. The HTTP client is closed and
+//! cleaned up before the next job. Every `Set-Cookie` is kept; the ESP-IDF Rust
 //! client stores headers in a map and would drop all but the last.
 
 use std::{
     ffi::{CStr, CString},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        mpsc::{self, TryRecvError},
+        Arc, Mutex,
     },
     thread,
     time::Duration,
@@ -27,7 +32,8 @@ use esp_idf_svc::sys::{
 
 use crate::{
     reader::ReaderLayout,
-    runtime_worker::NamedWorkerHandle,
+    runtime_memory::log_runtime_memory,
+    runtime_worker::LongLivedWorker,
     weread::{
         body::BoundedBody,
         client::{self, Job, JobError, Report, Request, Response, Transport, Work},
@@ -37,7 +43,9 @@ use crate::{
     },
 };
 
-pub const WEREAD_HTTP_WORKER_STACK_BYTES: usize = 96 * 1024;
+/// PSRAM stack for the one `weread-http` thread. Large enough for one mbedTLS
+/// handshake, and not taken from the ~334 KiB internal heap on every chapter.
+pub const WEREAD_HTTP_WORKER_STACK_BYTES: usize = 32 * 1024;
 const MAX_SET_COOKIE_BYTES: usize = 4 * 1024;
 
 pub struct HttpJobs {
@@ -45,11 +53,22 @@ pub struct HttpJobs {
 }
 
 struct Inflight {
-    handle: NamedWorkerHandle<Report, String>,
+    reply: mpsc::Receiver<Report>,
     cancel: Arc<AtomicBool>,
     generation: u64,
     job: Job,
     session: session::Session,
+}
+
+struct QueuedJob {
+    work: Work,
+    unix: Option<u64>,
+    cancel: Arc<AtomicBool>,
+    seed: u64,
+}
+
+struct WorkerSlot {
+    worker: LongLivedWorker<QueuedJob, Report>,
 }
 
 impl Default for HttpJobs {
@@ -87,46 +106,156 @@ impl HttpJobs {
 }
 
 fn poll_report(job: &mut Inflight) -> Option<Report> {
-    let joined = job.handle.try_join()?;
-    Some(match joined {
-        Ok(report) => report,
-        Err(error) => Report {
-            generation: job.generation,
-            job: job.job.clone(),
-            session: job.session.clone(),
-            result: Err(JobError::Message(format!("WeRead worker failed: {error}"))),
-        },
-    })
+    match job.reply.try_recv() {
+        Ok(report) => Some(report),
+        Err(TryRecvError::Empty) => None,
+        Err(TryRecvError::Disconnected) => Some(error_report(
+            job.generation,
+            job.job.clone(),
+            job.session.clone(),
+            "WeRead worker stopped".into(),
+        )),
+    }
 }
 
 fn spawn_work(work: Work, unix: Option<u64>, cancel: Arc<AtomicBool>) -> Result<Inflight, Report> {
     let generation = work.generation;
     let job = work.job.clone();
     let session = work.session.clone();
-    let flag = Arc::clone(&cancel);
-    let seed = random_seed();
-    match NamedWorkerHandle::spawn("weread-http", WEREAD_HTTP_WORKER_STACK_BYTES, move || {
-        let mut transport = EspTransport {
-            gap: true,
-            cancel: flag,
-        };
-        Ok::<Report, String>(client::perform_with_seed(&mut transport, work, unix, seed))
-    }) {
-        Ok(handle) => Ok(Inflight {
-            handle,
+    let queued = QueuedJob {
+        work,
+        unix,
+        cancel: Arc::clone(&cancel),
+        seed: random_seed(),
+    };
+    match submit_job(queued) {
+        Ok(reply) => Ok(Inflight {
+            reply,
             cancel,
             generation,
             job,
             session,
         }),
-        Err(error) => Err(Report {
+        Err(error) => Err(error_report(
             generation,
             job,
             session,
-            result: Err(JobError::Message(format!(
-                "WeRead worker failed to start: {error}"
-            ))),
-        }),
+            format!("WeRead worker failed to start: {error}"),
+        )),
+    }
+}
+
+fn error_report(generation: u64, job: Job, session: session::Session, message: String) -> Report {
+    log_runtime_memory("weread-http-spawn-failed");
+    Report {
+        generation,
+        job,
+        session,
+        result: Err(JobError::Message(message)),
+    }
+}
+
+fn submit_job(mut job: QueuedJob) -> Result<mpsc::Receiver<Report>, String> {
+    for attempt in 0..2 {
+        let worker = {
+            let mut slot = worker_slot()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if slot.is_none() {
+                match start_worker() {
+                    Ok(worker) => *slot = Some(WorkerSlot { worker }),
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            slot.as_ref().unwrap().worker.clone()
+        };
+        match worker.submit(job) {
+            Ok(reply) => return Ok(reply),
+            Err(returned) => {
+                job = returned;
+                let mut slot = worker_slot()
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                *slot = None;
+                if attempt == 1 {
+                    return Err("Not enough memory".into());
+                }
+            }
+        }
+    }
+    Err("Not enough memory".into())
+}
+
+fn worker_slot() -> &'static Mutex<Option<WorkerSlot>> {
+    static SLOT: Mutex<Option<WorkerSlot>> = Mutex::new(None);
+    &SLOT
+}
+
+fn start_worker() -> Result<LongLivedWorker<QueuedJob, Report>, std::io::Error> {
+    log_runtime_memory("weread-http-spawn");
+    let _psram_stack = PsramStackGuard::enter(WEREAD_HTTP_WORKER_STACK_BYTES);
+    LongLivedWorker::spawn(
+        "weread-http",
+        WEREAD_HTTP_WORKER_STACK_BYTES,
+        |job: QueuedJob| {
+            log_runtime_memory("weread-http-before-job");
+            let report = {
+                let mut transport = EspTransport {
+                    gap: true,
+                    cancel: job.cancel,
+                };
+                let report =
+                    client::perform_with_seed(&mut transport, job.work, job.unix, job.seed);
+                drop(transport);
+                report
+            };
+            log::info!("rustmix-wave=weread-http status=client-released");
+            log_runtime_memory("weread-http-after-job");
+            report
+        },
+    )
+}
+
+/// Sets pthread stack caps for the duration of one `pthread_create`.
+///
+/// Restoring the previous config keeps weather, EPUB, and Lua workers on
+/// internal stacks. Those tasks touch the filesystem and NVS.
+struct PsramStackGuard {
+    restore: esp_idf_svc::sys::esp_pthread_cfg_t,
+}
+
+impl PsramStackGuard {
+    fn enter(stack_bytes: usize) -> Self {
+        unsafe {
+            let fallback = sys::esp_pthread_get_default_config();
+            let mut restore = fallback;
+            if sys::esp_pthread_get_cfg(&mut restore) != ESP_OK {
+                restore = fallback;
+            }
+            let mut cfg = restore;
+            cfg.stack_size = stack_bytes;
+            cfg.stack_alloc_caps = sys::MALLOC_CAP_SPIRAM | sys::MALLOC_CAP_8BIT;
+            cfg.inherit_cfg = false;
+            cfg.thread_name = c"weread-http".as_ptr();
+            if sys::esp_pthread_set_cfg(&cfg) == ESP_OK {
+                log::info!(
+                    "rustmix-wave=weread-http status=psram-stack stack-bytes={stack_bytes} caps=spiram"
+                );
+            } else {
+                log::warn!(
+                    "rustmix-wave=weread-http status=psram-stack-cfg-failed stack-bytes={stack_bytes} fallback=internal"
+                );
+            }
+            Self { restore }
+        }
+    }
+}
+
+impl Drop for PsramStackGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = sys::esp_pthread_set_cfg(&self.restore);
+        }
     }
 }
 

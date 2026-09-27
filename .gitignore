@@ -8,6 +8,8 @@
 *.sha256
 *.bin
 !src/fonts/*.bin
+!src/reader_hanzi_s2t.bin
+!src/reader_hanzi_t2s.bin
 *.elf
 
 # Python helper caches

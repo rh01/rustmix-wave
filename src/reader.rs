@@ -90,7 +90,10 @@ const READER_PERSISTENCE_VERSION: &str = "1";
 /// font, orientation, alignment). Version 4 adds letter spacing, line and
 /// paragraph spacing, margins, indent, justification, and Chinese script.
 /// Version 5 adds immersive reading, which changes the content box.
-const READER_CACHE_VERSION: &str = "5";
+/// Version 6 adds the SD CJK font file name.
+const READER_CACHE_VERSION: &str = "6";
+/// Page turns between full refreshes when dark mode is on and the cadence is Off.
+const DARK_MODE_FULL_REFRESH_TURNS: u8 = 5;
 /// How long a long-press status overlay stays on an immersive page.
 pub const IMMERSIVE_STATUS_MS: u64 = 2_500;
 /// Left and right inset while immersive. Top and bottom stay at the panel edge.
@@ -1120,6 +1123,7 @@ pub struct ReaderLayout {
     pub paragraph_alignment: ParagraphAlignment,
     pub chinese_script: crate::reader_hanzi::ChineseScript,
     pub immersive: bool,
+    pub sd_cjk_file: [u8; 13],
 }
 
 impl ReaderLayout {
@@ -1465,6 +1469,21 @@ impl ReaderPreferences {
             paragraph_alignment: self.paragraph_alignment,
             chinese_script: self.chinese_script,
             immersive: self.immersive,
+            sd_cjk_file: self.sd_cjk_file,
+        }
+    }
+
+    /// Full-refresh interval actually used. Dark mode still refreshes when the
+    /// user cadence is off, so white-on-black text does not ghost.
+    #[must_use]
+    pub const fn effective_full_refresh_turns(self) -> Option<u8> {
+        if let Some(turns) = self.full_refresh.turns() {
+            return Some(turns);
+        }
+        if self.dark_mode {
+            Some(DARK_MODE_FULL_REFRESH_TURNS)
+        } else {
+            None
         }
     }
 
@@ -1491,7 +1510,7 @@ impl ReaderPreferences {
             bool_marker(self.immersive),
             bool_marker(self.dark_mode),
             self.full_refresh.marker(),
-            bool_marker(self.status_page),
+            bool_marker(self.show_progress),
             bool_marker(self.status_page),
             bool_marker(self.status_chapter),
             bool_marker(self.status_time),
@@ -1502,7 +1521,7 @@ impl ReaderPreferences {
         )
     }
 
-    fn parse(text: &str) -> Result<Self, String> {
+    pub(crate) fn parse(text: &str) -> Result<Self, String> {
         let mut prefs = Self::default();
         let mut version = None;
         let mut saw_status_page = false;
@@ -1566,7 +1585,9 @@ impl ReaderPreferences {
                     prefs.long_press_chapter = parse_bool("long_press_chapter", value)?
                 }
                 "auto_page_turn" => prefs.auto_page_turn = AutoPageTurn::parse(value)?,
-                other => return Err(format!("unsupported Reader preference key {other:?}")),
+                other => {
+                    log::info!("rustmix-wave=reader-prefs status=ignored-key key={other}");
+                }
             }
         }
         match version.as_deref() {
@@ -3654,7 +3675,7 @@ impl ReaderUiState {
 
     /// Count a successful page turn and request a full refresh every N turns.
     pub fn note_page_turn(&mut self) {
-        let Some(every) = self.preferences.full_refresh.turns() else {
+        let Some(every) = self.preferences.effective_full_refresh_turns() else {
             self.turns_since_refresh = 0;
             return;
         };
@@ -5135,6 +5156,7 @@ fn book_fingerprint(book: &ReaderBook, layout: ReaderLayout) -> u64 {
     feed_cache_bytes(&mut hash, layout.orientation.marker().as_bytes());
     feed_cache_bytes(&mut hash, layout.font_size.marker().as_bytes());
     feed_cache_bytes(&mut hash, layout.book_font.marker().as_bytes());
+    feed_cache_bytes(&mut hash, &layout.sd_cjk_file);
     feed_cache_bytes(&mut hash, layout.paragraph_alignment.marker().as_bytes());
     feed_layout_preferences(&mut hash, &layout);
     feed_cache_bytes(&mut hash, READER_CACHE_VERSION.as_bytes());
@@ -6944,7 +6966,7 @@ mod tests {
             chapter_cache_fingerprint(&book, base.layout(), 1, 0, 40),
             chapter_cache_fingerprint(&book, tracked.layout(), 1, 0, 40)
         );
-        assert_eq!(READER_CACHE_VERSION, "5");
+        assert_eq!(READER_CACHE_VERSION, "6");
     }
 
     #[test]
@@ -6956,7 +6978,7 @@ mod tests {
             size_bytes: 40,
             modified_seconds: 1,
         };
-        for version in ["3", "4"] {
+        for version in ["3", "4", "5"] {
             let text = format!(
                 "version={version}\nfingerprint=0000000000000001\nbase_page=0\nindexed_through=1\ncomplete=false\noffset=0\n"
             );
@@ -7007,6 +7029,20 @@ mod tests {
             ..ReaderPreferences::default()
         };
         assert!(landscape.layout().max_line_width_px > layout.max_line_width_px);
+        let mut sd_one = ReaderPreferences::default();
+        sd_one.book_font = BookFont::SdCjk;
+        sd_one.set_sd_cjk_file_name(Some("ONE.BIN"));
+        let mut sd_two = sd_one;
+        sd_two.set_sd_cjk_file_name(Some("TWO.BIN"));
+        assert_ne!(sd_one.layout().sd_cjk_file, sd_two.layout().sd_cjk_file);
+        assert_ne!(
+            ReaderUiState::cache_file_name_for(&book, sd_one.layout()),
+            ReaderUiState::cache_file_name_for(&book, sd_two.layout())
+        );
+        assert_ne!(
+            chapter_cache_fingerprint(&book, sd_one.layout(), 0, 0, 40),
+            chapter_cache_fingerprint(&book, sd_two.layout(), 0, 0, 40)
+        );
         assert!(show_immersive_status(ButtonEvent::Select, 600, true));
         assert!(!show_immersive_status(ButtonEvent::Select, 599, true));
         assert!(!show_immersive_status(ButtonEvent::Select, 900, false));
@@ -7056,6 +7092,20 @@ mod tests {
         assert_eq!(modern.paragraph_alignment, ParagraphAlignment::Center);
         assert!(modern.immersive);
         assert!(modern.dark_mode);
+        assert!(modern.serialized().contains("\nshow_progress=true\n"));
+        assert!(modern.serialized().contains("\nstatus_page=true\n"));
+        let mut split = ReaderPreferences::default();
+        split.show_progress = false;
+        split.status_page = true;
+        let stored = split.serialized();
+        assert!(stored.contains("\nshow_progress=false\n"));
+        assert!(stored.contains("\nstatus_page=true\n"));
+        let base = ReaderPreferences::default().serialized();
+        let with_unknown = format!("{base}future_setting=1\n");
+        assert_eq!(
+            ReaderPreferences::parse(&with_unknown).unwrap(),
+            ReaderPreferences::parse(&base).unwrap()
+        );
         assert!(modern.status_time);
         assert!(!modern.status_chapter);
         assert!(modern.swap_page_keys);
@@ -7115,6 +7165,25 @@ mod tests {
         assert!(reader.take_clear_ghost_request());
         reader.note_page_turn();
         assert!(!reader.take_clear_ghost_request());
+
+        reader.preferences.full_refresh = FullRefreshEvery::Off;
+        reader.preferences.dark_mode = false;
+        reader.note_page_turn();
+        assert!(!reader.take_clear_ghost_request());
+        reader.preferences.dark_mode = true;
+        for _ in 0..4 {
+            reader.note_page_turn();
+        }
+        assert!(!reader.take_clear_ghost_request());
+        reader.note_page_turn();
+        assert!(reader.take_clear_ghost_request());
+        reader.preferences.full_refresh = FullRefreshEvery::Turns10;
+        for _ in 0..9 {
+            reader.note_page_turn();
+        }
+        assert!(!reader.take_clear_ghost_request());
+        reader.note_page_turn();
+        assert!(reader.take_clear_ghost_request());
 
         let clock = AutoTurnClock::new(1_000);
         assert!(!clock.due(15_999, AutoPageTurn::Secs15));

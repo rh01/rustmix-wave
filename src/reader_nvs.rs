@@ -1,9 +1,11 @@
-//! Optional NVS mirror of Reader font and letter-spacing preferences.
+//! Optional NVS mirror of Reader preferences.
 //!
 //! SD `/RUSTMIX/READER/PREFS.TXT` remains authoritative. NVS is a fallback when
 //! the card is missing and a boot-time restore source after a prefs parse error.
-//! The Wi-Fi stack already owns `EspDefaultNvsPartition::take()`, so this
-//! module uses the C NVS API on a private namespace.
+//! The full serialized document is stored so every preference survives, including
+//! fields added after the original font and letter-spacing keys. The Wi-Fi stack
+//! already owns `EspDefaultNvsPartition::take()`, so this module uses the C NVS
+//! API on a private namespace.
 
 use crate::reader::ReaderPreferences;
 
@@ -18,6 +20,28 @@ const KEY_FONT_SIZE: &str = "font_px";
 const KEY_BOOK_FONT: &str = "font_face";
 #[allow(dead_code)]
 const KEY_LETTER_SPACING: &str = "letter_px";
+#[allow(dead_code)]
+const KEY_PREFS_DOCUMENT: &str = "prefs";
+#[allow(dead_code)]
+const NVS_DOCUMENT_BYTES: usize = 1536;
+
+/// Serialized preferences stored under the NVS `prefs` key.
+#[must_use]
+pub fn nvs_preferences_document(prefs: &ReaderPreferences) -> String {
+    prefs.serialized()
+}
+
+/// Restore every field from an NVS document. Unknown keys inside it are ignored.
+#[must_use]
+pub fn apply_nvs_preferences_document(prefs: &mut ReaderPreferences, document: &str) -> bool {
+    match ReaderPreferences::parse(document) {
+        Ok(parsed) => {
+            *prefs = parsed;
+            true
+        }
+        Err(_) => false,
+    }
+}
 
 pub fn save_reader_preferences(prefs: &ReaderPreferences) {
     #[cfg(target_os = "espidf")]
@@ -60,8 +84,12 @@ fn save_espidf(prefs: &ReaderPreferences) {
         let size_key = CString::new(KEY_FONT_SIZE).expect("nvs size key");
         let face_key = CString::new(KEY_BOOK_FONT).expect("nvs face key");
         let spacing_key = CString::new(KEY_LETTER_SPACING).expect("nvs spacing key");
+        let prefs_key = CString::new(KEY_PREFS_DOCUMENT).expect("nvs prefs key");
         let face = CString::new(prefs.nvs_face_marker())
             .unwrap_or_else(|_| CString::new("serif").unwrap());
+        if let Ok(document) = CString::new(nvs_preferences_document(prefs)) {
+            let _ = nvs_set_str(handle, prefs_key.as_ptr(), document.as_ptr());
+        }
         let _ = nvs_set_i32(
             handle,
             size_key.as_ptr(),
@@ -98,6 +126,24 @@ fn load_espidf(prefs: &mut ReaderPreferences) -> bool {
         let ns = CString::new(NVS_NAMESPACE).expect("nvs namespace");
         if nvs_open(ns.as_ptr(), nvs_open_mode_t_NVS_READONLY, &mut handle) != ESP_OK {
             return false;
+        }
+        let prefs_key = CString::new(KEY_PREFS_DOCUMENT).expect("nvs prefs key");
+        let mut document = [0u8; NVS_DOCUMENT_BYTES];
+        let mut document_len = document.len();
+        if nvs_get_str(
+            handle,
+            prefs_key.as_ptr(),
+            document.as_mut_ptr(),
+            &mut document_len,
+        ) == ESP_OK
+        {
+            let end = document_len.saturating_sub(1).min(document.len());
+            if let Ok(text) = core::str::from_utf8(&document[..end]) {
+                if apply_nvs_preferences_document(prefs, text) {
+                    nvs_close(handle);
+                    return true;
+                }
+            }
         }
         let mut px: i32 = 0;
         let size_key = CString::new(KEY_FONT_SIZE).expect("nvs size key");
@@ -138,12 +184,38 @@ fn load_espidf(prefs: &mut ReaderPreferences) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::load_reader_preferences_overlay;
-    use crate::reader::ReaderPreferences;
+    use super::{
+        apply_nvs_preferences_document, load_reader_preferences_overlay, nvs_preferences_document,
+    };
+    use crate::reader::{BookFont, BookFontSize, LetterSpacing, LineSpacing, ReaderPreferences};
 
     #[test]
     fn host_nvs_overlay_is_a_no_op() {
         let mut prefs = ReaderPreferences::default();
         assert!(!load_reader_preferences_overlay(&mut prefs));
+    }
+
+    #[test]
+    fn nvs_document_round_trips_every_preference_and_skips_unknown_keys() {
+        let mut prefs = ReaderPreferences::default();
+        prefs.book_font = BookFont::SdCjk;
+        prefs.set_sd_cjk_file_name(Some("CJK.BIN"));
+        prefs.font_size = BookFontSize::Px32;
+        prefs.letter_spacing = LetterSpacing::Px2;
+        prefs.line_spacing = LineSpacing::Px8;
+        prefs.immersive = true;
+        prefs.dark_mode = true;
+        prefs.show_progress = false;
+        prefs.status_page = false;
+        let document = nvs_preferences_document(&prefs);
+        assert!(document.len() < 1536);
+        assert!(document.contains("show_progress=false"));
+        assert!(document.contains("status_page=false"));
+        let mut loaded = ReaderPreferences::default();
+        assert!(apply_nvs_preferences_document(
+            &mut loaded,
+            &format!("{document}future_setting=1\n")
+        ));
+        assert_eq!(loaded, prefs);
     }
 }

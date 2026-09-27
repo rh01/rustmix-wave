@@ -1,13 +1,21 @@
 //! Display-time Traditional/Simplified conversion.
 //!
-//! The mapping is a compact flash table of one-to-one pairs. It is not copied
-//! into PSRAM. Conversion happens while a page is drawn and does not change
-//! byte offsets. The selected script is still part of the layout cache
-//! fingerprint, so a script change names a different TXT or EPUB chapter
-//! cache. The embedded face is a GB2312 subset, so pairs whose traditional
-//! form is outside that face are omitted rather than drawn as a missing glyph.
+//! The tables are the first candidate from OpenCC `STCharacters.txt` and
+//! `TSCharacters.txt` (Apache-2.0, <https://github.com/BYVoid/OpenCC>), packed
+//! as sorted little-endian `(source, target)` code points in `.rodata`. Lookup
+//! is a binary search. The tables are not copied into PSRAM. Conversion happens
+//! while a page is drawn and does not change byte offsets. A target the
+//! embedded GB2312 face cannot draw is left as the original character.
+//!
+//! The selected script is part of the layout cache fingerprint, so a script
+//! change names a different TXT or EPUB chapter cache.
 
 use crate::fonts;
+
+/// Simplified to traditional, first OpenCC candidate.
+static SIMP_TO_TRAD: &[u8] = include_bytes!("reader_hanzi_s2t.bin");
+/// Traditional to simplified, first OpenCC candidate.
+static TRAD_TO_SIMP: &[u8] = include_bytes!("reader_hanzi_t2s.bin");
 
 /// Display script. Original leaves the book text unchanged.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -56,93 +64,105 @@ impl ChineseScript {
     }
 }
 
-/// Simplified character, then its traditional counterpart.
-///
-/// The embedded Unifont is a GB2312 subset. Most traditional code points
-/// (國, 書, 學, …) are absent, so those pairs are not stored: converting them
-/// would draw a missing glyph. Each pair below is present on both sides.
-const MAP: &[(char, char)] = &[
-    ('于', '於'),
-    ('伙', '夥'),
-    ('后', '後'),
-    ('干', '乾'),
-    ('折', '摺'),
-    ('征', '徵'),
-];
-
 /// Convert one line for display. Unmapped characters, including Latin, stay.
 #[must_use]
 pub fn convert(text: &str, script: ChineseScript) -> String {
     match script {
         ChineseScript::Original => text.to_string(),
-        ChineseScript::Simplified => map_chars(text, false),
-        ChineseScript::Traditional => map_chars(text, true),
+        ChineseScript::Simplified => map_chars(text, TRAD_TO_SIMP),
+        ChineseScript::Traditional => map_chars(text, SIMP_TO_TRAD),
     }
 }
 
-fn map_chars(text: &str, to_traditional: bool) -> String {
+fn map_chars(text: &str, table: &[u8]) -> String {
     text.chars()
-        .map(|character| map_one(character, to_traditional))
+        .map(|character| map_one(character, table))
         .collect()
 }
 
-fn map_one(character: char, to_traditional: bool) -> char {
-    let mapped = if to_traditional {
-        MAP.iter()
-            .find(|(simplified, _)| *simplified == character)
-            .map(|(_, traditional)| *traditional)
-    } else {
-        MAP.iter()
-            .find(|(_, traditional)| *traditional == character)
-            .map(|(simplified, _)| *simplified)
+fn map_one(character: char, table: &[u8]) -> char {
+    let Some(target) = lookup(table, character as u32) else {
+        return character;
     };
-    match mapped {
+    match char::from_u32(target) {
         Some(next) if fonts::gb2312_contains(next) => next,
         _ => character,
     }
 }
 
+fn lookup(table: &[u8], source: u32) -> Option<u32> {
+    let records = table.len() / 8;
+    let mut low = 0usize;
+    let mut high = records;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let offset = mid * 8;
+        let key = read_u32(table, offset);
+        match key.cmp(&source) {
+            core::cmp::Ordering::Less => low = mid + 1,
+            core::cmp::Ordering::Greater => high = mid,
+            core::cmp::Ordering::Equal => return Some(read_u32(table, offset + 4)),
+        }
+    }
+    None
+}
+
+fn read_u32(table: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        table[offset],
+        table[offset + 1],
+        table[offset + 2],
+        table[offset + 3],
+    ])
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{convert, ChineseScript, MAP};
+    use super::{convert, lookup, read_u32, ChineseScript, SIMP_TO_TRAD, TRAD_TO_SIMP};
+
+    fn assert_sorted(table: &[u8]) {
+        assert_eq!(table.len() % 8, 0);
+        let records = table.len() / 8;
+        for index in 1..records {
+            let previous = read_u32(table, (index - 1) * 8);
+            let current = read_u32(table, index * 8);
+            assert!(previous < current);
+        }
+    }
 
     #[test]
-    fn conversion_is_one_to_one_and_gb2312_renderable() {
-        assert!(MAP.len() >= 6, "mapping table should stay useful");
-        let mut missing = String::new();
-        for (simplified, traditional) in MAP {
-            assert_ne!(simplified, traditional);
-            if !crate::fonts::gb2312_contains(*simplified) {
-                missing.push_str(&format!("S:{simplified} "));
-            }
-            if !crate::fonts::gb2312_contains(*traditional) {
-                missing.push_str(&format!("T:{traditional} "));
-            }
+    fn opencc_tables_are_sorted_and_cover_common_characters() {
+        assert!(SIMP_TO_TRAD.len() / 8 >= 3_800);
+        assert!(TRAD_TO_SIMP.len() / 8 >= 3_200);
+        assert_sorted(SIMP_TO_TRAD);
+        assert_sorted(TRAD_TO_SIMP);
+        assert_eq!(lookup(SIMP_TO_TRAD, '国' as u32), Some('國' as u32));
+        assert_eq!(lookup(SIMP_TO_TRAD, '后' as u32), Some('後' as u32));
+        assert_eq!(lookup(SIMP_TO_TRAD, '干' as u32), Some('幹' as u32));
+        assert_eq!(lookup(TRAD_TO_SIMP, '國' as u32), Some('国' as u32));
+        assert_eq!(lookup(TRAD_TO_SIMP, '後' as u32), Some('后' as u32));
+        let supplementary = (0..SIMP_TO_TRAD.len() / 8)
+            .map(|index| read_u32(SIMP_TO_TRAD, index * 8))
+            .find(|code| *code > 0xFFFF);
+        let supplementary = supplementary.expect("OpenCC extension characters");
+        assert!(lookup(SIMP_TO_TRAD, supplementary).is_some());
+    }
+
+    #[test]
+    fn conversion_keeps_characters_the_font_cannot_draw() {
+        assert!(!crate::fonts::gb2312_contains('國'));
+        assert_eq!(convert("国", ChineseScript::Traditional), "国");
+        assert_eq!(convert("国ABC", ChineseScript::Traditional), "国ABC");
+        let traditional = convert("后", ChineseScript::Traditional);
+        if crate::fonts::gb2312_contains('後') {
+            assert_eq!(traditional, "後");
+            assert_eq!(convert("後", ChineseScript::Simplified), "后");
+        } else {
+            assert_eq!(traditional, "后");
         }
-        assert!(missing.is_empty(), "outside GB2312 Unifont: {missing}");
-        for (simplified, traditional) in MAP {
-            let simplified_text = simplified.to_string();
-            let traditional_text = traditional.to_string();
-            assert_eq!(
-                convert(&simplified_text, ChineseScript::Traditional),
-                traditional_text
-            );
-            assert_eq!(
-                convert(&traditional_text, ChineseScript::Simplified),
-                simplified_text
-            );
-            assert_eq!(
-                convert(&simplified_text, ChineseScript::Original),
-                simplified_text
-            );
-            assert_eq!(
-                convert(&simplified_text, ChineseScript::Traditional)
-                    .chars()
-                    .count(),
-                1
-            );
-        }
+        assert_eq!(traditional.chars().count(), 1);
         assert_eq!(convert("ABC 中", ChineseScript::Traditional), "ABC 中");
+        assert_eq!(convert("后", ChineseScript::Original), "后");
         assert_eq!(ChineseScript::Original.next(), ChineseScript::Simplified);
         assert_eq!(
             ChineseScript::parse("zh-tw").unwrap(),

@@ -510,9 +510,10 @@ pub fn save_chapter(root: &Path, book_id: &str, chapter: &CachedChapter) -> Resu
     if body.len() > MAX_CHAPTER_TEXT + 1024 {
         return Err("chapter cache exceeds the size limit".into());
     }
+    // `CHAP.TMP` belongs to a streaming download the main task may be writing.
     atomic_write(
         &dir.join(&name),
-        &dir.join("CHAP.TMP"),
+        &dir.join("TEXT.TMP"),
         &dir.join("CHAP.BAK"),
         body.as_bytes(),
     )

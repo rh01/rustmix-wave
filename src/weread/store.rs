@@ -4,14 +4,22 @@
 //! 16 KB main stack. A smashed frame there shows up as `InstrFetchProhibited`
 //! with a return address of 1 and `.TMP` left in a register. This thread does
 //! that work instead. Its stack is internal RAM: the jobs call FATFS, and a
-//! PSRAM stack must not. The caller waits on a channel. `JoinHandle::join` is
-//! never used, so a dead worker is a failed save rather than a main-task panic.
+//! PSRAM stack must not. `JoinHandle::join` is never used, so a dead worker
+//! is a failed save rather than a main-task panic.
+//!
+//! There is only ever one store thread. A caller that stops waiting does not
+//! start a second one; later jobs queue behind the late job, so `CHAP.TMP`,
+//! `TEXT.TMP`, and `IMG.TMP` have one writer. [`busy`] stays true until that
+//! queue drains, and the HTTP poller does not open a new download temp file on
+//! the main task while it is. Download commits and chapter saves are polled or
+//! queued; only the reads the page render needs (load, paginate, image refs)
+//! wait, bounded by [`STORE_TIMEOUT`].
 
 use std::{
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     sync::{mpsc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(test)]
@@ -28,6 +36,7 @@ use crate::{
 
 const STORE_WORKER_STACK_BYTES: usize = 32 * 1024;
 const STORE_TIMEOUT: Duration = Duration::from_secs(20);
+const STORE_IDLE_EXIT: Duration = Duration::from_secs(10);
 
 enum StoreJob {
     Pages {
@@ -57,6 +66,8 @@ enum StoreJob {
     },
     #[cfg(test)]
     ThreadId,
+    #[cfg(test)]
+    Hold(mpsc::Receiver<()>),
 }
 
 enum StoreReply {
@@ -69,31 +80,43 @@ enum StoreReply {
     ThreadId(ThreadId),
 }
 
-fn slot() -> &'static Mutex<Option<LongLivedWorker<StoreJob, StoreReply>>> {
-    static SLOT: Mutex<Option<LongLivedWorker<StoreJob, StoreReply>>> = Mutex::new(None);
+type StoreWorker = LongLivedWorker<StoreJob, StoreReply>;
+
+fn slot() -> &'static Mutex<Option<StoreWorker>> {
+    static SLOT: Mutex<Option<StoreWorker>> = Mutex::new(None);
     &SLOT
 }
 
-fn reset_worker() {
+fn worker() -> Result<StoreWorker, String> {
     let mut guard = slot()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *guard = None;
+    if let Some(worker) = guard.as_ref() {
+        if worker.is_alive() {
+            return Ok(worker.clone());
+        }
+    }
+    log::info!("rustmix-wave=weread-store status=starting stack-bytes={STORE_WORKER_STACK_BYTES}");
+    let spawned = LongLivedWorker::spawn_with_idle_exit(
+        "weread-store",
+        STORE_WORKER_STACK_BYTES,
+        Some(STORE_IDLE_EXIT),
+        handle_job,
+    )
+    .map_err(|error| format!("WeRead store worker start failed: {error}"))?;
+    *guard = Some(spawned.clone());
+    Ok(spawned)
 }
 
-fn worker() -> Result<LongLivedWorker<StoreJob, StoreReply>, String> {
-    let mut guard = slot()
+/// True while any store job is queued or running, including one whose caller
+/// already gave up. New download temp files must not be opened until then.
+#[must_use]
+pub fn busy() -> bool {
+    slot()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if guard.is_none() {
-        log::info!(
-            "rustmix-wave=weread-store status=starting stack-bytes={STORE_WORKER_STACK_BYTES}"
-        );
-        let spawned = LongLivedWorker::spawn("weread-store", STORE_WORKER_STACK_BYTES, handle_job)
-            .map_err(|error| format!("WeRead store worker start failed: {error}"))?;
-        *guard = Some(spawned);
-    }
-    Ok(guard.as_ref().unwrap().clone())
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .is_some_and(|worker| worker.is_alive() && worker.outstanding() > 0)
 }
 
 fn handle_job(job: StoreJob) -> StoreReply {
@@ -105,6 +128,8 @@ fn handle_job(job: StoreJob) -> StoreReply {
         StoreJob::ImageRefs { .. } => 4,
         #[cfg(test)]
         StoreJob::ThreadId => 5,
+        #[cfg(test)]
+        StoreJob::Hold(_) => 5,
     };
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| match job {
         StoreJob::Pages {
@@ -119,7 +144,13 @@ fn handle_job(job: StoreJob) -> StoreReply {
             root,
             book_id,
             chapter,
-        } => StoreReply::Save(offline::save_chapter(&root, &book_id, &chapter)),
+        } => {
+            let result = offline::save_chapter(&root, &book_id, &chapter);
+            if let Err(error) = &result {
+                log::warn!("rustmix-wave=weread-store status=save-failed error={error}");
+            }
+            StoreReply::Save(result)
+        }
         StoreJob::Commit {
             download,
             succeeded,
@@ -137,6 +168,11 @@ fn handle_job(job: StoreJob) -> StoreReply {
         } => StoreReply::ImageRefs(offline::chapter_image_refs(&root, &book_id, index)),
         #[cfg(test)]
         StoreJob::ThreadId => StoreReply::ThreadId(std::thread::current().id()),
+        #[cfg(test)]
+        StoreJob::Hold(release) => {
+            let _ = release.recv();
+            StoreReply::ThreadId(std::thread::current().id())
+        }
     }));
     match result {
         Ok(reply) => reply,
@@ -153,24 +189,63 @@ fn handle_job(job: StoreJob) -> StoreReply {
     }
 }
 
+/// Queue a job on the one store thread. A thread that exited while idle is
+/// replaced; a live one is always reused.
+fn queue(mut job: StoreJob) -> Result<mpsc::Receiver<StoreReply>, String> {
+    for _ in 0..2 {
+        match worker()?.submit(job) {
+            Ok(inbox) => return Ok(inbox),
+            Err(returned) => job = returned,
+        }
+    }
+    Err("WeRead store worker stopped".into())
+}
+
 fn submit(job: StoreJob) -> Result<StoreReply, String> {
-    let worker = worker()?;
-    let inbox = match worker.submit(job) {
-        Ok(inbox) => inbox,
-        Err(_) => {
-            reset_worker();
-            return Err("WeRead store worker stopped".into());
-        }
-    };
-    match inbox.recv_timeout(STORE_TIMEOUT) {
+    match queue(job)?.recv_timeout(STORE_TIMEOUT) {
         Ok(reply) => Ok(reply),
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            reset_worker();
-            Err("WeRead store worker timed out".into())
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            reset_worker();
-            Err("WeRead store worker stopped".into())
+        Err(mpsc::RecvTimeoutError::Timeout) => Err("WeRead store worker timed out".into()),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err("WeRead store worker stopped".into()),
+    }
+}
+
+/// A download commit running on the store thread. The HTTP poller checks it
+/// once per main-loop pass instead of waiting.
+pub struct CommitJob {
+    inbox: mpsc::Receiver<StoreReply>,
+    started: Instant,
+}
+
+impl CommitJob {
+    pub fn start(
+        download: impl Into<CardDownload>,
+        succeeded: bool,
+        write_error: Option<String>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            inbox: queue(StoreJob::Commit {
+                download: download.into(),
+                succeeded,
+                write_error,
+            })?,
+            started: Instant::now(),
+        })
+    }
+
+    /// `None` while the commit is still running.
+    pub fn poll(&self) -> Option<Result<(), String>> {
+        match self.inbox.try_recv() {
+            Ok(StoreReply::Commit(result)) => Some(result),
+            Ok(_) => Some(Err(
+                "WeRead store worker returned an unexpected result".into()
+            )),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Some(Err("WeRead store worker stopped".into()))
+            }
+            Err(mpsc::TryRecvError::Empty) if self.started.elapsed() >= STORE_TIMEOUT => {
+                Some(Err("SD card write timed out".into()))
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
         }
     }
 }
@@ -201,18 +276,33 @@ pub fn save_chapter(root: &Path, book_id: &str, chapter: &CachedChapter) -> Resu
     }
 }
 
+/// Queue a chapter save and return without waiting. The store thread logs a
+/// failed write; the chapter is fetched again the next time it is opened.
+pub fn queue_save_chapter(
+    root: &Path,
+    book_id: &str,
+    chapter: CachedChapter,
+) -> Result<(), String> {
+    queue(StoreJob::Save {
+        root: root.to_path_buf(),
+        book_id: book_id.to_string(),
+        chapter,
+    })
+    .map(drop)
+}
+
+/// Commit a finished download and wait. The device polls [`CommitJob`].
 pub fn complete_download(
     download: impl Into<CardDownload>,
     succeeded: bool,
     write_error: Option<String>,
 ) -> Result<(), String> {
-    match submit(StoreJob::Commit {
-        download: download.into(),
-        succeeded,
-        write_error,
-    })? {
-        StoreReply::Commit(result) => result,
-        _ => Err("WeRead store worker returned an unexpected result".into()),
+    let job = CommitJob::start(download, succeeded, write_error)?;
+    loop {
+        if let Some(result) = job.poll() {
+            return result;
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -242,7 +332,7 @@ pub fn chapter_image_refs(root: &Path, book_id: &str, index: u32) -> Vec<ImageRe
 mod tests {
     use std::{fs, thread};
 
-    use super::{submit, StoreJob, StoreReply};
+    use super::{queue, submit, StoreJob, StoreReply};
     use crate::{
         reader::ReaderPreferences,
         weread::{
@@ -287,7 +377,7 @@ mod tests {
         )
         .unwrap();
         let book = offline::book_dir(&dir, "43208843");
-        assert!(!book.join("CHAP.TMP").exists());
+        assert!(!book.join("TEXT.TMP").exists());
         let loaded = store::load_chapter(&dir, "43208843", 2).unwrap();
         assert!(loaded.text.contains("saved off the caller"));
 
@@ -301,6 +391,37 @@ mod tests {
         assert!(offline::chapter_cached(&dir, "43208843", 3));
         assert!(!book.join("CHAP.TMP").exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_late_job_keeps_the_one_store_thread_and_holds_busy() {
+        let (release, hold) = std::sync::mpsc::channel();
+        let held = queue(StoreJob::Hold(hold)).unwrap();
+        assert!(store::busy());
+        let late = queue(StoreJob::ThreadId).unwrap();
+        assert!(late
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
+        assert!(
+            store::busy(),
+            "an abandoned job must keep new temp files closed"
+        );
+        release.send(()).unwrap();
+        let StoreReply::ThreadId(first) = held.recv().unwrap() else {
+            panic!("hold job did not report its thread");
+        };
+        let StoreReply::ThreadId(second) = late.recv().unwrap() else {
+            panic!("queued job did not report its thread");
+        };
+        assert_eq!(
+            first, second,
+            "a timed-out caller must not start a second writer"
+        );
+        let started = std::time::Instant::now();
+        while store::busy() {
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            thread::sleep(std::time::Duration::from_millis(2));
+        }
     }
 
     #[test]

@@ -279,6 +279,19 @@ impl WereadUi {
         self.busy || matches!(self.phase, Phase::Login | Phase::Download) || self.pending.is_some()
     }
 
+    /// The queued job opens a download temp file on the SD card. The poller
+    /// holds it while the store thread still has a commit or save running.
+    #[must_use]
+    pub fn next_job_writes_card(&self) -> bool {
+        matches!(
+            self.pending,
+            Some(Job::Chapter {
+                fetch_images: false,
+                ..
+            }) | Some(Job::ChapterImage { .. })
+        )
+    }
+
     /// True while a shelf, login, chapter, download, or progress upload still needs Wi-Fi.
     ///
     /// A download stays true for the whole book, including the pause between
@@ -1534,16 +1547,17 @@ impl WereadUi {
                 }
                 if mounted {
                     if let Some(chapter) = self.chapters.get(self.chapter_pos) {
-                        let saved = store::save_chapter(
-                            &sd_root(),
-                            &self.book_id,
-                            &CachedChapter {
-                                uid: chapter.uid.clone(),
-                                index: chapter.index,
-                                title: chapter.title.clone(),
-                                text,
-                            },
-                        );
+                        let cached = CachedChapter {
+                            uid: chapter.uid.clone(),
+                            index: chapter.index,
+                            title: chapter.title.clone(),
+                            text,
+                        };
+                        let saved = if downloading {
+                            store::save_chapter(&sd_root(), &self.book_id, &cached)
+                        } else {
+                            store::queue_save_chapter(&sd_root(), &self.book_id, cached)
+                        };
                         crate::runtime_memory::log_main_stack_high_water("weread-chapter-commit");
                         if let Err(error) = saved {
                             if downloading {

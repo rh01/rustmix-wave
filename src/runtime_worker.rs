@@ -7,7 +7,10 @@
 use core::fmt::{self, Display};
 use std::{
     io,
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -169,19 +172,50 @@ struct JobEnvelope<J, R> {
     reply: mpsc::Sender<R>,
 }
 
-/// One thread that accepts jobs until the last sender is dropped.
+/// Liveness and queue depth shared by a [`LongLivedWorker`] and its thread.
+struct WorkerShared {
+    /// False once the thread has stopped taking jobs. Guarded by the same
+    /// lock `submit` holds while sending, so a job is never queued to a thread
+    /// that is about to exit.
+    alive: Mutex<bool>,
+    /// Jobs queued or running. The owner reads this to refuse work that would
+    /// touch the same files while an older job is still on the thread.
+    outstanding: AtomicUsize,
+}
+
+struct AliveGuard(Arc<WorkerShared>);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        *self
+            .0
+            .alive
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+    }
+}
+
+/// One thread that accepts jobs in order.
+///
+/// There is never more than one thread per worker. A caller that stops
+/// waiting for a reply does not start another thread: the old job keeps
+/// running and later jobs queue behind it, so file writes stay serial. With
+/// `idle_exit` the thread exits after that long with nothing queued; its
+/// stack is freed and the owner spawns a new one on the next job.
 ///
 /// WeRead HTTPS uses this so a chapter download does not allocate a new
 /// pthread stack for every request. The stack is whatever the caller
 /// configured on the thread that calls [`LongLivedWorker::spawn`].
 pub struct LongLivedWorker<J, R> {
     tx: mpsc::Sender<JobEnvelope<J, R>>,
+    shared: Arc<WorkerShared>,
 }
 
 impl<J, R> Clone for LongLivedWorker<J, R> {
     fn clone(&self) -> Self {
         Self {
             tx: self.tx.clone(),
+            shared: Arc::clone(&self.shared),
         }
     }
 }
@@ -191,31 +225,103 @@ where
     J: Send + 'static,
     R: Send + 'static,
 {
-    pub fn spawn<F>(name: &'static str, stack_bytes: usize, mut handler: F) -> io::Result<Self>
+    pub fn spawn<F>(name: &'static str, stack_bytes: usize, handler: F) -> io::Result<Self>
+    where
+        F: FnMut(J) -> R + Send + 'static,
+    {
+        Self::spawn_with_idle_exit(name, stack_bytes, None, handler)
+    }
+
+    pub fn spawn_with_idle_exit<F>(
+        name: &'static str,
+        stack_bytes: usize,
+        idle_exit: Option<Duration>,
+        mut handler: F,
+    ) -> io::Result<Self>
     where
         F: FnMut(J) -> R + Send + 'static,
     {
         let (tx, rx) = mpsc::channel::<JobEnvelope<J, R>>();
+        let shared = Arc::new(WorkerShared {
+            alive: Mutex::new(true),
+            outstanding: AtomicUsize::new(0),
+        });
+        let thread_shared = Arc::clone(&shared);
         let thread = spawn_thread(name, stack_bytes, move || {
-            while let Ok(envelope) = rx.recv() {
+            let _alive = AliveGuard(Arc::clone(&thread_shared));
+            let mut run = |envelope: JobEnvelope<J, R>| {
                 let result = handler(envelope.job);
+                thread_shared.outstanding.fetch_sub(1, Ordering::AcqRel);
                 let _ = envelope.reply.send(result);
+            };
+            loop {
+                let received = match idle_exit {
+                    Some(idle) => rx.recv_timeout(idle),
+                    None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+                };
+                match received {
+                    Ok(envelope) => run(envelope),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let mut alive = thread_shared
+                            .alive
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        match rx.try_recv() {
+                            Ok(envelope) => {
+                                drop(alive);
+                                run(envelope);
+                            }
+                            Err(_) => {
+                                *alive = false;
+                                break;
+                            }
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
             }
         })?;
-        // The firmware keeps this thread for the process lifetime. Detach so
-        // cloning the sender does not require the join handle.
         detach(thread);
-        Ok(Self { tx })
+        Ok(Self { tx, shared })
     }
 
     /// Queue one job. The receiver yields the result, or disconnects if the
-    /// worker thread has stopped.
+    /// worker thread has stopped. `Err` returns the job when the thread is no
+    /// longer running, which is the only case where the owner may start a
+    /// replacement.
     pub fn submit(&self, job: J) -> Result<mpsc::Receiver<R>, J> {
         let (reply, inbox) = mpsc::channel();
+        let alive = self
+            .shared
+            .alive
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !*alive {
+            return Err(job);
+        }
+        self.shared.outstanding.fetch_add(1, Ordering::AcqRel);
         match self.tx.send(JobEnvelope { job, reply }) {
             Ok(()) => Ok(inbox),
-            Err(mpsc::SendError(envelope)) => Err(envelope.job),
+            Err(mpsc::SendError(envelope)) => {
+                self.shared.outstanding.fetch_sub(1, Ordering::AcqRel);
+                Err(envelope.job)
+            }
         }
+    }
+
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        *self
+            .shared
+            .alive
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Jobs queued or still running on the thread.
+    #[must_use]
+    pub fn outstanding(&self) -> usize {
+        self.shared.outstanding.load(Ordering::Acquire)
     }
 }
 
@@ -229,8 +335,11 @@ where
         .spawn(task)
 }
 
+/// Dropping a `JoinHandle` calls `pthread_detach`, so the pthread stack is
+/// released when the thread returns. `mem::forget` would leave it joinable
+/// and leak the stack.
 fn detach(handle: JoinHandle<()>) {
-    std::mem::forget(handle);
+    drop(handle);
 }
 
 fn finish_worker<T, E: Display>(
@@ -301,6 +410,25 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         };
         assert!(matches!(outcome, Err(super::NamedWorkerError::Panicked)));
+    }
+
+    #[test]
+    fn idle_worker_exits_and_refuses_jobs_until_replaced() {
+        let worker = super::LongLivedWorker::spawn_with_idle_exit(
+            "unit-idle",
+            32 * 1024,
+            Some(Duration::from_millis(30)),
+            |value: u32| value * 2,
+        )
+        .unwrap();
+        assert_eq!(worker.submit(3).unwrap().recv().unwrap(), 6);
+        assert_eq!(worker.outstanding(), 0);
+        let started = std::time::Instant::now();
+        while worker.is_alive() {
+            assert!(started.elapsed() < Duration::from_secs(2));
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(worker.submit(4).unwrap_err(), 4);
     }
 
     #[test]

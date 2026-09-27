@@ -20,17 +20,24 @@ pub const MAX_IMAGE_BYTES: usize = MAX_COVER_BYTES;
 /// `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` (16 KiB) land in PSRAM. It is dropped
 /// before the luma plane is allocated.
 pub const MAX_CHAPTER_IMAGE_BYTES: usize = 1024 * 1024;
-/// Source edge accepted before decode. Larger headers are skipped.
-///
-/// A square at this edge is the largest RGBA buffer that still fits in PSRAM
-/// beside the SD font, glyph cache, and both WeRead stacks.
+/// PNG source edge. A square RGBA buffer, the compressed file, and decoder
+/// scratch still fit beside the SD font, glyph cache, and both WeRead stacks.
+/// Larger headers are skipped.
 pub const MAX_IMAGE_EDGE: u32 = 752;
-/// Pixel count accepted before decode.
+/// Pixel count accepted for one PNG.
 pub const MAX_DECODE_PIXELS: u32 = MAX_IMAGE_EDGE * MAX_IMAGE_EDGE;
-/// One decoded buffer (RGBA, 4 bytes per pixel). The image crate refuses
-/// anything larger. The compressed file is not still live when a second plane
-/// is allocated.
+/// One PNG output buffer (RGBA, 4 bytes per pixel). The compressed file is
+/// still live during decode; the luma plane is not.
 pub const MAX_IMAGE_DECODE_BYTES: usize = (MAX_DECODE_PIXELS as usize) * 4;
+/// Baseline JPEG output edge.
+///
+/// `jpeg-decoder` keeps every component plane and the interleaved frame at the
+/// same time, so a full-resolution 752px RGB image does not fit. Larger JPEGs
+/// are decoded at 1/2, 1/4, or 1/8 when that output still fits, and skipped
+/// when even 1/8 does not.
+pub const MAX_JPEG_EDGE: u32 = 592;
+/// Row filters, the zlib window, and one MCU-row of coefficients.
+pub const IMAGE_DECODE_SCRATCH_BYTES: usize = 128 * 1024;
 /// Widest reader measure. Bitmaps are decoded to this and scaled again to the
 /// open layout when the chapter is drawn.
 pub const IMAGE_TARGET_WIDTH: u32 = 752;
@@ -96,6 +103,73 @@ pub const HTTP_IO_BUFFER_BYTES: usize = 2 * 1024;
 /// Waveshare ESP32-S3-WROOM-1-N16R8 octal PSRAM.
 pub const MODULE_PSRAM_BYTES: usize = 8 * 1024 * 1024;
 
+/// PSRAM left for one chapter image after the resident font, glyph cache, and
+/// both WeRead stacks. The compressed file and the decoder's planes share it.
+#[must_use]
+pub fn image_heap_room() -> usize {
+    MODULE_PSRAM_BYTES.saturating_sub(
+        crate::fonts::SD_FONT_RESIDENT_BUDGET_BYTES
+            + WEREAD_HTTP_WORKER_STACK_BYTES
+            + IMAGE_DECODE_STACK_BYTES
+            + crate::fonts::GLYPH_CACHE_BUDGET_BYTES,
+    )
+}
+
+/// Output edge `jpeg-decoder` produces for `idct` (8 = full, 4 = 1/2, 2 = 1/4, 1 = 1/8).
+#[must_use]
+pub fn jpeg_scaled_edge(len: u16, idct: u32) -> u32 {
+    u32::from(len).saturating_mul(idct).saturating_sub(1) / 8 + 1
+}
+
+/// Bytes `jpeg-decoder` allocates besides the compressed file.
+///
+/// Baseline holds component planes plus the interleaved frame. Progressive
+/// also holds full-resolution DCT coefficients, which scaling does not shrink.
+/// The MCU-row term is the scan-time peak when it exceeds those two frames.
+#[must_use]
+pub fn jpeg_decoder_extra_bytes(
+    src_w: u16,
+    src_h: u16,
+    out_w: u32,
+    out_h: u32,
+    components: usize,
+    progressive: bool,
+) -> Option<usize> {
+    let out = (out_w as usize).checked_mul(out_h as usize)?;
+    let planes = out.checked_mul(components)?;
+    let interleaved = planes;
+    let coeff = if progressive {
+        let blocks_x = (usize::from(src_w)).div_ceil(8);
+        let blocks_y = (usize::from(src_h)).div_ceil(8);
+        blocks_x
+            .checked_mul(blocks_y)?
+            .checked_mul(64)?
+            .checked_mul(2)?
+            .checked_mul(components)?
+    } else {
+        0
+    };
+    // One MCU row, worst vertical sampling of 4, 64 i16 coefficients per block.
+    let mcu_row = (usize::from(src_w))
+        .div_ceil(8)
+        .checked_mul(4)?
+        .checked_mul(64)?
+        .checked_mul(2)?
+        .checked_mul(components)?;
+    let combine = planes.checked_add(interleaved)?.checked_add(coeff)?;
+    let scan = planes.checked_add(mcu_row)?;
+    Some(combine.max(scan))
+}
+
+/// `file_len` plus `extra` plus decoder scratch fits in [`image_heap_room`].
+#[must_use]
+pub fn image_alloc_fits(file_len: usize, extra: usize) -> bool {
+    file_len
+        .saturating_add(extra)
+        .saturating_add(IMAGE_DECODE_SCRATCH_BYTES)
+        <= image_heap_room()
+}
+
 pub const WEREAD_ROOT: &str = "/sdcard/RUSTMIX/WEREAD";
 pub const WEREAD_CONFIG_PATH: &str = "/sdcard/RUSTMIX/WEREAD.TXT";
 pub const SESSION_FILE: &str = "SESS.TXT";
@@ -105,10 +179,12 @@ pub const SESSION_BAK: &str = "SESS.BAK";
 #[cfg(test)]
 mod tests {
     use super::{
+        image_alloc_fits, image_heap_room, jpeg_decoder_extra_bytes, jpeg_scaled_edge,
         DOWNLOAD_CHUNK_BYTES, HTTP_CHAPTER_LIMIT_MS, HTTP_IDLE_LIMIT_MS, HTTP_IO_BUFFER_BYTES,
-        HTTP_READ_TIMEOUT_MS, HTTP_TIMEOUT_SECS, IMAGE_DECODE_STACK_BYTES, MAX_CHAPTER_IMAGES,
+        HTTP_READ_TIMEOUT_MS, HTTP_TIMEOUT_SECS, IMAGE_DECODE_SCRATCH_BYTES,
+        IMAGE_DECODE_STACK_BYTES, IMAGE_TARGET_HEIGHT, IMAGE_TARGET_WIDTH, MAX_CHAPTER_IMAGES,
         MAX_CHAPTER_IMAGE_BYTES, MAX_CHAPTER_TEXT, MAX_DECODE_PIXELS, MAX_IMAGE_DECODE_BYTES,
-        MAX_SHARD_BYTES, MODULE_PSRAM_BYTES, WEREAD_HTTP_WORKER_STACK_BYTES,
+        MAX_JPEG_EDGE, MAX_SHARD_BYTES, MODULE_PSRAM_BYTES, WEREAD_HTTP_WORKER_STACK_BYTES,
     };
     use crate::fonts::{
         GLYPH_CACHE_BUDGET_BYTES, MAX_SD_FONT_BYTES, SD_FONT_RESIDENT_BUDGET_BYTES,
@@ -147,28 +223,56 @@ mod tests {
         assert_eq!(HTTP_CHAPTER_LIMIT_MS, 120_000);
         assert!(HTTP_CHAPTER_LIMIT_MS > HTTP_IDLE_LIMIT_MS);
         assert!(HTTP_IDLE_LIMIT_MS > HTTP_READ_TIMEOUT_MS as u64);
-        // Peak is the compressed file plus one RGBA decode. The file is dropped
-        // before the luma plane, so that plane is not added on top.
         assert_eq!(
             MAX_IMAGE_DECODE_BYTES,
             MAX_DECODE_PIXELS as usize * 4,
-            "decode cap is one RGBA buffer"
+            "png cap is one RGBA buffer"
         );
-        let image_peak = MAX_CHAPTER_IMAGE_BYTES + MAX_IMAGE_DECODE_BYTES;
-        let luma_after_drop = MAX_IMAGE_DECODE_BYTES + MAX_DECODE_PIXELS as usize;
+        // PNG: file + RGBA output + scratch. No second full frame.
+        let png_extra = MAX_DECODE_PIXELS as usize * 4;
         assert!(
-            luma_after_drop <= image_peak,
-            "luma conversion must not exceed the file-plus-decode peak"
+            image_alloc_fits(MAX_CHAPTER_IMAGE_BYTES, png_extra),
+            "png square at the edge must fit"
         );
-        let with_image = SD_FONT_RESIDENT_BUDGET_BYTES
-            + WEREAD_HTTP_WORKER_STACK_BYTES
-            + IMAGE_DECODE_STACK_BYTES
-            + image_peak
-            + GLYPH_CACHE_BUDGET_BYTES;
+        // The file is dropped before the luma plane, so RGBA and luma coexist
+        // without the compressed bytes.
+        let png_and_luma = png_extra + MAX_DECODE_PIXELS as usize;
+        assert!(png_and_luma + IMAGE_DECODE_SCRATCH_BYTES <= image_heap_room());
         assert!(
-            with_image < MODULE_PSRAM_BYTES,
-            "image decode psram budget {with_image} exceeds {MODULE_PSRAM_BYTES}"
+            !image_alloc_fits(MAX_CHAPTER_IMAGE_BYTES, 800 * 800 * 4),
+            "800x800 rgba plus the file does not fit"
         );
+        // Baseline JPEG: component planes and the interleaved frame coexist
+        // with the file. 800x800 full-resolution RGB does not fit; 1/2 does.
+        let full_800 = jpeg_decoder_extra_bytes(800, 800, 800, 800, 3, false).unwrap();
+        assert!(
+            !image_alloc_fits(MAX_CHAPTER_IMAGE_BYTES, full_800),
+            "800x800 baseline jpeg planes plus interleaved frame do not fit"
+        );
+        let half = jpeg_scaled_edge(800, 4);
+        let half_800 = jpeg_decoder_extra_bytes(800, 800, half, half, 3, false).unwrap();
+        assert!(image_alloc_fits(MAX_CHAPTER_IMAGE_BYTES, half_800));
+        assert!(half <= MAX_JPEG_EDGE);
+        let jpeg_edge = jpeg_decoder_extra_bytes(
+            MAX_JPEG_EDGE as u16,
+            MAX_JPEG_EDGE as u16,
+            MAX_JPEG_EDGE,
+            MAX_JPEG_EDGE,
+            3,
+            false,
+        )
+        .unwrap();
+        assert!(image_alloc_fits(MAX_CHAPTER_IMAGE_BYTES, jpeg_edge));
+        let jpeg_total = MAX_CHAPTER_IMAGE_BYTES + jpeg_edge + IMAGE_DECODE_SCRATCH_BYTES;
+        assert!(
+            image_heap_room() - jpeg_total >= 128 * 1024,
+            "jpeg edge leaves less than 128 KiB"
+        );
+        // Floyd-Steinberg runs after the file and the decoder planes are gone.
+        let dither = (IMAGE_TARGET_WIDTH as usize) * (IMAGE_TARGET_HEIGHT as usize) * 3;
+        assert!(dither + IMAGE_DECODE_SCRATCH_BYTES <= image_heap_room());
+        assert!(jpeg_total <= image_heap_room());
+        assert!(image_heap_room() < MODULE_PSRAM_BYTES);
         assert_eq!(MAX_CHAPTER_IMAGE_BYTES, 1024 * 1024);
         assert!(MAX_CHAPTER_IMAGES <= 8);
         assert!(IMAGE_DECODE_STACK_BYTES >= 48 * 1024);

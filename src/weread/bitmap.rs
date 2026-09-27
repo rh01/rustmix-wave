@@ -1,11 +1,14 @@
 //! Bounded JPEG/PNG decode into a 1-bit bitmap for the e-paper panel.
 //!
-//! The compressed bytes are dropped as soon as the decoder returns an owned
-//! image, and that image is dropped as soon as a luma plane exists. Scaling
-//! and Floyd-Steinberg then run on the luma plane only. Every buffer this
-//! module owns is reserved with [`Vec::try_reserve_exact`]; a failure becomes
-//! a placeholder instead of an abort. Decode itself runs on the `weread-img`
-//! PSRAM stack, not the 16 KiB main task.
+//! JPEG goes through `jpeg-decoder` and PNG through `png`, not `image`'s
+//! `DynamicImage` path. That path allocates the output buffer before the
+//! decoder's own planes, so a baseline JPEG briefly holds the file, the
+//! component planes, and two full frames. Here the file is dropped as soon as
+//! those planes are gone, and scaling plus Floyd-Steinberg run on a luma
+//! plane only. Every buffer this module owns is reserved with
+//! [`Vec::try_reserve_exact`]; a failure becomes a placeholder instead of an
+//! abort. Decode itself runs on the `weread-img` PSRAM stack, not the 16 KiB
+//! main task.
 //!
 //! The SSD1677 driver has no grayscale waveform
 //! ([`crate::panel_refresh::supports_grayscale_refresh`]), so the bitmap is
@@ -13,14 +16,16 @@
 
 use std::io::Cursor;
 
-use image::{DynamicImage, GenericImageView, ImageFormat};
+use jpeg_decoder::{CodingProcess, Decoder as JpegDecoder, PixelFormat};
+use png::{BitDepth, ColorType, Decoder as PngDecoder, Transformations};
 
 use crate::{
     panel_refresh::supports_grayscale_refresh,
     runtime_worker::NamedWorkerHandle,
     weread::limits::{
-        IMAGE_DECODE_STACK_BYTES, MAX_CHAPTER_IMAGE_BYTES, MAX_DECODE_PIXELS,
-        MAX_IMAGE_DECODE_BYTES, MAX_IMAGE_EDGE,
+        image_alloc_fits, jpeg_decoder_extra_bytes, jpeg_scaled_edge, IMAGE_DECODE_SCRATCH_BYTES,
+        IMAGE_DECODE_STACK_BYTES, MAX_CHAPTER_IMAGE_BYTES, MAX_IMAGE_DECODE_BYTES, MAX_IMAGE_EDGE,
+        MAX_JPEG_EDGE,
     },
 };
 
@@ -78,8 +83,8 @@ pub fn fitted_size(width: u32, height: u32, max_width: u32, max_height: u32) -> 
 
 /// Decode one image the caller already owns.
 ///
-/// `bytes` is dropped before the luma plane is allocated, so the compressed
-/// file and the second pixel buffer do not coexist.
+/// `bytes` is dropped before the luma plane is allocated. JPEG scaling is
+/// chosen so the decoder's own planes fit in [`image_heap_room`](crate::weread::limits::image_heap_room).
 pub fn decode_mono(
     bytes: Vec<u8>,
     max_width: u32,
@@ -88,30 +93,24 @@ pub fn decode_mono(
     if bytes.is_empty() || bytes.len() > MAX_CHAPTER_IMAGE_BYTES {
         return Err("image exceeds the size limit");
     }
-    let format = image::guess_format(&bytes).map_err(|_| "image format is not png or jpeg")?;
-    if !matches!(format, ImageFormat::Png | ImageFormat::Jpeg) {
-        return Err("image format is not png or jpeg");
-    }
-    let (width, height) = image::io::Reader::new(Cursor::new(bytes.as_slice()))
-        .with_guessed_format()
-        .map_err(|_| "image header is unreadable")?
-        .into_dimensions()
-        .map_err(|_| "image header is unreadable")?;
-    if !dimensions_allowed(width, height) {
-        return Err("image is too large");
-    }
-    let pixels = (width as usize).saturating_mul(height as usize);
-    // Prove the decoded buffer fits while the file is still held, then free
-    // the probe before the decoder allocates its own copy.
-    {
-        let mut probe = Vec::<u8>::new();
-        probe
-            .try_reserve_exact(pixels.saturating_mul(4))
-            .map_err(|_| "image decode failed")?;
-    }
-    let image = decode_dynamic(&bytes, format)?;
-    drop(bytes);
-    let (luma, width, height) = luma_plane(image)?;
+    let (luma, width, height) = match sniff(&bytes) {
+        Some(ImageKind::Jpeg) => {
+            let (pixels, width, height, format) = decode_jpeg(&bytes)?;
+            drop(bytes);
+            let luma = match format {
+                PixelFormat::CMYK32 => luma_from_cmyk(&pixels, width, height)?,
+                _ => luma_from_rgb_like(&pixels, width, height, format.pixel_bytes())?,
+            };
+            (luma, width, height)
+        }
+        Some(ImageKind::Png) => {
+            let (pixels, width, height, bpp) = decode_png(&bytes)?;
+            drop(bytes);
+            let luma = luma_from_rgb_like(&pixels, width, height, bpp)?;
+            (luma, width, height)
+        }
+        None => return Err("image format is not png or jpeg"),
+    };
     let (target_w, target_h) = fitted_size(
         width,
         height,
@@ -131,6 +130,22 @@ pub fn decode_mono(
     floyd_steinberg(&scaled, u32::from(target_w), u32::from(target_h))
 }
 
+#[derive(Clone, Copy)]
+enum ImageKind {
+    Jpeg,
+    Png,
+}
+
+fn sniff(bytes: &[u8]) -> Option<ImageKind> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n']) {
+        Some(ImageKind::Png)
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some(ImageKind::Jpeg)
+    } else {
+        None
+    }
+}
+
 /// Decode on the `weread-img` thread. The main task only moves `bytes` in.
 pub(crate) fn spawn_image_decode(
     bytes: Vec<u8>,
@@ -144,51 +159,168 @@ pub(crate) fn spawn_image_decode(
     })
 }
 
-fn dimensions_allowed(width: u32, height: u32) -> bool {
-    width > 0
-        && height > 0
-        && width <= MAX_IMAGE_EDGE
-        && height <= MAX_IMAGE_EDGE
-        && u64::from(width) * u64::from(height) <= u64::from(MAX_DECODE_PIXELS)
-}
-
-fn decode_dynamic(bytes: &[u8], format: ImageFormat) -> Result<DynamicImage, &'static str> {
-    let mut reader = image::io::Reader::with_format(Cursor::new(bytes), format);
-    let mut limits = image::io::Limits::default();
-    limits.max_alloc = Some(MAX_IMAGE_DECODE_BYTES as u64);
-    limits.max_image_width = Some(MAX_IMAGE_EDGE);
-    limits.max_image_height = Some(MAX_IMAGE_EDGE);
-    reader.limits(limits);
-    reader.decode().map_err(|_| "image decode failed")
-}
-
-/// One luma byte per pixel. The source image is dropped before this returns.
-fn luma_plane(image: DynamicImage) -> Result<(Vec<u8>, u32, u32), &'static str> {
-    let (width, height) = image.dimensions();
-    if !dimensions_allowed(width, height) {
+fn decode_jpeg(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32, PixelFormat), &'static str> {
+    let mut decoder = JpegDecoder::new(Cursor::new(bytes));
+    decoder
+        .read_info()
+        .map_err(|_| "image header is unreadable")?;
+    let info = decoder.info().ok_or("image header is unreadable")?;
+    if info.coding_process == CodingProcess::Lossless {
+        return Err("image decode failed");
+    }
+    let components = match info.pixel_format {
+        PixelFormat::L8 => 1,
+        PixelFormat::RGB24 => 3,
+        PixelFormat::CMYK32 => 4,
+        PixelFormat::L16 => return Err("image decode failed"),
+    };
+    let progressive = info.coding_process == CodingProcess::DctProgressive;
+    let src_w = info.width;
+    let src_h = info.height;
+    let (ask_w, ask_h) = select_jpeg_scale(src_w, src_h, components, progressive, bytes.len())?;
+    let (got_w, got_h) = decoder
+        .scale(ask_w, ask_h)
+        .map_err(|_| "image is too large")?;
+    if u32::from(got_w) > MAX_JPEG_EDGE || u32::from(got_h) > MAX_JPEG_EDGE {
         return Err("image is too large");
     }
-    let count = (width as usize).saturating_mul(height as usize);
+    let extra = jpeg_decoder_extra_bytes(
+        src_w,
+        src_h,
+        u32::from(got_w),
+        u32::from(got_h),
+        components,
+        progressive,
+    )
+    .ok_or("image is too large")?;
+    if !image_alloc_fits(bytes.len(), extra) {
+        return Err("image is too large");
+    }
+    // The decoder's planes are infallible allocations. Reserve their peak
+    // first so a shortfall becomes a placeholder, then free it before decode.
+    {
+        let mut probe = Vec::<u8>::new();
+        probe
+            .try_reserve_exact(extra.saturating_add(IMAGE_DECODE_SCRATCH_BYTES))
+            .map_err(|_| "image decode failed")?;
+    }
+    let pixels = decoder.decode().map_err(|_| "image decode failed")?;
+    let width = u32::from(got_w);
+    let height = u32::from(got_h);
+    let expect = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|count| count.checked_mul(info.pixel_format.pixel_bytes()))
+        .ok_or("image is too large")?;
+    if pixels.len() != expect {
+        return Err("image decode failed");
+    }
+    Ok((pixels, width, height, info.pixel_format))
+}
+
+fn select_jpeg_scale(
+    src_w: u16,
+    src_h: u16,
+    components: usize,
+    progressive: bool,
+    file_len: usize,
+) -> Result<(u16, u16), &'static str> {
+    for idct in [8u32, 4, 2, 1] {
+        let out_w = jpeg_scaled_edge(src_w, idct);
+        let out_h = jpeg_scaled_edge(src_h, idct);
+        if out_w == 0 || out_h == 0 || out_w > MAX_JPEG_EDGE || out_h > MAX_JPEG_EDGE {
+            continue;
+        }
+        let Some(extra) =
+            jpeg_decoder_extra_bytes(src_w, src_h, out_w, out_h, components, progressive)
+        else {
+            continue;
+        };
+        if !image_alloc_fits(file_len, extra) {
+            continue;
+        }
+        let out_w = u16::try_from(out_w).map_err(|_| "image is too large")?;
+        let out_h = u16::try_from(out_h).map_err(|_| "image is too large")?;
+        return Ok((out_w, out_h));
+    }
+    Err("image is too large")
+}
+
+fn decode_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32, usize), &'static str> {
+    let mut limits = png::Limits::default();
+    limits.bytes = IMAGE_DECODE_SCRATCH_BYTES;
+    let mut decoder = PngDecoder::new_with_limits(Cursor::new(bytes), limits);
+    decoder.set_transformations(Transformations::EXPAND | Transformations::STRIP_16);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|_| "image header is unreadable")?;
+    let (width, height) = reader.info().size();
+    if width == 0
+        || height == 0
+        || width > MAX_IMAGE_EDGE
+        || height > MAX_IMAGE_EDGE
+        || !image_alloc_fits(
+            bytes.len(),
+            (width as usize).saturating_mul(height as usize) * 4,
+        )
+    {
+        return Err("image is too large");
+    }
+    let output = reader.output_buffer_size();
+    if output > MAX_IMAGE_DECODE_BYTES || !image_alloc_fits(bytes.len(), output) {
+        return Err("image is too large");
+    }
+    let mut pixels = Vec::new();
+    pixels
+        .try_reserve_exact(output)
+        .map_err(|_| "image decode failed")?;
+    pixels.resize(output, 0);
+    let (color, depth) = reader.output_color_type();
+    reader
+        .next_frame(&mut pixels)
+        .map_err(|_| "image decode failed")?;
+    if depth != BitDepth::Eight {
+        return Err("image decode failed");
+    }
+    let bpp = match color {
+        ColorType::Grayscale => 1,
+        ColorType::GrayscaleAlpha => 2,
+        ColorType::Rgb => 3,
+        ColorType::Rgba => 4,
+        ColorType::Indexed => return Err("image decode failed"),
+    };
+    Ok((pixels, width, height, bpp))
+}
+
+fn luma_from_rgb_like(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    bpp: usize,
+) -> Result<Vec<u8>, &'static str> {
+    let count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or("image is too large")?;
+    if bpp == 0 || pixels.len() != count.saturating_mul(bpp) {
+        return Err("image decode failed");
+    }
     let mut luma = Vec::new();
     luma.try_reserve_exact(count)
         .map_err(|_| "image decode failed")?;
-    match image {
-        DynamicImage::ImageLuma8(image) => {
-            luma.extend_from_slice(image.as_raw());
-        }
-        DynamicImage::ImageLumaA8(image) => {
-            for pixel in image.pixels() {
-                luma.push(pixel.0[0]);
+    match bpp {
+        1 => luma.extend_from_slice(pixels),
+        2 => {
+            for pixel in pixels.chunks_exact(2) {
+                luma.push(pixel[0]);
             }
         }
-        DynamicImage::ImageRgb8(image) => {
-            for pixel in image.pixels() {
-                luma.push(rec601(pixel.0[0], pixel.0[1], pixel.0[2]));
+        3 => {
+            for pixel in pixels.chunks_exact(3) {
+                luma.push(rec601(pixel[0], pixel[1], pixel[2]));
             }
         }
-        DynamicImage::ImageRgba8(image) => {
-            for pixel in image.pixels() {
-                luma.push(rec601(pixel.0[0], pixel.0[1], pixel.0[2]));
+        4 => {
+            for pixel in pixels.chunks_exact(4) {
+                luma.push(rec601(pixel[0], pixel[1], pixel[2]));
             }
         }
         _ => return Err("image decode failed"),
@@ -196,7 +328,31 @@ fn luma_plane(image: DynamicImage) -> Result<(Vec<u8>, u32, u32), &'static str> 
     if luma.len() != count {
         return Err("image decode failed");
     }
-    Ok((luma, width, height))
+    Ok(luma)
+}
+
+fn luma_from_cmyk(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>, &'static str> {
+    let count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or("image is too large")?;
+    if pixels.len() != count.saturating_mul(4) {
+        return Err("image decode failed");
+    }
+    let mut luma = Vec::new();
+    luma.try_reserve_exact(count)
+        .map_err(|_| "image decode failed")?;
+    for pixel in pixels.chunks_exact(4) {
+        let cyan = 255 - u16::from(pixel[0]);
+        let magenta = 255 - u16::from(pixel[1]);
+        let yellow = 255 - u16::from(pixel[2]);
+        let black = 255 - u16::from(pixel[3]);
+        luma.push(rec601(
+            ((black * cyan) / 255) as u8,
+            ((black * magenta) / 255) as u8,
+            ((black * yellow) / 255) as u8,
+        ));
+    }
+    Ok(luma)
 }
 
 fn rec601(red: u8, green: u8, blue: u8) -> u8 {
@@ -354,10 +510,22 @@ mod tests {
         let png = tiny_png();
         assert!(decode_mono(png[..png.len() / 2].to_vec(), 48, 64).is_err());
         assert!(decode_mono(huge_png_header(), 48, 64).is_err());
+        assert!(decode_mono(jpeg_sof(8_000, 8_000), 752, 594).is_err());
         let bitmap = decode_mono(tiny_jpeg(), 48, 64).unwrap();
         assert!(bitmap.width >= 1 && bitmap.height >= 1);
         let bitmap = decode_mono(tiny_png(), 48, 64).unwrap();
         assert_eq!((bitmap.width, bitmap.height), (2, 2));
+    }
+
+    #[test]
+    fn wide_baseline_jpeg_is_scaled_inside_the_decoder_budget() {
+        let bitmap = decode_mono(solid_jpeg(800, 800), 752, 594).unwrap();
+        assert!(
+            (300..=592).contains(&bitmap.width) && (300..=592).contains(&bitmap.height),
+            "decoded {}x{}, full 800px planes would exceed PSRAM",
+            bitmap.width,
+            bitmap.height
+        );
     }
 
     #[test]
@@ -396,11 +564,32 @@ mod tests {
     }
 
     fn tiny_jpeg() -> Vec<u8> {
-        let image = RgbImage::from_pixel(2, 2, image::Rgb([20, 40, 60]));
+        solid_jpeg(2, 2)
+    }
+
+    fn solid_jpeg(width: u32, height: u32) -> Vec<u8> {
+        let image = RgbImage::from_pixel(width, height, image::Rgb([20, 40, 60]));
         let mut bytes = Vec::new();
         JpegEncoder::new(&mut bytes)
-            .write_image(image.as_raw(), 2, 2, image::ColorType::Rgb8)
+            .write_image(image.as_raw(), width, height, image::ColorType::Rgb8)
             .unwrap();
+        bytes
+    }
+
+    /// SOF-only JPEG. `read_info` succeeds and the dimension check must reject
+    /// it before `decode` allocates coefficient or plane buffers.
+    fn jpeg_sof(width: u16, height: u16) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xC0];
+        bytes.extend(17u16.to_be_bytes());
+        bytes.push(8);
+        bytes.extend(height.to_be_bytes());
+        bytes.extend(width.to_be_bytes());
+        bytes.push(3);
+        for id in 1..=3 {
+            bytes.push(id);
+            bytes.push(0x11);
+            bytes.push(0);
+        }
         bytes
     }
 

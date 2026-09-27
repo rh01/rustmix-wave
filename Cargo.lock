@@ -1857,9 +1857,11 @@ dependencies = [
  "esp-idf-svc",
  "fontdue",
  "image",
+ "jpeg-decoder",
  "log",
  "md-5",
  "miniz_oxide 0.8.9",
+ "png",
  "qrcode",
  "sha2",
 ]

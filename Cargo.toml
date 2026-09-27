@@ -28,7 +28,9 @@ embedded-graphics = "0.8.1"
 embedded-hal = "1.0"
 fontdue = "0.9"
 image = { version = "0.24.9", default-features = false, features = ["jpeg", "png"] }
+jpeg-decoder = { version = "0.3.2", default-features = false }
 log = "0.4"
+png = "0.17.16"
 md-5 = "0.10"
 miniz_oxide = "0.8"
 qrcode = { version = "0.14", default-features = false }

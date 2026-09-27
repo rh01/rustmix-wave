@@ -93,18 +93,64 @@ pub fn array_objects<'a>(
     max_objects: usize,
     max_object_bytes: usize,
 ) -> Vec<&'a str> {
+    collect_array_objects(json, key, max_objects, max_object_bytes, false)
+}
+
+/// Like [`array_objects`], but objects larger than `max_object_bytes` are kept
+/// as slices of the already-bounded response. Callers copy only the scalar
+/// fields they need, so a chapter `anchors` array is not retained.
+pub fn array_objects_scanned<'a>(
+    json: &'a str,
+    key: &str,
+    max_objects: usize,
+    max_object_bytes: usize,
+) -> Vec<&'a str> {
+    collect_array_objects(json, key, max_objects, max_object_bytes, true)
+}
+
+fn collect_array_objects<'a>(
+    json: &'a str,
+    key: &str,
+    max_objects: usize,
+    max_object_bytes: usize,
+    scan_large: bool,
+) -> Vec<&'a str> {
     let Some(raw) = object_raw(json, key)
         .or_else(|| object_raw(json, "data").and_then(|data| object_raw(data, key).or(Some(data))))
     else {
         return Vec::new();
     };
-    objects_in_array(raw, max_objects, max_object_bytes)
+    objects_in_array_mode(raw, max_objects, max_object_bytes, scan_large)
+}
+
+/// True when `json` is one complete value with only trailing whitespace.
+/// A response cut off at `MAX_JSON_BYTES` fails this check.
+#[must_use]
+pub fn document_complete(json: &str) -> bool {
+    let bytes = json.as_bytes();
+    let start = skip_ws(bytes, 0);
+    if start >= bytes.len() {
+        return false;
+    }
+    let Ok(end) = skip_value(bytes, start, 0) else {
+        return false;
+    };
+    skip_ws(bytes, end) >= bytes.len()
 }
 
 pub fn objects_in_array<'a>(
     raw: &'a str,
     max_objects: usize,
     max_object_bytes: usize,
+) -> Vec<&'a str> {
+    objects_in_array_mode(raw, max_objects, max_object_bytes, false)
+}
+
+fn objects_in_array_mode<'a>(
+    raw: &'a str,
+    max_objects: usize,
+    max_object_bytes: usize,
+    scan_large: bool,
 ) -> Vec<&'a str> {
     let bytes = raw.as_bytes();
     let mut index = skip_ws(bytes, 0);
@@ -131,7 +177,8 @@ pub fn objects_in_array<'a>(
             let Ok(next) = skip_value(bytes, index, 0) else {
                 break;
             };
-            if next.saturating_sub(start) <= max_object_bytes {
+            let size = next.saturating_sub(start);
+            if size <= max_object_bytes || scan_large {
                 if let Some(slice) = raw.get(start..next) {
                     objects.push(slice);
                 }

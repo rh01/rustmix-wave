@@ -111,6 +111,8 @@ pub struct AppState {
     weather_refresh_requested: bool,
     /// WeRead shelf, QR login, chapter reading, and offline cache.
     pub weread: WereadUi,
+    /// Set while Reading Preferences was opened from a WeRead chapter.
+    weread_preferences_return: Option<ScreenRoute>,
     /// One-shot word clip. The main loop plays it in short I2S chunks.
     pronounce_request: Option<PronounceTarget>,
 }
@@ -159,6 +161,7 @@ impl Default for AppState {
             power_key_manual_refresh_requested: false,
             weather_refresh_requested: false,
             weread: WereadUi::default(),
+            weread_preferences_return: None,
             pronounce_request: None,
         }
     }
@@ -920,6 +923,7 @@ impl AppState {
                         }
                         ReaderOption::ReadingPreferences => {
                             self.reader.begin_preferences_edit();
+                            self.weread_preferences_return = None;
                             self.router.navigate_to(ScreenRoute::ReaderPreferences);
                         }
                         ReaderOption::ClearGhosting => self.reader.request_clear_ghosting(),
@@ -936,7 +940,15 @@ impl AppState {
                 ButtonEvent::Down => self.reader.cycle_preference_next(),
                 ButtonEvent::Select => {
                     self.note_select_press();
-                    if self.reader.activate_selected_preference() {
+                    let from_weread = self.weread_preferences_return.is_some();
+                    let rebuild = if from_weread {
+                        self.reader.activate_shared_preference();
+                        false
+                    } else {
+                        self.reader.activate_selected_preference()
+                    };
+                    let _ = self.weread.sync_layout(self.reader.preferences.layout());
+                    if rebuild {
                         self.router.navigate_to(ScreenRoute::ReaderLoading);
                     }
                 }
@@ -1083,11 +1095,17 @@ impl AppState {
             self.note_select_press();
         }
         let layout = self.reader.preferences.layout();
+        let _ = self.weread.sync_layout(layout);
         let previous = self.router.current();
         if let Some(route) = self
             .weread
             .on_button(previous, event, layout, self.storage.mounted)
         {
+            if route == ScreenRoute::ReaderPreferences {
+                self.reader.refresh_font_catalog();
+                self.reader.begin_preferences_edit();
+                self.weread_preferences_return = Some(ScreenRoute::WeReadRead);
+            }
             self.router.navigate_to(route);
             self.weread.note_route(previous, route);
         }
@@ -1095,6 +1113,16 @@ impl AppState {
 
     pub fn back(&mut self) {
         let previous = self.router.current();
+        if self.router.current() == ScreenRoute::ReaderPreferences {
+            if let Some(return_route) = self.weread_preferences_return.take() {
+                self.reader.finish_preferences_edit();
+                let _ = self.weread.sync_layout(self.reader.preferences.layout());
+                self.router.navigate_to(return_route);
+                self.weread.note_route(previous, return_route);
+                self.sync_reader_orientation_for_active_route();
+                return;
+            }
+        }
         if self.router.current() == ScreenRoute::PowerKeyMenu {
             self.close_power_key_menu();
             return;
@@ -1584,6 +1612,48 @@ mod tests {
         assert_eq!(state.active_route(), ScreenRoute::ReaderPreferences);
         state.back();
         assert_eq!(state.active_route(), ScreenRoute::ReaderOptions);
+    }
+
+    #[test]
+    fn weread_chapter_select_opens_reading_preferences() {
+        use crate::reader::BookFontSize;
+
+        let mut state = AppState::default();
+        state.router.navigate_to(ScreenRoute::WeReadRead);
+        state.weread.chapter_source = "abcd ".repeat(80);
+        let layout = state.reader.preferences.layout();
+        state.weread.repaginate(layout);
+        let before = state.weread.pages.len();
+        state.apply(ButtonEvent::Select);
+        assert_eq!(state.active_route(), ScreenRoute::ReaderPreferences);
+        let size = state.reader.preferences.font_size;
+        state.apply(ButtonEvent::Select);
+        assert_eq!(state.reader.preferences.font_size, BookFontSize::Px32);
+        assert_ne!(state.reader.preferences.font_size, size);
+        assert!(state.weread.pages.len() > before);
+        assert_eq!(state.active_route(), ScreenRoute::ReaderPreferences);
+        state.apply(ButtonEvent::Down);
+        state.apply(ButtonEvent::Select);
+        assert_ne!(
+            state.reader.preferences.book_font,
+            crate::reader::BookFont::Serif
+        );
+        state.back();
+        assert_eq!(state.active_route(), ScreenRoute::WeReadRead);
+        state.back();
+        assert_eq!(state.active_route(), ScreenRoute::WeReadBook);
+    }
+
+    #[test]
+    fn reading_preferences_repaginates_an_open_weread_chapter() {
+        let mut state = AppState::default();
+        state.router.navigate_to(ScreenRoute::ReaderPreferences);
+        state.weread.chapter_source = "abcd ".repeat(80);
+        assert!(state.weread.sync_layout(state.reader.preferences.layout()));
+        let before = state.weread.pages.len();
+        state.apply(ButtonEvent::Select);
+        assert!(state.weread.pages.len() > before);
+        assert_eq!(state.active_route(), ScreenRoute::ReaderPreferences);
     }
     #[test]
     fn productivity_voice_notes_opens_recording_route_and_queues_start() {

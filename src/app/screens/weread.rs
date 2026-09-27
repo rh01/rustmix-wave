@@ -286,7 +286,7 @@ pub fn render_read(
     draw_footer(
         display,
         state.display,
-        footer(weread.busy, "MOVE PAGE  SELECT BOOK  HOLD BOOT BACK"),
+        footer(weread.busy, "MOVE PAGE  SELECT PREFS  HOLD BOOT BOOK"),
     )
 }
 

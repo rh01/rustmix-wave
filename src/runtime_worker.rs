@@ -5,6 +5,11 @@
 //! on the main task.
 
 use core::fmt::{self, Display};
+use std::{
+    io,
+    sync::mpsc,
+    thread::{self, JoinHandle},
+};
 
 #[derive(Debug)]
 pub enum NamedWorkerError<E> {
@@ -115,6 +120,75 @@ where
     }
 }
 
+struct JobEnvelope<J, R> {
+    job: J,
+    reply: mpsc::Sender<R>,
+}
+
+/// One thread that accepts jobs until the last sender is dropped.
+///
+/// WeRead HTTPS uses this so a chapter download does not allocate a new
+/// pthread stack for every request. The stack is whatever the caller
+/// configured on the thread that calls [`LongLivedWorker::spawn`].
+pub struct LongLivedWorker<J, R> {
+    tx: mpsc::Sender<JobEnvelope<J, R>>,
+}
+
+impl<J, R> Clone for LongLivedWorker<J, R> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+        }
+    }
+}
+
+impl<J, R> LongLivedWorker<J, R>
+where
+    J: Send + 'static,
+    R: Send + 'static,
+{
+    pub fn spawn<F>(name: &'static str, stack_bytes: usize, mut handler: F) -> io::Result<Self>
+    where
+        F: FnMut(J) -> R + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel::<JobEnvelope<J, R>>();
+        let thread = spawn_thread(name, stack_bytes, move || {
+            while let Ok(envelope) = rx.recv() {
+                let result = handler(envelope.job);
+                let _ = envelope.reply.send(result);
+            }
+        })?;
+        // The firmware keeps this thread for the process lifetime. Detach so
+        // cloning the sender does not require the join handle.
+        detach(thread);
+        Ok(Self { tx })
+    }
+
+    /// Queue one job. The receiver yields the result, or disconnects if the
+    /// worker thread has stopped.
+    pub fn submit(&self, job: J) -> Result<mpsc::Receiver<R>, J> {
+        let (reply, inbox) = mpsc::channel();
+        match self.tx.send(JobEnvelope { job, reply }) {
+            Ok(()) => Ok(inbox),
+            Err(mpsc::SendError(envelope)) => Err(envelope.job),
+        }
+    }
+}
+
+fn spawn_thread<F>(name: &str, stack_bytes: usize, task: F) -> io::Result<JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(stack_bytes)
+        .spawn(task)
+}
+
+fn detach(handle: JoinHandle<()>) {
+    std::mem::forget(handle);
+}
+
 fn finish_worker<T, E: Display>(
     name: &str,
     result: Result<T, E>,
@@ -160,5 +234,18 @@ mod tests {
         };
         assert_eq!(value, 7);
         assert!(worker.try_join().is_none());
+    }
+
+    #[test]
+    fn long_lived_worker_runs_jobs_on_one_thread() {
+        let worker = super::LongLivedWorker::spawn("unit-live", 32 * 1024, |value: u32| {
+            (std::thread::current().id(), value + 1)
+        })
+        .unwrap();
+        let first = worker.submit(1).unwrap().recv().unwrap();
+        let second = worker.submit(4).unwrap().recv().unwrap();
+        assert_eq!(first.0, second.0);
+        assert_eq!(first.1, 2);
+        assert_eq!(second.1, 5);
     }
 }

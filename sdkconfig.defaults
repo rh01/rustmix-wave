@@ -9,9 +9,17 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
+# Allocations larger than 16 KiB (an opened chapter shard, decoded text, SD
+# TTF outlines) go to PSRAM. Offline download writes 8 KiB chunks and does not
+# keep the shard resident. A ~2 MiB face parsed by fontdue occupies more than
+# 2 MiB there. The 2 KiB TLS I/O buffers stay in internal RAM.
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+# The long-lived WeRead worker asks pthread for a PSRAM stack. Tasks that
+# touch flash, NVS, or the SD card keep internal stacks. This worker does
+# none of those; the main task writes each download chunk.
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
 
 # Embed a semantic product milestone version in the ESP-IDF app descriptor.
 CONFIG_APP_PROJECT_VER_FROM_CONFIG=y

@@ -432,6 +432,22 @@ pub const fn sd_clock_khz(idle: bool) -> u32 {
     }
 }
 
+/// The SD host may drop to the identification clock only while the next wait
+/// will not touch the card.
+///
+/// `weread_needs_radio` stays true for a whole offline download, including the
+/// pause between chapters and the main-task FAT write. The in-flight HTTPS
+/// flag is false during that pause, so it is not enough to keep the 10 MHz clock.
+#[must_use]
+pub const fn sd_host_can_idle(
+    mounted: bool,
+    voice_busy: bool,
+    reader_busy: bool,
+    weread_needs_radio: bool,
+) -> bool {
+    mounted && !voice_busy && !reader_busy && !weread_needs_radio
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PowerView {
     pub mcu: McuPowerMode,
@@ -807,10 +823,11 @@ mod tests {
         alarm_wake_plan, clamp_auto_sleep_minutes, classify_wake_cause,
         cycle_auto_deep_sleep_minutes, days_from_civil, deep_sleep_blocked, format_battery,
         keep_retained_frame, mcu_mode, next_block_ms, panel_sleep_follow_up, plan_panel_transport,
-        power_key_poll_ms, sd_clock_khz, seconds_until, AlarmWakePlan, McuPowerMode, McuWake,
-        PanelSleepFollowUp, PanelTransport, PowerDebugSnapshot, RadioIdle, RadioJob, RefreshCause,
-        SleepResume, WaitInput, CURRENT_DRAW_ESTIMATES, DEFAULT_AUTO_DEEP_SLEEP_MINUTES,
-        RADIO_IDLE_TIMEOUT_SECS, SD_IDLE_CLOCK_KHZ,
+        power_key_poll_ms, sd_clock_khz, sd_host_can_idle, seconds_until, AlarmWakePlan,
+        McuPowerMode, McuWake, PanelSleepFollowUp, PanelTransport, PowerDebugSnapshot, RadioIdle,
+        RadioJob, RefreshCause, SleepResume, WaitInput, CURRENT_DRAW_ESTIMATES,
+        DEFAULT_AUTO_DEEP_SLEEP_MINUTES, RADIO_IDLE_TIMEOUT_SECS, SD_ACTIVE_CLOCK_KHZ,
+        SD_IDLE_CLOCK_KHZ,
     };
     use crate::rtc::RtcDateTime;
 
@@ -926,6 +943,19 @@ mod tests {
         );
         assert!(deep_sleep_blocked(false, true, false, false, false));
         assert!(!deep_sleep_blocked(false, false, false, false, false));
+    }
+
+    #[test]
+    fn weread_download_holds_the_radio_the_sd_clock_and_deep_sleep() {
+        assert!(RadioJob::WeRead.holds_radio());
+        assert!(deep_sleep_blocked(false, true, false, false, false));
+        assert!(!sd_host_can_idle(true, false, false, true));
+        assert_eq!(sd_clock_khz(false), SD_ACTIVE_CLOCK_KHZ);
+        assert!(sd_host_can_idle(true, false, false, false));
+        assert!(!sd_host_can_idle(false, false, false, false));
+        assert!(!sd_host_can_idle(true, true, false, false));
+        assert!(!sd_host_can_idle(true, false, true, false));
+        assert_eq!(sd_clock_khz(true), SD_IDLE_CLOCK_KHZ);
     }
 
     #[test]

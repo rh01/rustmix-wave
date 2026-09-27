@@ -1,15 +1,21 @@
-//! One bounded WeRead HTTPS job on a short-lived worker.
+//! One bounded WeRead HTTPS job on a single long-lived worker.
 //!
-//! The main loop polls the worker. Response bodies are allocated only after
-//! `Content-Length` is known to fit the job cap. Allocations above the internal
-//! heap threshold land in PSRAM. Every `Set-Cookie` is kept; the ESP-IDF Rust
-//! client stores headers in a map and would drop all but the last.
+//! The main loop polls the worker. A channel carries each job so a chapter
+//! download does not call `pthread_create` again. The worker stack is allocated
+//! from PSRAM. A PSRAM stack must not call flash, NVS, or FATFS, because those
+//! disable the flash cache. Offline download therefore reads each response in
+//! small chunks on this worker and the main task (internal stack) writes them
+//! to a temp file. Interactive reads still buffer one chapter. The HTTP client
+//! is closed and cleaned up before the next job. Every `Set-Cookie` is kept;
+//! the ESP-IDF Rust client stores headers in a map and would drop all but the last.
 
 use std::{
     ffi::{CStr, CString},
+    path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        mpsc::{self, TryRecvError},
+        Arc, Mutex,
     },
     thread,
     time::Duration,
@@ -27,17 +33,29 @@ use esp_idf_svc::sys::{
 
 use crate::{
     reader::ReaderLayout,
-    runtime_worker::NamedWorkerHandle,
+    runtime_memory::{log_runtime_memory, log_worker_memory},
+    runtime_worker::LongLivedWorker,
     weread::{
         body::BoundedBody,
         client::{self, Job, JobError, Report, Request, Response, Transport, Work},
-        limits::{HTTP_TIMEOUT_SECS, MIN_REQUEST_GAP_MS},
+        limits::{
+            DOWNLOAD_CHUNK_BYTES, DOWNLOAD_CLASSIFY_BYTES, HTTP_IO_BUFFER_BYTES, HTTP_TIMEOUT_SECS,
+            MIN_REQUEST_GAP_MS,
+        },
+        offline::{self, DownloadEvent},
         session,
         ui::{self, ServiceOutcome, WereadUi},
     },
 };
 
-pub const WEREAD_HTTP_WORKER_STACK_BYTES: usize = 96 * 1024;
+pub use crate::weread::limits::WEREAD_HTTP_WORKER_STACK_BYTES;
+
+/// PSRAM stack for the one `weread-http` thread. Large enough for one mbedTLS
+/// handshake, and not taken from the ~334 KiB internal heap on every chapter.
+/// A ~2 MiB SD face parsed by fontdue already occupies more than 2 MiB of
+/// PSRAM. Offline download no longer keeps the chapter body beside that face:
+/// each read is [`DOWNLOAD_CHUNK_BYTES`] and the main task writes it. The 2 KiB
+/// TLS I/O buffers stay in internal RAM.
 const MAX_SET_COOKIE_BYTES: usize = 4 * 1024;
 
 pub struct HttpJobs {
@@ -45,11 +63,27 @@ pub struct HttpJobs {
 }
 
 struct Inflight {
-    handle: NamedWorkerHandle<Report, String>,
+    reply: mpsc::Receiver<Report>,
+    chunks: Option<mpsc::Receiver<DownloadEvent>>,
+    download: Option<offline::ChapterDownload>,
+    write_error: Option<String>,
+    chunks_closed: bool,
     cancel: Arc<AtomicBool>,
     generation: u64,
     job: Job,
     session: session::Session,
+}
+
+struct QueuedJob {
+    work: Work,
+    unix: Option<u64>,
+    cancel: Arc<AtomicBool>,
+    seed: u64,
+    download_tx: Option<mpsc::SyncSender<DownloadEvent>>,
+}
+
+struct WorkerSlot {
+    worker: LongLivedWorker<QueuedJob, Report>,
 }
 
 impl Default for HttpJobs {
@@ -87,46 +121,251 @@ impl HttpJobs {
 }
 
 fn poll_report(job: &mut Inflight) -> Option<Report> {
-    let joined = job.handle.try_join()?;
-    Some(match joined {
-        Ok(report) => report,
-        Err(error) => Report {
-            generation: job.generation,
-            job: job.job.clone(),
-            session: job.session.clone(),
-            result: Err(JobError::Message(format!("WeRead worker failed: {error}"))),
-        },
-    })
+    drain_download(job);
+    if !job.chunks_closed {
+        return None;
+    }
+    match job.reply.try_recv() {
+        Ok(mut report) => {
+            if let Some(download) = job.download.take() {
+                let succeeded = report.result.is_ok();
+                if let Err(error) =
+                    offline::complete_download(download, succeeded, job.write_error.take())
+                {
+                    if report.result.is_ok() {
+                        report.result = Err(JobError::Message(error));
+                    }
+                }
+            }
+            Some(report)
+        }
+        Err(TryRecvError::Empty) => None,
+        Err(TryRecvError::Disconnected) => {
+            if let Some(download) = job.download.take() {
+                download.abort();
+            }
+            Some(error_report(
+                job.generation,
+                job.job.clone(),
+                job.session.clone(),
+                "WeRead worker stopped".into(),
+            ))
+        }
+    }
+}
+
+fn drain_download(job: &mut Inflight) {
+    let Some(chunks) = job.chunks.take() else {
+        job.chunks_closed = true;
+        return;
+    };
+    loop {
+        match chunks.try_recv() {
+            Ok(event) => {
+                if job.write_error.is_some() {
+                    continue;
+                }
+                if let Some(download) = job.download.as_mut() {
+                    if let Err(error) = download.apply(event) {
+                        job.write_error = Some(error);
+                    }
+                }
+            }
+            Err(TryRecvError::Empty) => {
+                job.chunks = Some(chunks);
+                break;
+            }
+            Err(TryRecvError::Disconnected) => {
+                job.chunks_closed = true;
+                break;
+            }
+        }
+    }
 }
 
 fn spawn_work(work: Work, unix: Option<u64>, cancel: Arc<AtomicBool>) -> Result<Inflight, Report> {
     let generation = work.generation;
     let job = work.job.clone();
     let session = work.session.clone();
-    let flag = Arc::clone(&cancel);
-    let seed = random_seed();
-    match NamedWorkerHandle::spawn("weread-http", WEREAD_HTTP_WORKER_STACK_BYTES, move || {
-        let mut transport = EspTransport {
-            gap: true,
-            cancel: flag,
-        };
-        Ok::<Report, String>(client::perform_with_seed(&mut transport, work, unix, seed))
-    }) {
-        Ok(handle) => Ok(Inflight {
-            handle,
+    let (download, download_tx, chunks) = match &job {
+        Job::Chapter {
+            fetch_images: false,
+            book_id,
+            chapter_uid,
+            chapter_idx,
+            ..
+        } => {
+            match offline::ChapterDownload::begin(
+                Path::new("/sdcard/RUSTMIX"),
+                book_id,
+                chapter_uid,
+                *chapter_idx,
+            ) {
+                Ok(file) => {
+                    let (tx, rx) = mpsc::sync_channel(2);
+                    (Some(file), Some(tx), Some(rx))
+                }
+                Err(error) => {
+                    return Err(error_report(generation, job, session, error));
+                }
+            }
+        }
+        _ => (None, None, None),
+    };
+    let chunks_closed = chunks.is_none();
+    let queued = QueuedJob {
+        work,
+        unix,
+        cancel: Arc::clone(&cancel),
+        seed: random_seed(),
+        download_tx,
+    };
+    match submit_job(queued) {
+        Ok(reply) => Ok(Inflight {
+            reply,
+            chunks,
+            download,
+            write_error: None,
+            chunks_closed,
             cancel,
             generation,
             job,
             session,
         }),
-        Err(error) => Err(Report {
-            generation,
-            job,
-            session,
-            result: Err(JobError::Message(format!(
-                "WeRead worker failed to start: {error}"
-            ))),
-        }),
+        Err(error) => {
+            if let Some(file) = download {
+                file.abort();
+            }
+            Err(error_report(
+                generation,
+                job,
+                session,
+                format!("WeRead worker failed to start: {error}"),
+            ))
+        }
+    }
+}
+
+fn error_report(generation: u64, job: Job, session: session::Session, message: String) -> Report {
+    log_runtime_memory("weread-http-spawn-failed");
+    Report {
+        generation,
+        job,
+        session,
+        result: Err(JobError::Message(message)),
+    }
+}
+
+fn submit_job(mut job: QueuedJob) -> Result<mpsc::Receiver<Report>, String> {
+    for attempt in 0..2 {
+        let worker = {
+            let mut slot = worker_slot()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if slot.is_none() {
+                match start_worker() {
+                    Ok(worker) => *slot = Some(WorkerSlot { worker }),
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            slot.as_ref().unwrap().worker.clone()
+        };
+        match worker.submit(job) {
+            Ok(reply) => return Ok(reply),
+            Err(returned) => {
+                job = returned;
+                let mut slot = worker_slot()
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                *slot = None;
+                if attempt == 1 {
+                    return Err("Not enough memory".into());
+                }
+            }
+        }
+    }
+    Err("Not enough memory".into())
+}
+
+fn worker_slot() -> &'static Mutex<Option<WorkerSlot>> {
+    static SLOT: Mutex<Option<WorkerSlot>> = Mutex::new(None);
+    &SLOT
+}
+
+fn start_worker() -> Result<LongLivedWorker<QueuedJob, Report>, std::io::Error> {
+    log_runtime_memory("weread-http-spawn");
+    let _psram_stack = PsramStackGuard::enter(WEREAD_HTTP_WORKER_STACK_BYTES);
+    LongLivedWorker::spawn(
+        "weread-http",
+        WEREAD_HTTP_WORKER_STACK_BYTES,
+        |job: QueuedJob| {
+            log_worker_memory(
+                "weread-http-before-job",
+                "weread-http",
+                WEREAD_HTTP_WORKER_STACK_BYTES,
+            );
+            let report = {
+                let mut transport = EspTransport {
+                    gap: true,
+                    cancel: job.cancel,
+                    download: job.download_tx,
+                };
+                let report =
+                    client::perform_with_seed(&mut transport, job.work, job.unix, job.seed);
+                drop(transport);
+                report
+            };
+            log::info!("rustmix-wave=weread-http status=client-released");
+            log_worker_memory(
+                "weread-http-after-job",
+                "weread-http",
+                WEREAD_HTTP_WORKER_STACK_BYTES,
+            );
+            report
+        },
+    )
+}
+
+/// Sets pthread stack caps for the duration of one `pthread_create`.
+///
+/// Restoring the previous config keeps weather, EPUB, and Lua workers on
+/// internal stacks. Those tasks touch the filesystem and NVS.
+struct PsramStackGuard {
+    restore: esp_idf_svc::sys::esp_pthread_cfg_t,
+}
+
+impl PsramStackGuard {
+    fn enter(stack_bytes: usize) -> Self {
+        unsafe {
+            let fallback = sys::esp_pthread_get_default_config();
+            let mut restore = fallback;
+            if sys::esp_pthread_get_cfg(&mut restore) != ESP_OK {
+                restore = fallback;
+            }
+            let mut cfg = restore;
+            cfg.stack_size = stack_bytes;
+            cfg.stack_alloc_caps = sys::MALLOC_CAP_SPIRAM | sys::MALLOC_CAP_8BIT;
+            cfg.inherit_cfg = false;
+            cfg.thread_name = c"weread-http".as_ptr();
+            if sys::esp_pthread_set_cfg(&cfg) == ESP_OK {
+                log::info!(
+                    "rustmix-wave=weread-http status=psram-stack stack-bytes={stack_bytes} caps=spiram"
+                );
+            } else {
+                log::warn!(
+                    "rustmix-wave=weread-http status=psram-stack-cfg-failed stack-bytes={stack_bytes} fallback=internal"
+                );
+            }
+            Self { restore }
+        }
+    }
+}
+
+impl Drop for PsramStackGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = sys::esp_pthread_set_cfg(&self.restore);
+        }
     }
 }
 
@@ -139,6 +378,7 @@ fn random_seed() -> u64 {
 struct EspTransport {
     gap: bool,
     cancel: Arc<AtomicBool>,
+    download: Option<mpsc::SyncSender<DownloadEvent>>,
 }
 
 impl Transport for EspTransport {
@@ -167,6 +407,26 @@ impl Transport for EspTransport {
             return Err("cancelled".into());
         }
         http_call(request, &self.cancel)
+    }
+
+    fn streaming_download(&self) -> bool {
+        self.download.is_some()
+    }
+
+    fn call_stream(
+        &mut self,
+        request: &Request,
+        part: &'static str,
+    ) -> Result<client::StreamedPart, String> {
+        self.gap = true;
+        if self.cancelled() {
+            return Err("cancelled".into());
+        }
+        let tx = self
+            .download
+            .as_ref()
+            .ok_or("streaming download is not available")?;
+        http_call_stream(request, &self.cancel, tx, part)
     }
 }
 
@@ -218,8 +478,8 @@ fn http_call(request: &Request, cancel: &AtomicBool) -> Result<Response, String>
     let mut config = esp_http_client_config_t::default();
     config.url = url.as_ptr();
     config.timeout_ms = (HTTP_TIMEOUT_SECS * 1000) as i32;
-    config.buffer_size = 2048;
-    config.buffer_size_tx = 2048;
+    config.buffer_size = HTTP_IO_BUFFER_BYTES as _;
+    config.buffer_size_tx = HTTP_IO_BUFFER_BYTES as _;
     config.event_handler = Some(on_http_event);
     config.user_data = &mut cookies as *mut CookieList as *mut core::ffi::c_void;
     config.crt_bundle_attach = Some(sys::esp_crt_bundle_attach);
@@ -317,6 +577,133 @@ fn http_call(request: &Request, cancel: &AtomicBool) -> Result<Response, String>
         set_cookie: cookies.text,
         content_length: declared,
     })
+}
+
+fn http_call_stream(
+    request: &Request,
+    cancel: &AtomicBool,
+    tx: &mpsc::SyncSender<DownloadEvent>,
+    part: &'static str,
+) -> Result<client::StreamedPart, String> {
+    let url = CString::new(request.url.as_str()).map_err(|_| "URL is not a C string")?;
+    let mut cookies = CookieList {
+        text: String::new(),
+    };
+    let mut config = esp_http_client_config_t::default();
+    config.url = url.as_ptr();
+    config.timeout_ms = (HTTP_TIMEOUT_SECS * 1000) as i32;
+    config.buffer_size = HTTP_IO_BUFFER_BYTES as _;
+    config.buffer_size_tx = HTTP_IO_BUFFER_BYTES as _;
+    config.event_handler = Some(on_http_event);
+    config.user_data = &mut cookies as *mut CookieList as *mut core::ffi::c_void;
+    config.crt_bundle_attach = Some(sys::esp_crt_bundle_attach);
+    let raw = unsafe { esp_http_client_init(&config) };
+    if raw.is_null() {
+        return Err("HTTP connection init failed".into());
+    }
+    let client = HttpClient(raw);
+    let method = if request.method == "POST" {
+        esp_http_client_method_t_HTTP_METHOD_POST
+    } else {
+        esp_http_client_method_t_HTTP_METHOD_GET
+    };
+    if unsafe { esp_http_client_set_method(client.0, method) } != ESP_OK {
+        return Err("HTTP method setup failed".into());
+    }
+    let mut owned_headers = Vec::new();
+    for (name, value) in &request.headers {
+        if name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        let c_name = CString::new(name.as_str()).map_err(|_| "header name is not a C string")?;
+        let c_value = CString::new(value.as_str()).map_err(|_| "header value is not a C string")?;
+        if unsafe { esp_http_client_set_header(client.0, c_name.as_ptr(), c_value.as_ptr()) }
+            != ESP_OK
+        {
+            return Err("HTTP header setup failed".into());
+        }
+        owned_headers.push((c_name, c_value));
+    }
+    let write_len = request.body.as_ref().map(String::len).unwrap_or(0) as i32;
+    if unsafe { esp_http_client_open(client.0, write_len) } != ESP_OK {
+        return Err("HTTP request failed".into());
+    }
+    if let Some(body) = request.body.as_deref() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        let wrote = unsafe {
+            esp_http_client_write(
+                client.0,
+                body.as_ptr() as *const core::ffi::c_char,
+                write_len,
+            )
+        };
+        if wrote != write_len {
+            return Err("HTTP request write failed".into());
+        }
+    }
+    let fetched = unsafe { esp_http_client_fetch_headers(client.0) };
+    if fetched < 0 {
+        return Err("HTTP response headers failed".into());
+    }
+    let status = unsafe { esp_http_client_get_status_code(client.0) } as u16;
+    let content_length = unsafe { esp_http_client_get_content_length(client.0) };
+    if content_length >= 0 && content_length as usize > request.max_bytes {
+        return Err("response exceeds size limit".into());
+    }
+    // One reusable read buffer. Chunks forwarded to the main task are the only
+    // body copies; the shard is not assembled on this thread.
+    let mut chunk = vec![0u8; DOWNLOAD_CHUNK_BYTES];
+    let mut prefix = Vec::new();
+    let mut total = 0usize;
+    emit_download(tx, DownloadEvent::BeginPart(part))?;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        let read = unsafe {
+            esp_http_client_read(
+                client.0,
+                chunk.as_mut_ptr() as *mut core::ffi::c_char,
+                chunk.len() as i32,
+            )
+        };
+        if read < 0 {
+            return Err("HTTP response read failed".into());
+        }
+        if read == 0 {
+            break;
+        }
+        let slice = &chunk[..read as usize];
+        if prefix.len() < DOWNLOAD_CLASSIFY_BYTES {
+            let room = DOWNLOAD_CLASSIFY_BYTES - prefix.len();
+            prefix.extend_from_slice(&slice[..slice.len().min(room)]);
+        }
+        total = total.saturating_add(slice.len());
+        if total > request.max_bytes {
+            return Err("response exceeds size limit".into());
+        }
+        emit_download(tx, DownloadEvent::Chunk(slice.to_vec()))?;
+    }
+    emit_download(tx, DownloadEvent::EndPart)?;
+    log::info!(
+        "rustmix-wave=weread-http method={} status={} bytes={} set-cookie-bytes={} stream=chunk",
+        request.method,
+        status,
+        total,
+        cookies.text.len()
+    );
+    Ok(client::StreamedPart {
+        status,
+        set_cookie: cookies.text,
+        prefix,
+        total,
+    })
+}
+
+fn emit_download(tx: &mpsc::SyncSender<DownloadEvent>, event: DownloadEvent) -> Result<(), String> {
+    tx.send(event).map_err(|_| "download cancelled".to_string())
 }
 
 fn c_string(ptr: *mut core::ffi::c_char) -> String {

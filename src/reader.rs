@@ -2398,6 +2398,19 @@ impl ReaderUiState {
     /// settings persist immediately and request a staged current-page rebuild.
     #[must_use]
     pub fn activate_selected_preference(&mut self) -> bool {
+        self.apply_selected_preference(true)
+    }
+
+    /// Apply the highlighted preference without tearing down an open TXT/EPUB.
+    ///
+    /// WeRead opens this same editor. Layout changes update `session.layout`
+    /// in place; the caller repaginates the open WeRead chapter.
+    pub fn activate_shared_preference(&mut self) {
+        self.refresh_font_catalog();
+        let _ = self.apply_selected_preference(false);
+    }
+
+    fn apply_selected_preference(&mut self, rebuild_open_book: bool) -> bool {
         let layout_sensitive = match self.selected_preference() {
             ReadingPreference::ReadingTheme => {
                 self.preferences.theme = self.preferences.theme.next();
@@ -2450,9 +2463,13 @@ impl ReaderUiState {
                 false
             }
         };
-        if layout_sensitive {
+        if !layout_sensitive {
+            return false;
+        }
+        if rebuild_open_book {
             self.request_layout_rebuild()
         } else {
+            self.persist_shared_typography();
             false
         }
     }
@@ -2493,6 +2510,13 @@ impl ReaderUiState {
         self.cycle_book_font_choice();
         self.last_message = Some(format!("Book font: {}", self.book_font_display_label()));
         self.request_layout_rebuild()
+    }
+
+    fn persist_shared_typography(&mut self) {
+        self.persist_preferences_best_effort();
+        if let Some(session) = self.session.as_mut() {
+            session.layout = self.preferences.layout();
+        }
     }
 
     fn cycle_book_font_choice(&mut self) {

@@ -128,7 +128,7 @@ Button wake       -> GPIO0/4/5/6 ext1, restore the saved route
 
 The ESP32-S3 stays at a fixed clock unless `CONFIG_PM_ENABLE` is set. This firmware enables DFS from 80 MHz to 240 MHz and tickless idle so a blocked main task can light-sleep. 80 MHz is the floor for octal PSRAM. Bluetooth is left disabled. PSRAM is retained in light sleep and lost in deep sleep, so deep sleep writes the TXT/EPUB offset and the WeRead chapter to the SD card and stores the route in NVS and RTC noinit memory.
 
-`src/power_policy.rs` decides radio idle, the blocking wait, panel transport, and auto deep sleep. The panel rail stays on during reading so a partial refresh can keep the previous image in controller RAM. After 60 seconds idle, or when entering the sleep image, the SSD1677 deep-sleeps (`0x10`) and ALDO3 turns off. If `0x10` was sent and a later pin or rail step fails, the retained frame is dropped and the next refresh is `show_base`. A failed PSRAM copy of the last frame does the same instead of aborting. Otherwise the next partial writes the retained frame to plane `0x26` before the new frame goes to `0x24`. A rail cut never uses a bare `0x24` partial. Wi-Fi stops about 20 seconds after NTP, weather, WeRead, SoftAP, or the transfer portal finishes. The ES8311 and NS4150B power down when audio is idle. The SD host clock returns to 10 MHz before the next loop's file access and drops to 400 kHz only while the main task is blocked. Button GPIOs wake light sleep on a low level. Deep sleep wakes from UP, SELECT, DOWN, and BOOT. The AXP2101 Power key is not an RTC GPIO, so it cannot wake deep sleep; the sleep image says so. Device Info page 4 shows the estimate and the AXP2101 battery ADC. The current table in that module is an estimate, not a board measurement.
+`src/power_policy.rs` decides radio idle, the blocking wait, panel transport, and auto deep sleep. The panel rail stays on during reading so a partial refresh can keep the previous image in controller RAM. After 60 seconds idle, or when entering the sleep image, the SSD1677 deep-sleeps (`0x10`) and ALDO3 turns off. If `0x10` was sent and a later pin or rail step fails, the retained frame is dropped and the next refresh is `show_base`. A failed PSRAM copy of the last frame does the same instead of aborting. Otherwise the next partial writes the retained frame to plane `0x26` before the new frame goes to `0x24`. A rail cut never uses a bare `0x24` partial. Wi-Fi stops about 20 seconds after NTP, weather, WeRead, SoftAP, or the transfer portal finishes. The ES8311 and NS4150B power down when audio is idle. The SD host clock returns to 10 MHz before the next loop's file access and drops to 400 kHz only while the main task is blocked. While `WereadUi::needs_radio` is true, including the pause between offline-download chapters, the station stays up, the SD clock stays at 10 MHz, and auto deep sleep is blocked. Button GPIOs wake light sleep on a low level. Deep sleep wakes from UP, SELECT, DOWN, and BOOT. The AXP2101 Power key is not an RTC GPIO, so it cannot wake deep sleep; the sleep image says so. Device Info page 4 shows the estimate and the AXP2101 battery ADC. The current table in that module is an estimate, not a board measurement.
 
 GPIO0 BOOT remains the UI navigation key:
 
@@ -168,7 +168,7 @@ Reader writes use FAT 8.3-safe `.TMP` and `.BAK` siblings. Bookmarks retain byte
 /sdcard/RUSTMIX/WEREAD/<8HEX>/PROG.TXT
 ```
 
-The main loop runs at most one WeRead job per iteration, then returns to button polling. Login polls and whole-book downloads are separate jobs. Chapter bytes and images are heap allocations checked against a cap before `Vec` reserve; allocations above 16 KiB use PSRAM.
+The main loop runs at most one WeRead job per iteration, then returns to button polling. Login polls and whole-book downloads are separate jobs on one long-lived worker, so a chapter download does not allocate another pthread stack. That worker's stack is in PSRAM. FATFS, NVS, and other flash-cache users stay on the main task, whose stack is in internal RAM: a PSRAM stack must not disable the flash cache. Offline download reads each chapter response in 8 KiB chunks on the worker and sends them through a bounded channel. The main task writes those chunks to `CHAP.TMP` and renames the file. The raw parts stay on the SD card; the chapter is decoded and paginated only when it is opened, then stored as plain text. Interactive reading of one chapter still buffers that chapter. A failed download deletes the temp file, retries the chapter, then skips it and continues the book. Catalog chapter objects are scanned for their scalar fields, so an `anchors` array larger than 2 KiB does not drop the chapter. A catalog body that is not complete JSON, including one cut off at the response cap, is reported as a truncated response instead of an empty book. Book info and progress reads accept the same nested `book` / `readingProgress` shapes. Each chapterInfos, chapterinfo, and progress response logs its path, status, byte count, errcode, parsed chapter count, and truncated flag, without the query string or cookies. SELECT on a chapter opens the existing Reading Preferences screen. The open chapter is paginated with those preferences and rebuilt when the font, size, or other layout setting changes. SD faces from `/fonts` and `/RUSTMIX/FONTS` are loaded once at boot; fontdue keeps every outline, so a ~2 MiB TTF occupies more than 2 MiB of PSRAM. Heap free and largest-block sizes are logged at `sd-font-loaded` and around each WeRead job. The 2 KiB TLS I/O buffers stay in internal RAM. During download the 8 MiB module budget covers that face (planned at 2× the file cap), the 32 KiB worker stack, a few 8 KiB chunks, and the 512 KiB glyph cache. Opening one stored chapter can still allocate a single shard and its text after the download has finished.
 
 ## Voice Notes boundary
 
@@ -299,20 +299,20 @@ Heavy operations are deliberately moved away from the main task:
 | Full EPUB parse | short-lived `epub-parser` thread | 64 KiB worker stack | heap-owned bounded EPUB document |
 | EPUB title lookup during library scans | short-lived EPUB title thread | 32 KiB worker stack | compact title string |
 | HTTPS weather fetch | `runtime_worker::run_named_worker("weather-fetch", ...)` | 64 KiB worker stack, bounded 8 KiB response | parsed weather snapshot or classified error |
-| WeRead HTTPS job | `runtime_worker::NamedWorkerHandle::spawn("weread-http", ...)` polled from the main loop | 96 KiB worker stack, capped JSON/HTML/shard/image bodies | one login, shelf, chapter, progress, notes, or cover result |
+| WeRead HTTPS job | one long-lived `weread-http` thread, channel queue, polled from the main loop | 32 KiB PSRAM pthread stack (`esp_pthread_set_cfg` + `MALLOC_CAP_SPIRAM`), capped JSON/HTML/shard/image bodies, HTTP client cleaned up between jobs | one login, shelf, chapter, progress, notes, or cover result |
 | Lua app open | `runtime_worker::run_named_worker("lua-loader", ...)` | 32 KiB worker stack, bounded script size | compact native Lua session and canvas |
 | Wi-Fi transfer portal | ESP-IDF HTTP server task | 24 KiB task stack, 4 KiB streaming chunks, 64 MiB upload cap | compact lifecycle snapshot |
 | Voice Notes PCM record/playback | cooperative main-loop chunks | bounded I2S RX/TX buffers, streamed `.TMP` finalization | compact UI progress snapshots |
 
 `src/runtime_worker.rs` logs memory snapshots before and after generic named workers, joins the short-lived thread, maps worker-start and panic failures into explicit errors, and returns a compact result to the main loop.
 
-`src/runtime_memory.rs` records:
+`src/runtime_memory.rs` records the calling task's unused stack. Main-task logs name that figure `main-stack-high-water-bytes`. The `weread-http` worker logs `worker-stack-free-bytes` against its 32 KiB stack and warns when less than one eighth remains. Heap fields are:
 
 ```text
-main-stack-high-water-bytes
 heap-free-internal-bytes
 heap-largest-internal-block-bytes
 heap-free-psram-bytes
+heap-largest-psram-block-bytes
 ```
 
 This makes memory pressure visible in monitor logs and prevents stack-heavy parsing, TLS, or Lua loading from silently consuming the main-loop stack.

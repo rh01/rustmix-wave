@@ -148,11 +148,13 @@ Shelf rows:
 
 Book rows are **Read**, **Contents**, **Notes**, **Download**, and **Refresh**.
 
-Reading uses the same font, size, and CJK faces as the TXT/EPUB reader. Rotate up and down to change pages. At the ends of a chapter the control moves to the previous or next chapter. SELECT returns to the book menu. BOOT long does the same. After a page turn the device waits a few seconds, then uploads progress to WeRead when a web session is present.
+**Read** opens the saved chapter, or chapter 1 when progress has no chapter yet. If the contents are not loaded, Read fetches them first (the footer says WORKING) and then opens the book. A failed fetch stays on the book screen with the error text.
+
+Reading uses the same font, size, and CJK faces as the TXT/EPUB reader, including faces installed under `/RUSTMIX/FONTS`. SELECT on a chapter opens Reading Preferences, the same screen the local reader uses. BOOT long returns to the chapter. If the font or size changed, the open chapter is repaginated in place. BOOT long again returns to the book menu. Rotate up and down to change pages. At the ends of a chapter the control moves to the previous or next chapter. After a page turn the device waits a few seconds, then uploads progress to WeRead when a web session is present.
 
 While a request is running the footer says WORKING. SELECT cancels it. Buttons and the idle timer keep running; a slow request does not put the panel to sleep the moment it returns.
 
-**Download** saves every chapter as plain text under `/RUSTMIX/WEREAD/<8 hex>/<8 hex>.TXT`. SELECT cancels the chapter that is downloading, and BOOT long leaves the screen. Saved chapters open with no network. The clock must be synced over Wi-Fi before a chapter can be fetched; the device treats the RTC value as UTC+8 wall time.
+**Download** writes each chapter response to `/RUSTMIX/WEREAD/<8 hex>/<8 hex>.TXT` in 8 KiB chunks, using a temporary file that is renamed when the chapter finishes. The download does not keep the chapter in memory or paginate it. Opening a saved chapter decodes it and paginates it. One worker thread is reused for every chapter. If a chapter or the SD write fails, the device retries it and then continues with the rest of the book. A full card shows "SD card full". Skipped chapters are stored in `SKIP.TXT` and are not fetched again after a reboot. SELECT cancels the chapter that is downloading, and BOOT long leaves the screen. Saved chapters open with no network. The clock must be synced over Wi-Fi before a chapter can be fetched; the device treats the RTC value as UTC+8 wall time. Wi-Fi and the SD card stay in their active modes for the whole download, including the pause between chapters.
 
 Highlights and notes use the official read-only API and need the `wrk-` key. Phone-number one-time-password login is not supported: finish that step in the WeRead app, then scan again.
 

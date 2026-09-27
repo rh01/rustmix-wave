@@ -5,6 +5,10 @@
 //! Settings > Network > Configure Wi-Fi is selected. Saving writes NVS and,
 //! when the card is present, writes `WIFI.TXT` back. The LAN transfer portal
 //! stays a separate STA-only service.
+//!
+//! The open AP has the same 10-minute budget as the transfer portal, both as an
+//! idle timeout and as a total timeout. Every exit stops the HTTP server and
+//! the SoftAP radio together.
 
 use crate::network_config::{NetworkConfig, DEFAULT_NTP_SERVER, DEFAULT_TIMEZONE};
 
@@ -18,6 +22,249 @@ pub const WIFI_SETUP_HTTP_PORT: u16 = 80;
 pub const WIFI_SETUP_SERVER_STACK_BYTES: usize = 20 * 1024;
 /// Bound scan rows returned to the phone UI.
 pub const WIFI_SETUP_MAX_SCAN: usize = 24;
+/// POST `/save` body cap. A full buffer with more bytes still unread is rejected.
+pub const WIFI_SETUP_MAX_BODY_BYTES: usize = 256;
+/// HTTP status when that cap is exceeded. The truncated body is not saved.
+pub const WIFI_SETUP_BODY_TOO_LARGE_STATUS: u16 = 413;
+/// `/scan` response type. SSIDs are JSON-escaped, including `<`.
+pub const WIFI_SETUP_SCAN_CONTENT_TYPE: &str = "application/json";
+/// Idle timeout with no HTTP traffic. Matches the transfer portal.
+pub const WIFI_SETUP_IDLE_TIMEOUT_SECONDS: u64 = 10 * 60;
+/// Hard cap from the moment the setup AP starts, even if the phone keeps polling.
+pub const WIFI_SETUP_TOTAL_TIMEOUT_SECONDS: u64 = 10 * 60;
+/// Shown on e-paper after the setup AP stops on its own.
+pub const WIFI_SETUP_RESTART_HINT: &str = "Settings > Network > Configure Wi-Fi";
+
+/// Why a running setup session must stop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WifiSetupTimeoutKind {
+    Idle,
+    Total,
+}
+
+impl WifiSetupTimeoutKind {
+    #[must_use]
+    pub const fn log_reason(self) -> &'static str {
+        match self {
+            Self::Idle => "idle-timeout",
+            Self::Total => "total-timeout",
+        }
+    }
+}
+
+/// Host-testable idle and total timeout clock. Times are milliseconds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WifiSetupSessionClock {
+    started_ms: u64,
+    last_activity_ms: u64,
+}
+
+impl WifiSetupSessionClock {
+    #[must_use]
+    pub const fn start(now_ms: u64) -> Self {
+        Self {
+            started_ms: now_ms,
+            last_activity_ms: now_ms,
+        }
+    }
+
+    pub fn note_activity(&mut self, now_ms: u64) {
+        if now_ms > self.last_activity_ms {
+            self.last_activity_ms = now_ms;
+        }
+    }
+
+    #[must_use]
+    pub fn poll(self, now_ms: u64) -> Option<WifiSetupTimeoutKind> {
+        Self::from_elapsed(
+            now_ms.saturating_sub(self.last_activity_ms),
+            now_ms.saturating_sub(self.started_ms),
+        )
+    }
+
+    /// `idle_ms` is time since the last HTTP request. `total_ms` is time since start.
+    #[must_use]
+    pub fn from_elapsed(idle_ms: u64, total_ms: u64) -> Option<WifiSetupTimeoutKind> {
+        let idle_due = idle_ms >= timeout_millis(WIFI_SETUP_IDLE_TIMEOUT_SECONDS);
+        let total_due = total_ms >= timeout_millis(WIFI_SETUP_TOTAL_TIMEOUT_SECONDS);
+        match (idle_due, total_due) {
+            (false, false) => None,
+            (false, true) => Some(WifiSetupTimeoutKind::Total),
+            (true, false) => Some(WifiSetupTimeoutKind::Idle),
+            (true, true) if idle_ms < total_ms => Some(WifiSetupTimeoutKind::Total),
+            (true, true) => Some(WifiSetupTimeoutKind::Idle),
+        }
+    }
+}
+
+const fn timeout_millis(seconds: u64) -> u64 {
+    seconds.saturating_mul(1_000)
+}
+
+/// Every way the setup portal leaves the running state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WifiSetupExit {
+    SettingsStop,
+    HttpServerFailed,
+    SoftApFailed,
+    SavedCredentials,
+    IdleTimeout,
+    TotalTimeout,
+    SleepEntry,
+    Restart,
+    TransferPortal,
+}
+
+impl WifiSetupExit {
+    pub const ALL: [Self; 9] = [
+        Self::SettingsStop,
+        Self::HttpServerFailed,
+        Self::SoftApFailed,
+        Self::SavedCredentials,
+        Self::IdleTimeout,
+        Self::TotalTimeout,
+        Self::SleepEntry,
+        Self::Restart,
+        Self::TransferPortal,
+    ];
+
+    /// One teardown plan: HTTP and the AP radio both stop, on every path.
+    #[must_use]
+    pub const fn teardown(self) -> WifiSetupTeardown {
+        let _ = self;
+        WifiSetupTeardown {
+            stop_http: true,
+            stop_ap_radio: true,
+        }
+    }
+
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::SettingsStop => "settings-stop",
+            Self::HttpServerFailed => "http-start-failed",
+            Self::SoftApFailed => "softap-start-failed",
+            Self::SavedCredentials => "saved-credentials",
+            Self::IdleTimeout => "idle-timeout",
+            Self::TotalTimeout => "total-timeout",
+            Self::SleepEntry => "sleep-entry",
+            Self::Restart => "restart",
+            Self::TransferPortal => "transfer-portal",
+        }
+    }
+
+    #[must_use]
+    pub const fn shows_restart_hint(self) -> bool {
+        matches!(self, Self::IdleTimeout | Self::TotalTimeout)
+    }
+}
+
+/// Resources a setup exit must release.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WifiSetupTeardown {
+    pub stop_http: bool,
+    pub stop_ap_radio: bool,
+}
+
+/// HTTP server and SoftAP radio ownership, used to prove teardown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SetupResources {
+    pub http: bool,
+    pub ap_radio: bool,
+}
+
+impl SetupResources {
+    #[must_use]
+    pub const fn apply_exit(self, exit: WifiSetupExit) -> Self {
+        let plan = exit.teardown();
+        Self {
+            http: self.http && !plan.stop_http,
+            ap_radio: self.ap_radio && !plan.stop_ap_radio,
+        }
+    }
+}
+
+/// What to do with a POST `/save` body after the bounded read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SetupPostDecision {
+    Save(NetworkConfig),
+    TooLarge,
+    Invalid(String),
+}
+
+impl SetupPostDecision {
+    #[must_use]
+    pub const fn status_code(&self) -> u16 {
+        match self {
+            Self::Save(_) => 200,
+            Self::TooLarge => WIFI_SETUP_BODY_TOO_LARGE_STATUS,
+            Self::Invalid(_) => 400,
+        }
+    }
+}
+
+/// Stack buffer for POST `/save`. Overflow is remembered so a truncated form is never parsed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupBodyAccumulator {
+    buf: [u8; WIFI_SETUP_MAX_BODY_BYTES],
+    filled: usize,
+    overflow: bool,
+}
+
+impl SetupBodyAccumulator {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            buf: [0; WIFI_SETUP_MAX_BODY_BYTES],
+            filled: 0,
+            overflow: false,
+        }
+    }
+
+    /// Push the next socket read. Returns true once the body exceeds the cap.
+    pub fn push(&mut self, chunk: &[u8]) -> bool {
+        if chunk.is_empty() {
+            return self.overflow;
+        }
+        if self.overflow {
+            return true;
+        }
+        let room = WIFI_SETUP_MAX_BODY_BYTES.saturating_sub(self.filled);
+        if chunk.len() > room {
+            if room > 0 {
+                self.buf[self.filled..self.filled + room].copy_from_slice(&chunk[..room]);
+                self.filled += room;
+            }
+            self.overflow = true;
+            return true;
+        }
+        self.buf[self.filled..self.filled + chunk.len()].copy_from_slice(chunk);
+        self.filled += chunk.len();
+        false
+    }
+
+    #[must_use]
+    pub fn decide(&self) -> SetupPostDecision {
+        if self.overflow {
+            return SetupPostDecision::TooLarge;
+        }
+        let bytes = &self.buf[..self.filled];
+        let text = match core::str::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => return SetupPostDecision::Invalid("form is not UTF-8".into()),
+        };
+        match parse_setup_form(text) {
+            Ok(config) => SetupPostDecision::Save(config),
+            Err(error) => SetupPostDecision::Invalid(format!("{error:#}")),
+        }
+    }
+}
+
+impl Default for SetupBodyAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// User request handed from Settings into `main.rs`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,6 +282,7 @@ pub enum WifiSetupState {
     Ready,
     Saving,
     Failed,
+    TimedOut,
 }
 
 impl WifiSetupState {
@@ -46,6 +294,7 @@ impl WifiSetupState {
             Self::Ready => "READY",
             Self::Saving => "SAVING",
             Self::Failed => "FAILED",
+            Self::TimedOut => "TIMEOUT",
         }
     }
 }
@@ -108,6 +357,22 @@ impl WifiSetupSnapshot {
             state: WifiSetupState::Failed,
             last_action: "SoftAP setup failed".into(),
             error: Some(error.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Setup AP stopped on its own. E-paper tells the user how to start it again.
+    #[must_use]
+    pub fn timed_out(kind: WifiSetupTimeoutKind) -> Self {
+        let last_action = match kind {
+            WifiSetupTimeoutKind::Idle => "Stopped after 10 idle minutes",
+            WifiSetupTimeoutKind::Total => "Stopped after 10 minutes",
+        };
+        Self {
+            state: WifiSetupState::TimedOut,
+            last_action: last_action.into(),
+            error: Some(format!("Restart: {WIFI_SETUP_RESTART_HINT}")),
+            network_count: 0,
             ..Self::default()
         }
     }
@@ -177,6 +442,21 @@ pub fn scanned_networks_json(networks: &[ScannedNetwork]) -> String {
     json
 }
 
+/// `/scan` payload. The handler sends `content_type` with the JSON body.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScanHttpBody {
+    pub content_type: &'static str,
+    pub json: String,
+}
+
+#[must_use]
+pub fn scan_http_body(networks: &[ScannedNetwork]) -> ScanHttpBody {
+    ScanHttpBody {
+        content_type: WIFI_SETUP_SCAN_CONTENT_TYPE,
+        json: scanned_networks_json(networks),
+    }
+}
+
 /// Parse `application/x-www-form-urlencoded` from POST `/save`.
 pub fn parse_setup_form(body: &str) -> anyhow::Result<NetworkConfig> {
     let mut ssid = None;
@@ -220,10 +500,24 @@ pub const fn setup_html() -> &'static str {
 const SAVED_HTML: &str = include_str!("wifi_setup_saved.html");
 
 fn json_escape(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '<' => escaped.push_str("\\u003c"),
+            '>' => escaped.push_str("\\u003e"),
+            '&' => escaped.push_str("\\u0026"),
+            other if other.is_control() => {
+                escaped.push_str(&format!("\\u{:04x}", u32::from(other)));
+            }
+            other => escaped.push(other),
+        }
+    }
+    escaped
 }
 
 fn percent_decode(value: &str) -> Result<String, &'static str> {
@@ -264,20 +558,21 @@ const fn hex(value: u8) -> Option<u8> {
 pub mod espidf {
     use std::{
         sync::{Arc, Mutex},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
-    use anyhow::{anyhow, Result};
+    use anyhow::Result;
     use embedded_svc::{
         http::Method,
         io::{Read as _, Write as _},
     };
     use esp_idf_svc::http::server::{Configuration, EspHttpServer};
-    use log::info;
+    use log::{info, warn};
 
     use super::{
-        parse_setup_form, scanned_networks_json, setup_html, setup_url, ScannedNetwork,
-        WifiSetupSnapshot, WifiSetupState, SAVED_HTML, WIFI_SETUP_HTTP_PORT,
+        scan_http_body, setup_html, setup_url, ScannedNetwork, SetupBodyAccumulator,
+        SetupPostDecision, WifiSetupSessionClock, WifiSetupSnapshot, WifiSetupState,
+        WifiSetupTimeoutKind, SAVED_HTML, WIFI_SETUP_HTTP_PORT, WIFI_SETUP_SCAN_CONTENT_TYPE,
         WIFI_SETUP_SERVER_STACK_BYTES,
     };
     use crate::network_config::NetworkConfig;
@@ -287,16 +582,25 @@ pub mod espidf {
         networks: Vec<ScannedNetwork>,
         pending: Option<NetworkConfig>,
         scan_requested: bool,
+        started_at: Instant,
+        last_activity_at: Instant,
     }
 
     impl SharedStatus {
         fn ready() -> Self {
+            let now = Instant::now();
             Self {
                 snapshot: WifiSetupSnapshot::ready(0),
                 networks: Vec::new(),
                 pending: None,
                 scan_requested: true,
+                started_at: now,
+                last_activity_at: now,
             }
+        }
+
+        fn touch(&mut self) {
+            self.last_activity_at = Instant::now();
         }
     }
 
@@ -319,82 +623,98 @@ pub mod espidf {
                 ..Default::default()
             })?;
 
-            server.fn_handler("/", Method::Get, move |request| {
-                request
-                    .into_ok_response()?
-                    .write_all(setup_html().as_bytes())?;
-                Ok::<(), anyhow::Error>(())
-            })?;
-            server.fn_handler("/index.html", Method::Get, move |request| {
-                request
-                    .into_ok_response()?
-                    .write_all(setup_html().as_bytes())?;
-                Ok::<(), anyhow::Error>(())
-            })?;
-            server.fn_handler("/generate_204", Method::Get, move |request| {
-                request
-                    .into_ok_response()?
-                    .write_all(setup_html().as_bytes())?;
-                Ok::<(), anyhow::Error>(())
-            })?;
-            server.fn_handler("/hotspot-detect.html", Method::Get, move |request| {
-                request
-                    .into_ok_response()?
-                    .write_all(setup_html().as_bytes())?;
-                Ok::<(), anyhow::Error>(())
-            })?;
-            server.fn_handler("/ncsi.txt", Method::Get, move |request| {
-                request
-                    .into_ok_response()?
-                    .write_all(setup_html().as_bytes())?;
-                Ok::<(), anyhow::Error>(())
-            })?;
-            server.fn_handler("/connecttest.txt", Method::Get, move |request| {
-                request
-                    .into_ok_response()?
-                    .write_all(setup_html().as_bytes())?;
-                Ok::<(), anyhow::Error>(())
-            })?;
+            for path in [
+                "/",
+                "/index.html",
+                "/generate_204",
+                "/hotspot-detect.html",
+                "/ncsi.txt",
+                "/connecttest.txt",
+            ] {
+                let page_shared = Arc::clone(&shared);
+                server.fn_handler(path, Method::Get, move |request| {
+                    lock(&page_shared).touch();
+                    request
+                        .into_ok_response()?
+                        .write_all(setup_html().as_bytes())?;
+                    Ok::<(), anyhow::Error>(())
+                })?;
+            }
 
             let scan_shared = Arc::clone(&shared);
             server.fn_handler("/scan", Method::Get, move |request| {
                 let mut locked = lock(&scan_shared);
+                locked.touch();
                 if request.uri().contains("refresh=1") {
                     locked.scan_requested = true;
                     locked.snapshot.last_action = "Scan requested".into();
                 }
-                let body = scanned_networks_json(&locked.networks);
-                request.into_ok_response()?.write_all(body.as_bytes())?;
+                let body = scan_http_body(&locked.networks);
+                debug_assert_eq!(body.content_type, WIFI_SETUP_SCAN_CONTENT_TYPE);
+                let payload = body.json;
+                drop(locked);
+                request
+                    .into_response(
+                        200,
+                        Some("OK"),
+                        &[("Content-Type", WIFI_SETUP_SCAN_CONTENT_TYPE)],
+                    )?
+                    .write_all(payload.as_bytes())?;
                 Ok::<(), anyhow::Error>(())
             })?;
 
             let save_shared = Arc::clone(&shared);
             server.fn_handler("/save", Method::Post, move |mut request| {
-                let mut buffer = [0_u8; 256];
-                let mut total = 0;
+                lock(&save_shared).touch();
+                let mut body = SetupBodyAccumulator::new();
+                let mut chunk = [0_u8; 64];
                 loop {
-                    if total == buffer.len() {
-                        break;
-                    }
-                    let read = request.read(&mut buffer[total..])?;
+                    let read = request.read(&mut chunk)?;
                     if read == 0 {
                         break;
                     }
-                    total += read;
+                    if body.push(&chunk[..read]) {
+                        break;
+                    }
                 }
-                let body = core::str::from_utf8(&buffer[..total])
-                    .map_err(|_| anyhow!("form is not UTF-8"))?;
-                let config = parse_setup_form(body)?;
-                {
-                    let mut locked = lock(&save_shared);
-                    locked.snapshot.state = WifiSetupState::Saving;
-                    locked.snapshot.last_action = format!("Saving {}", config.ssid);
-                    locked.snapshot.error = None;
-                    locked.pending = Some(config);
+                match body.decide() {
+                    SetupPostDecision::Save(config) => {
+                        {
+                            let mut locked = lock(&save_shared);
+                            locked.snapshot.state = WifiSetupState::Saving;
+                            locked.snapshot.last_action = format!("Saving {}", config.ssid);
+                            locked.snapshot.error = None;
+                            locked.pending = Some(config);
+                        }
+                        request
+                            .into_ok_response()?
+                            .write_all(SAVED_HTML.as_bytes())?;
+                    }
+                    SetupPostDecision::TooLarge => {
+                        warn!(
+                            "rustmix-wave=wifi-setup status=rejected http=413 reason=body-too-large"
+                        );
+                        request
+                            .into_response(
+                                SetupPostDecision::TooLarge.status_code(),
+                                Some("Payload Too Large"),
+                                &[("Content-Type", "text/plain; charset=utf-8")],
+                            )?
+                            .write_all(b"request body too large")?;
+                    }
+                    SetupPostDecision::Invalid(message) => {
+                        warn!(
+                            "rustmix-wave=wifi-setup status=rejected http=400 reason=invalid-form"
+                        );
+                        request
+                            .into_response(
+                                400,
+                                Some("Bad Request"),
+                                &[("Content-Type", "text/plain; charset=utf-8")],
+                            )?
+                            .write_all(message.as_bytes())?;
+                    }
                 }
-                request
-                    .into_ok_response()?
-                    .write_all(SAVED_HTML.as_bytes())?;
                 Ok::<(), anyhow::Error>(())
             })?;
 
@@ -443,6 +763,21 @@ pub mod espidf {
             locked.snapshot.error = Some(error.into());
             locked.snapshot.last_action = "Setup error".into();
         }
+
+        /// Keep a non-fatal notice, such as an invalid `WIFI.TXT`, on the setup screen.
+        pub fn set_notice(&self, notice: impl Into<String>) {
+            lock(&self.shared).snapshot.error = Some(notice.into());
+        }
+
+        #[must_use]
+        pub fn timeout_kind(&self) -> Option<WifiSetupTimeoutKind> {
+            let locked = lock(&self.shared);
+            let now = Instant::now();
+            WifiSetupSessionClock::from_elapsed(
+                elapsed_millis(locked.last_activity_at, now),
+                elapsed_millis(locked.started_at, now),
+            )
+        }
     }
 
     impl Drop for WifiSetupServer {
@@ -456,14 +791,25 @@ pub mod espidf {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    fn elapsed_millis(start: Instant, now: Instant) -> u64 {
+        now.saturating_duration_since(start).as_millis() as u64
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
-        collapse_scan_results, parse_setup_form, scanned_networks_json, setup_html, setup_url,
-        ScannedNetwork, WifiSetupSnapshot, WifiSetupState, WIFI_SETUP_AP_SSID,
+        collapse_scan_results, parse_setup_form, scan_http_body, scanned_networks_json, setup_html,
+        setup_url, ScannedNetwork, SetupBodyAccumulator, SetupPostDecision, SetupResources,
+        WifiSetupExit, WifiSetupSessionClock, WifiSetupSnapshot, WifiSetupState,
+        WifiSetupTimeoutKind, WIFI_SETUP_AP_SSID, WIFI_SETUP_BODY_TOO_LARGE_STATUS,
+        WIFI_SETUP_IDLE_TIMEOUT_SECONDS, WIFI_SETUP_MAX_BODY_BYTES, WIFI_SETUP_RESTART_HINT,
+        WIFI_SETUP_SCAN_CONTENT_TYPE, WIFI_SETUP_TOTAL_TIMEOUT_SECONDS,
     };
+    use crate::wifi_transfer::WIFI_TRANSFER_INACTIVITY_SECONDS;
 
     #[test]
     fn setup_portal_is_off_until_started() {
@@ -484,6 +830,7 @@ mod tests {
         assert!(html.contains("/save"));
         assert!(html.contains("name=\"ssid\""));
         assert!(html.contains("name=\"password\""));
+        assert!(html.contains("maxlength=\"64\""));
     }
 
     #[test]
@@ -503,13 +850,132 @@ mod tests {
 
     #[test]
     fn scan_json_escapes_ssid_and_omits_secrets() {
-        let json = scanned_networks_json(&[ScannedNetwork {
-            ssid: r#"Cafe "Main""#.into(),
+        let response = scan_http_body(&[ScannedNetwork {
+            ssid: "<Cafe & \"Main\">".into(),
             rssi_dbm: -40,
             open: false,
         }]);
-        assert!(json.contains(r#"Cafe \"Main\""#));
-        assert!(!json.to_ascii_lowercase().contains("pass"));
+        assert_eq!(response.content_type, WIFI_SETUP_SCAN_CONTENT_TYPE);
+        assert_eq!(response.content_type, "application/json");
+        assert!(response
+            .json
+            .contains(r#"\u003cCafe \u0026 \"Main\"\u003e"#));
+        assert!(!response.json.contains('<'));
+        assert!(!response.json.contains('>'));
+        assert!(!response.json.contains('&'));
+        assert!(!response.json.to_ascii_lowercase().contains("pass"));
+        let quoted = scanned_networks_json(&[ScannedNetwork {
+            ssid: "Cafe \"Main\"".into(),
+            rssi_dbm: -40,
+            open: false,
+        }]);
+        assert!(quoted.contains(r#"Cafe \"Main\""#));
+    }
+
+    #[test]
+    fn timeouts_match_transfer_portal_and_distinguish_idle_from_total() {
+        assert_eq!(
+            WIFI_SETUP_IDLE_TIMEOUT_SECONDS,
+            WIFI_TRANSFER_INACTIVITY_SECONDS
+        );
+        assert_eq!(
+            WIFI_SETUP_TOTAL_TIMEOUT_SECONDS,
+            WIFI_TRANSFER_INACTIVITY_SECONDS
+        );
+        assert_eq!(WIFI_SETUP_IDLE_TIMEOUT_SECONDS, 10 * 60);
+        let limit = Duration::from_secs(WIFI_SETUP_TOTAL_TIMEOUT_SECONDS).as_millis() as u64;
+        let clock = WifiSetupSessionClock::start(0);
+        assert_eq!(clock.poll(limit - 1), None);
+        assert_eq!(clock.poll(limit), Some(WifiSetupTimeoutKind::Idle));
+
+        let mut active = WifiSetupSessionClock::start(0);
+        active.note_activity(9 * 60 * 1_000);
+        assert_eq!(
+            active.poll(limit),
+            Some(WifiSetupTimeoutKind::Total),
+            "traffic resets idle, but the total cap still stops the AP"
+        );
+        assert_eq!(active.poll(limit - 1), None);
+    }
+
+    #[test]
+    fn timed_out_snapshot_shows_how_to_restart_setup() {
+        for kind in [WifiSetupTimeoutKind::Idle, WifiSetupTimeoutKind::Total] {
+            let snapshot = WifiSetupSnapshot::timed_out(kind);
+            assert_eq!(snapshot.state, WifiSetupState::TimedOut);
+            assert!(!snapshot.is_active());
+            let error = snapshot.error.expect("restart hint");
+            assert!(error.contains(WIFI_SETUP_RESTART_HINT));
+            assert!(error.contains("Settings > Network > Configure Wi-Fi"));
+        }
+    }
+
+    #[test]
+    fn teardown_stops_http_and_ap_radio_on_every_exit() {
+        let running = SetupResources {
+            http: true,
+            ap_radio: true,
+        };
+        let http_failed_after_softap = SetupResources {
+            http: false,
+            ap_radio: true,
+        };
+        let stopped = SetupResources {
+            http: false,
+            ap_radio: false,
+        };
+        for exit in WifiSetupExit::ALL {
+            let plan = exit.teardown();
+            assert!(plan.stop_http, "{exit:?} must stop HTTP");
+            assert!(plan.stop_ap_radio, "{exit:?} must stop the AP radio");
+            assert_eq!(running.apply_exit(exit), stopped, "{exit:?}");
+            assert_eq!(
+                http_failed_after_softap.apply_exit(exit),
+                stopped,
+                "{exit:?} must drop the radio left up when HTTP failed to start"
+            );
+            assert!(!exit.reason().is_empty());
+        }
+        assert!(WifiSetupExit::SettingsStop.teardown().stop_ap_radio);
+        assert!(WifiSetupExit::HttpServerFailed.teardown().stop_ap_radio);
+        assert!(WifiSetupExit::IdleTimeout.shows_restart_hint());
+        assert!(WifiSetupExit::TotalTimeout.shows_restart_hint());
+        assert!(!WifiSetupExit::SettingsStop.shows_restart_hint());
+    }
+
+    #[test]
+    fn oversize_body_is_rejected_with_413_and_not_saved() {
+        let password = "p".repeat(49);
+        let mut form = format!("ssid=Lab&password={password}&timezone=UTC&extra=");
+        while form.len() < WIFI_SETUP_MAX_BODY_BYTES {
+            form.push('x');
+        }
+        assert_eq!(form.len(), WIFI_SETUP_MAX_BODY_BYTES);
+        let truncated = parse_setup_form(&form).expect("truncated prefix would have parsed");
+        assert_eq!(truncated.password.len(), 49);
+        form.push('y');
+
+        let mut body = SetupBodyAccumulator::new();
+        assert!(body.push(form.as_bytes()));
+        let decision = body.decide();
+        assert_eq!(decision, SetupPostDecision::TooLarge);
+        assert_eq!(decision.status_code(), WIFI_SETUP_BODY_TOO_LARGE_STATUS);
+        assert_eq!(decision.status_code(), 413);
+
+        let mut exact = SetupBodyAccumulator::new();
+        let mut fitting = format!("ssid=Lab&password=correct-horse&timezone=UTC&pad=");
+        while fitting.len() < WIFI_SETUP_MAX_BODY_BYTES {
+            fitting.push('a');
+        }
+        assert_eq!(fitting.len(), WIFI_SETUP_MAX_BODY_BYTES);
+        assert!(!exact.push(fitting.as_bytes()));
+        match exact.decide() {
+            SetupPostDecision::Save(config) => {
+                assert_eq!(config.ssid, "Lab");
+                assert_eq!(config.password, "correct-horse");
+            }
+            other => panic!("complete body at the cap should save, got {other:?}"),
+        }
     }
 
     #[test]

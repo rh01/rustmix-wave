@@ -65,7 +65,10 @@ mod firmware {
         network::{
             espidf::NetworkRuntime, NetworkLogFingerprint, NetworkSnapshot, WifiConnectionState,
         },
-        network_config::{NetworkConfig, WIFI_CONFIG_PATH},
+        network_config::{
+            load_sd_wifi_txt, resolve_boot_wifi, BootWifiSource, NetworkConfig, SdWifiTxt,
+            WIFI_CONFIG_PATH,
+        },
         panel_refresh::{
             PanelGlobalReason, PanelRefreshCoordinator, PanelRefreshPlan, PanelRefreshRequest,
             PANEL_PARTIAL_REFRESH_LIMIT,
@@ -104,8 +107,9 @@ mod firmware {
         weather_config::{WeatherConfig, WEATHER_CONFIG_PATH},
         wifi_nvs,
         wifi_setup::{
-            espidf::WifiSetupServer, WifiSetupSnapshot, WifiSetupUiRequest, WIFI_SETUP_AP_SSID,
-            WIFI_SETUP_SERVER_STACK_BYTES,
+            espidf::WifiSetupServer, WifiSetupExit, WifiSetupSnapshot, WifiSetupTimeoutKind,
+            WifiSetupUiRequest, WIFI_SETUP_AP_SSID, WIFI_SETUP_IDLE_TIMEOUT_SECONDS,
+            WIFI_SETUP_SERVER_STACK_BYTES, WIFI_SETUP_TOTAL_TIMEOUT_SECONDS,
         },
         wifi_transfer::{
             espidf::WifiTransferServer, WifiTransferSnapshot, WifiTransferUiRequest,
@@ -183,30 +187,43 @@ mod firmware {
             }
         };
 
-        // Credentials prefer SD WIFI.TXT; NVS is the fallback when the file is
-        // missing. Never log the password.
-        let mut network_config = match NetworkConfig::load_from_path(WIFI_CONFIG_PATH) {
-            Ok(config) => {
+        // WIFI.TXT stays first. NVS is only the fallback when that file is
+        // missing. An invalid file is logged and shown; it does not use NVS.
+        // Never log the password.
+        let sd_wifi = load_sd_wifi_txt(WIFI_CONFIG_PATH);
+        let nvs_wifi = if matches!(sd_wifi, SdWifiTxt::Missing) {
+            wifi_nvs::load_network_config()
+        } else {
+            None
+        };
+        let boot_wifi = resolve_boot_wifi(sd_wifi, nvs_wifi);
+        let wifi_txt_invalid = boot_wifi.invalid_wifi_txt.clone();
+        let mut network_config = match boot_wifi.source {
+            BootWifiSource::Sd | BootWifiSource::Nvs => {
+                let config = boot_wifi.credentials.expect("boot source has credentials");
+                let source = match boot_wifi.source {
+                    BootWifiSource::Sd => "sd",
+                    BootWifiSource::Nvs => "nvs",
+                    BootWifiSource::None => "none",
+                };
                 info!(
-                    "rustmix-wave=wifi-config status=ready source=sd path={WIFI_CONFIG_PATH} ssid={} timezone={} ntp-server={}",
+                    "rustmix-wave=wifi-config status=ready source={source} path={WIFI_CONFIG_PATH} ssid={} timezone={} ntp-server={}",
                     config.ssid, config.timezone, config.ntp_server
                 );
                 Some(config)
             }
-            Err(error) => {
-                warn!(
-                    "rustmix-wave=wifi-config status=unavailable source=sd path={WIFI_CONFIG_PATH} error={error:#}"
-                );
-                match wifi_nvs::load_network_config() {
-                    Some(config) => {
-                        info!(
-                            "rustmix-wave=wifi-config status=ready source=nvs ssid={} timezone={} ntp-server={}",
-                            config.ssid, config.timezone, config.ntp_server
-                        );
-                        Some(config)
-                    }
-                    None => None,
+            BootWifiSource::None => {
+                if let Some(message) = wifi_txt_invalid.as_deref() {
+                    warn!(
+                        "rustmix-wave=wifi-config status=invalid source=sd path={WIFI_CONFIG_PATH} error={message}"
+                    );
+                    warn!("rustmix-wave=wifi-config status=nvs-not-used reason=wifi-txt-invalid");
+                } else {
+                    warn!(
+                        "rustmix-wave=wifi-config status=unavailable source=sd path={WIFI_CONFIG_PATH} error=WIFI.TXT missing and NVS empty"
+                    );
                 }
+                None
             }
         };
 
@@ -424,6 +441,10 @@ mod firmware {
         if let Some(config) = network_config.as_ref() {
             state.regional = state.regional.with_timezone_name(&config.timezone)?;
             state.update_network_snapshot(NetworkSnapshot::provisioned(config));
+        } else if let Some(message) = wifi_txt_invalid.clone() {
+            let mut snapshot = NetworkSnapshot::default();
+            snapshot.error = Some(message);
+            state.update_network_snapshot(snapshot);
         }
         if let Some(config) = weather_config.as_ref() {
             state.update_weather_snapshot(WeatherSnapshot::provisioned(config));
@@ -496,6 +517,9 @@ mod firmware {
                 NetworkRuntime::configuration_missing()
             }
         };
+        if let Some(message) = wifi_txt_invalid.clone() {
+            network_runtime.set_config_warning(Some(message));
+        }
         let mut wifi_transfer_server: Option<WifiTransferServer> = None;
         state.update_wifi_transfer_snapshot(WifiTransferSnapshot::default());
         let mut wifi_setup_server: Option<WifiSetupServer> = None;
@@ -642,7 +666,7 @@ mod firmware {
         info!("rustmix-wave=lua-sokoban-tilt-event-bridge-ready sample=SOKOBAN board=9x9 motion=debounced-tilt-only dirty=old-cell,new-cell,status-or-board refresh=shared-panel-coordinator transport=existing-fullscreen-partial panel-api=rust-owned");
         info!("rustmix-wave=weather-fetch-stack-isolation-ready worker=weather-fetch stack-bytes=65536 main-task-stack-bytes=16384 response-max-bytes=8192 state=heap-boxed policy=short-lived-worker-join");
         info!("rustmix-wave=wifi-transfer-web-portal-ready activation=settings-network-explicit-toggle auto-start=false root={WIFI_TRANSFER_ROOT} transport=http-lan-only token=required server-stack-bytes={WIFI_TRANSFER_SERVER_STACK_BYTES} main-task-stack-bytes=16384 upload=streamed-atomic-tmp fat83=true protected-config=true inactivity-seconds={WIFI_TRANSFER_INACTIVITY_SECONDS}");
-        info!("rustmix-wave=wifi-softap-setup-ready ap={WIFI_SETUP_AP_SSID} url=http://192.168.4.1/ trigger=missing-wifi-txt,sta-fail,settings-configure-wifi persist=nvs,wifi-txt-writeback transfer-portal=sta-only stack-bytes={WIFI_SETUP_SERVER_STACK_BYTES}");
+        info!("rustmix-wave=wifi-softap-setup-ready ap={WIFI_SETUP_AP_SSID} url=http://192.168.4.1/ trigger=missing-wifi-txt,sta-fail,settings-configure-wifi persist=nvs,wifi-txt-writeback transfer-portal=sta-only stack-bytes={WIFI_SETUP_SERVER_STACK_BYTES} idle-timeout-seconds={WIFI_SETUP_IDLE_TIMEOUT_SECONDS} total-timeout-seconds={WIFI_SETUP_TOTAL_TIMEOUT_SECONDS} teardown=http-and-radio");
         log_runtime_memory("boot-complete");
         info!("rustmix-wave=hierarchical-router-ready policy=category-subcategory-feature-details");
         info!("rustmix-wave=wifi-transfer-lifecycle-ready state=off-until-settings-network-toggle server=temporary-http-task sd-root=/sdcard/RUSTMIX stop=switch-off,back,sleep,wifi-loss,inactivity");
@@ -1170,10 +1194,12 @@ mod firmware {
                                 _mounted_sd.is_some(),
                                 "sleep-entry",
                             );
-                            stop_wifi_setup_server(
+                            teardown_wifi_setup(
+                                &mut network_runtime,
                                 &mut wifi_setup_server,
                                 &mut state,
-                                "sleep-entry",
+                                WifiSetupSnapshot::default(),
+                                WifiSetupExit::SleepEntry,
                             );
                             if let Some(active) = voice_recording.take() {
                                 let _ = active.cancel();
@@ -1389,7 +1415,10 @@ mod firmware {
                     ReaderTickOutcome::None => {}
                 }
                 apply_wifi_transfer_ui_request(
+                    &mut network_runtime,
+                    &mut wifi_setup_server,
                     &mut wifi_transfer_server,
+                    &mut network_config,
                     &mut state,
                     &mut storage_browser,
                     _mounted_sd.is_some(),
@@ -1527,7 +1556,10 @@ mod firmware {
                             _mounted_sd.is_some(),
                         );
                         apply_wifi_transfer_ui_request(
+                            &mut network_runtime,
+                            &mut wifi_setup_server,
                             &mut wifi_transfer_server,
+                            &mut network_config,
                             &mut state,
                             &mut storage_browser,
                             _mounted_sd.is_some(),
@@ -1727,7 +1759,10 @@ mod firmware {
                     _mounted_sd.is_some(),
                 );
                 apply_wifi_transfer_ui_request(
+                    &mut network_runtime,
+                    &mut wifi_setup_server,
                     &mut wifi_transfer_server,
+                    &mut network_config,
                     &mut state,
                     &mut storage_browser,
                     _mounted_sd.is_some(),
@@ -1862,7 +1897,10 @@ mod firmware {
     }
 
     fn apply_wifi_transfer_ui_request(
+        runtime: &mut NetworkRuntime,
+        setup_server: &mut Option<WifiSetupServer>,
         server: &mut Option<WifiTransferServer>,
+        network_config: &mut Option<NetworkConfig>,
         state: &mut AppState,
         storage_browser: &mut StorageBrowser,
         mounted: bool,
@@ -1894,18 +1932,57 @@ mod firmware {
                 if server.is_some() {
                     return;
                 }
+                if softap_is_up(setup_server, state) {
+                    info!("rustmix-wave=wifi-transfer-server status=stopping-softap-first");
+                    teardown_wifi_setup(
+                        runtime,
+                        setup_server,
+                        state,
+                        WifiSetupSnapshot::default(),
+                        WifiSetupExit::TransferPortal,
+                    );
+                    if let Some(config) = network_config.as_ref() {
+                        match runtime.connect_station(config) {
+                            Ok(()) => info!(
+                                "rustmix-wave=wifi-connect status=restored source=transfer-start ssid={}",
+                                config.ssid
+                            ),
+                            Err(error) => {
+                                warn!(
+                                    "rustmix-wave=wifi-connect status=restore-failed source=transfer-start ssid={} error={error:#}",
+                                    config.ssid
+                                );
+                                runtime.record_resume_failure(format!("{error:#}"));
+                            }
+                        }
+                    } else {
+                        runtime.record_configuration_missing();
+                    }
+                    state.update_network_snapshot(runtime.snapshot());
+                }
                 state.update_wifi_transfer_snapshot(WifiTransferSnapshot::starting());
-                let Some(ipv4) = state.network.ipv4_address.as_deref() else {
+                if !state.network.is_station_associated() {
                     state.update_wifi_transfer_snapshot(WifiTransferSnapshot::failed(
                         "Connect Wi-Fi before starting transfer",
                     ));
-                    warn!("rustmix-wave=wifi-transfer-server status=start-rejected reason=wifi-not-connected");
+                    warn!(
+                        "rustmix-wave=wifi-transfer-server status=start-rejected reason=sta-not-associated"
+                    );
+                    return;
+                }
+                let Some(ipv4) = state.network.ipv4_address.clone() else {
+                    state.update_wifi_transfer_snapshot(WifiTransferSnapshot::failed(
+                        "Connect Wi-Fi before starting transfer",
+                    ));
+                    warn!(
+                        "rustmix-wave=wifi-transfer-server status=start-rejected reason=sta-address-missing"
+                    );
                     return;
                 };
                 let code = format!("{:06}", unsafe { sys::esp_random() } % 1_000_000);
                 info!("rustmix-wave=wifi-transfer-server status=starting ipv4={ipv4} port=80 root={WIFI_TRANSFER_ROOT} stack-bytes={WIFI_TRANSFER_SERVER_STACK_BYTES}");
                 log_runtime_memory("before-wifi-transfer-start");
-                match WifiTransferServer::start(ipv4, code) {
+                match WifiTransferServer::start(&ipv4, code) {
                     Ok(active) => {
                         state.update_wifi_transfer_snapshot(active.snapshot());
                         *server = Some(active);
@@ -1970,15 +2047,43 @@ mod firmware {
         }
     }
 
-    fn stop_wifi_setup_server(
-        server: &mut Option<WifiSetupServer>,
+    fn softap_is_up(setup_server: &Option<WifiSetupServer>, state: &AppState) -> bool {
+        setup_server.is_some()
+            || state.network.wifi_state == WifiConnectionState::Provisioning
+            || state.wifi_setup.is_active()
+    }
+
+    /// Stop the setup HTTP server and the SoftAP radio together.
+    fn teardown_wifi_setup(
+        runtime: &mut NetworkRuntime,
+        setup_server: &mut Option<WifiSetupServer>,
         state: &mut AppState,
-        reason: &'static str,
+        snapshot: WifiSetupSnapshot,
+        exit: WifiSetupExit,
     ) {
-        if server.take().is_some() {
-            info!("rustmix-wave=wifi-setup-server status=stopped reason={reason}");
+        let plan = exit.teardown();
+        debug_assert!(plan.stop_http && plan.stop_ap_radio);
+        if plan.stop_http && setup_server.take().is_some() {
+            info!(
+                "rustmix-wave=wifi-setup-server status=stopped reason={}",
+                exit.reason()
+            );
         }
-        state.update_wifi_setup_snapshot(WifiSetupSnapshot::default());
+        if plan.stop_ap_radio {
+            if let Err(error) = runtime.stop_radio() {
+                warn!(
+                    "rustmix-wave=wifi-setup status=radio-stop-failed reason={} error={error:#}",
+                    exit.reason()
+                );
+            } else {
+                info!(
+                    "rustmix-wave=wifi-setup status=radio-stopped reason={}",
+                    exit.reason()
+                );
+            }
+        }
+        state.update_wifi_setup_snapshot(snapshot);
+        state.update_network_snapshot(runtime.snapshot());
     }
 
     fn start_wifi_setup_portal(
@@ -1991,7 +2096,13 @@ mod firmware {
     ) -> bool {
         if !runtime.has_radio() {
             warn!("rustmix-wave=wifi-setup status=rejected reason=radio-unavailable");
-            state.update_wifi_setup_snapshot(WifiSetupSnapshot::failed("Wi-Fi radio unavailable"));
+            teardown_wifi_setup(
+                runtime,
+                setup_server,
+                state,
+                WifiSetupSnapshot::failed("Wi-Fi radio unavailable"),
+                WifiSetupExit::SoftApFailed,
+            );
             return false;
         }
         stop_wifi_transfer_server(
@@ -2001,13 +2112,23 @@ mod firmware {
             mounted,
             "wifi-setup-start",
         );
-        stop_wifi_setup_server(setup_server, state, "restart");
-        state.update_wifi_setup_snapshot(WifiSetupSnapshot::starting());
+        teardown_wifi_setup(
+            runtime,
+            setup_server,
+            state,
+            WifiSetupSnapshot::starting(),
+            WifiSetupExit::Restart,
+        );
         info!("rustmix-wave=wifi-setup status=starting ap={WIFI_SETUP_AP_SSID}");
         if let Err(error) = runtime.start_softap() {
             warn!("rustmix-wave=wifi-setup status=softap-failed error={error:#}");
-            state.update_wifi_setup_snapshot(WifiSetupSnapshot::failed(format!("{error:#}")));
-            state.update_network_snapshot(runtime.snapshot());
+            teardown_wifi_setup(
+                runtime,
+                setup_server,
+                state,
+                WifiSetupSnapshot::failed(format!("{error:#}")),
+                WifiSetupExit::SoftApFailed,
+            );
             return false;
         }
         match WifiSetupServer::start() {
@@ -2018,19 +2139,27 @@ mod firmware {
                         warn!("rustmix-wave=wifi-setup status=scan-failed error={error:#}")
                     }
                 }
+                if let Some(message) = runtime.config_warning() {
+                    active.set_notice(message);
+                }
                 state.update_wifi_setup_snapshot(active.snapshot());
                 *setup_server = Some(active);
                 state.update_network_snapshot(runtime.snapshot());
                 log_network_snapshot(&state.network);
                 info!(
-                    "rustmix-wave=wifi-setup status=ready ap={WIFI_SETUP_AP_SSID} url=http://192.168.4.1/"
+                    "rustmix-wave=wifi-setup status=ready ap={WIFI_SETUP_AP_SSID} url=http://192.168.4.1/ idle-timeout-seconds={WIFI_SETUP_IDLE_TIMEOUT_SECONDS} total-timeout-seconds={WIFI_SETUP_TOTAL_TIMEOUT_SECONDS}"
                 );
                 true
             }
             Err(error) => {
                 warn!("rustmix-wave=wifi-setup status=http-failed error={error:#}");
-                state.update_wifi_setup_snapshot(WifiSetupSnapshot::failed(format!("{error:#}")));
-                state.update_network_snapshot(runtime.snapshot());
+                teardown_wifi_setup(
+                    runtime,
+                    setup_server,
+                    state,
+                    WifiSetupSnapshot::failed(format!("{error:#}")),
+                    WifiSetupExit::HttpServerFailed,
+                );
                 false
             }
         }
@@ -2062,7 +2191,13 @@ mod firmware {
             }
             WifiSetupUiRequest::Stop => {
                 info!("rustmix-wave=wifi-setup-ui-request request=stop");
-                stop_wifi_setup_server(setup_server, state, "settings-stop");
+                teardown_wifi_setup(
+                    runtime,
+                    setup_server,
+                    state,
+                    WifiSetupSnapshot::default(),
+                    WifiSetupExit::SettingsStop,
+                );
                 if let Some(config) = network_config.as_ref() {
                     match runtime.connect_station(config) {
                         Ok(()) => {
@@ -2096,22 +2231,38 @@ mod firmware {
         storage_browser: &mut StorageBrowser,
         mounted: bool,
     ) -> bool {
-        let Some(active) = setup_server.as_ref() else {
+        if setup_server.is_none() {
             return false;
-        };
-        if active.take_scan_requested() {
+        }
+        let scan_requested = setup_server
+            .as_ref()
+            .is_some_and(|active| active.take_scan_requested());
+        if scan_requested {
             match runtime.scan_networks() {
-                Ok(networks) => active.set_networks(networks),
+                Ok(networks) => {
+                    if let Some(active) = setup_server.as_ref() {
+                        active.set_networks(networks);
+                    }
+                }
                 Err(error) => warn!("rustmix-wave=wifi-setup status=scan-failed error={error:#}"),
             }
         }
-        if let Some(config) = active.take_pending() {
+        if let Some(config) = setup_server
+            .as_ref()
+            .and_then(|active| active.take_pending())
+        {
             info!(
                 "rustmix-wave=wifi-setup status=credentials-received ssid={}",
                 config.ssid
             );
             persist_station_credentials(&config, mounted);
-            stop_wifi_setup_server(setup_server, state, "saved-credentials");
+            teardown_wifi_setup(
+                runtime,
+                setup_server,
+                state,
+                WifiSetupSnapshot::default(),
+                WifiSetupExit::SavedCredentials,
+            );
             match runtime.connect_station(&config) {
                 Ok(()) => {
                     info!(
@@ -2152,12 +2303,43 @@ mod firmware {
                 }
             }
         }
-        let snapshot = active.snapshot();
-        if snapshot != state.wifi_setup {
-            state.update_wifi_setup_snapshot(snapshot);
+        let timeout = setup_server
+            .as_ref()
+            .and_then(|active| active.timeout_kind());
+        if let Some(kind) = timeout {
+            let exit = match kind {
+                WifiSetupTimeoutKind::Idle => WifiSetupExit::IdleTimeout,
+                WifiSetupTimeoutKind::Total => WifiSetupExit::TotalTimeout,
+            };
+            info!(
+                "rustmix-wave=wifi-setup status=timeout reason={}",
+                exit.reason()
+            );
+            teardown_wifi_setup(
+                runtime,
+                setup_server,
+                state,
+                WifiSetupSnapshot::timed_out(kind),
+                exit,
+            );
+            if state.active_route() != ScreenRoute::WifiSetup {
+                state.router.navigate_to(ScreenRoute::WifiSetup);
+                info!("rustmix-wave=screen-route route=wifi-setup cause=setup-timeout");
+            }
             return true;
         }
-        false
+        let changed = if let Some(active) = setup_server.as_ref() {
+            let snapshot = active.snapshot();
+            if snapshot != state.wifi_setup {
+                state.update_wifi_setup_snapshot(snapshot);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        changed
     }
 
     #[derive(Clone, Copy, Debug)]

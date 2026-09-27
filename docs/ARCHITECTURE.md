@@ -199,7 +199,7 @@ Personal rows in `EVENTS.TXT` are writable. `US2026.TXT` is read-only. `HINDU26.
 
 ## SoftAP Wi-Fi setup
 
-`src/wifi_setup.rs` owns the captive setup portal. Station credentials still load first from `/RUSTMIX/WIFI.TXT`. NVS (`rw_wifi`) is the fallback when that file is missing. SoftAP `Rustmix-Setup` at `http://192.168.4.1` starts when the file is missing, STA join fails, or Settings → Network → Configure Wi-Fi is selected. Saving writes NVS and, when the SD card is present, writes `WIFI.TXT`, then switches to STA. The transfer portal stays a separate STA-only service on port 80.
+`src/wifi_setup.rs` owns the captive setup portal. Station credentials still load first from `/RUSTMIX/WIFI.TXT`. NVS (`rw_wifi`) is the fallback only when that file is missing. If `WIFI.TXT` is present but invalid, firmware logs `WIFI.TXT is invalid` and does not use NVS. SoftAP `Rustmix-Setup` at `http://192.168.4.1` starts when the file is missing, STA join fails, or Settings → Network → Configure Wi-Fi is selected. The open AP stops after 10 minutes idle or 10 minutes total, the same budget as the transfer portal: HTTP and the AP radio both stop, and e-paper shows Settings → Network → Configure Wi-Fi. Every other exit uses that same teardown. Saving writes NVS and, when the SD card is present, writes `WIFI.TXT`, then switches to STA. Passwords are an 8–63 byte passphrase or a 64-character hex PSK. The transfer portal stays a separate STA-only service on port 80 and will not bind `192.168.4.1`.
 
 Protected paths include device configuration and internal sidecars such as:
 

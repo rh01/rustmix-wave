@@ -2,6 +2,7 @@
 //!
 //! SD `/RUSTMIX/WIFI.TXT` remains the first-class boot path. NVS is used when
 //! that file is missing and as the always-written companion after SoftAP save.
+//! An invalid `WIFI.TXT` is not replaced by NVS.
 //! The Wi-Fi stack already owns `EspDefaultNvsPartition::take()`, so this
 //! module uses the C NVS API on a private namespace. The password is stored
 //! but never logged.

@@ -20,6 +20,7 @@ use crate::{
     },
     network::NetworkSnapshot,
     orientation::OrientedFrameBuffer,
+    wifi_setup::{WifiSetupState, WIFI_SETUP_RESTART_HINT},
 };
 
 pub fn render_network(
@@ -163,13 +164,21 @@ pub fn render_wifi_setup(
     line(display, 252, "Open", setup.url_label(), detail)?;
     line(display, 292, "Scanned", &scanned, body)?;
 
-    Text::new("Phone steps", Point::new(22, 372), heading).draw(display)?;
-    Text::new("1. Join Rustmix-Setup", Point::new(22, 420), body).draw(display)?;
-    Text::new("2. Open http://192.168.4.1", Point::new(22, 460), body).draw(display)?;
-    Text::new("3. Pick SSID, save password", Point::new(22, 500), body).draw(display)?;
-    Text::new(&setup.last_action, Point::new(22, 548), detail).draw(display)?;
-    if let Some(error) = setup.error.as_deref() {
-        Text::new(error, Point::new(22, 588), detail).draw(display)?;
+    if setup.state == WifiSetupState::TimedOut {
+        Text::new("Setup network stopped", Point::new(22, 372), heading).draw(display)?;
+        Text::new("Restart from", Point::new(22, 420), body).draw(display)?;
+        Text::new("Settings > Network >", Point::new(22, 460), body).draw(display)?;
+        Text::new("Configure Wi-Fi", Point::new(22, 500), body).draw(display)?;
+        Text::new(WIFI_SETUP_RESTART_HINT, Point::new(22, 548), detail).draw(display)?;
+    } else {
+        Text::new("Phone steps", Point::new(22, 372), heading).draw(display)?;
+        Text::new("1. Join Rustmix-Setup", Point::new(22, 420), body).draw(display)?;
+        Text::new("2. Open http://192.168.4.1", Point::new(22, 460), body).draw(display)?;
+        Text::new("3. Pick SSID, save password", Point::new(22, 500), body).draw(display)?;
+        Text::new(&setup.last_action, Point::new(22, 548), detail).draw(display)?;
+        if let Some(error) = setup.error.as_deref() {
+            Text::new(error, Point::new(22, 588), detail).draw(display)?;
+        }
     }
 
     draw_action(display, 640, "Stop setup", true, body)?;
@@ -279,7 +288,12 @@ fn draw_action(
 #[cfg(test)]
 mod tests {
     use super::{render_network, render_network_details, render_wifi_setup, render_wifi_transfer};
-    use crate::{app::AppState, framebuffer::FrameBuffer, orientation::OrientedFrameBuffer};
+    use crate::{
+        app::AppState,
+        framebuffer::FrameBuffer,
+        orientation::OrientedFrameBuffer,
+        wifi_setup::{WifiSetupSnapshot, WifiSetupTimeoutKind},
+    };
 
     #[test]
     fn network_overview_details_and_transfer_render_without_configuration() {
@@ -289,6 +303,17 @@ mod tests {
         render_network(&mut display, &state).unwrap();
         render_network_details(&mut display, &state).unwrap();
         render_wifi_transfer(&mut display, &state).unwrap();
+        render_wifi_setup(&mut display, &state).unwrap();
+    }
+
+    #[test]
+    fn timed_out_setup_screen_renders_restart_instructions() {
+        let mut frame = FrameBuffer::new_white();
+        let mut display = OrientedFrameBuffer::new(&mut frame, Default::default());
+        let mut state = AppState::default();
+        state.update_wifi_setup_snapshot(WifiSetupSnapshot::timed_out(WifiSetupTimeoutKind::Idle));
+        render_wifi_setup(&mut display, &state).unwrap();
+        state.update_wifi_setup_snapshot(WifiSetupSnapshot::timed_out(WifiSetupTimeoutKind::Total));
         render_wifi_setup(&mut display, &state).unwrap();
     }
 }

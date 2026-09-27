@@ -459,8 +459,8 @@ Network shows Wi-Fi, SNTP, SSID, IPv4 address, RSSI, provisioning details, regio
 
 Provision Wi-Fi in either of these first-class ways:
 
-- **SD card:** put `/RUSTMIX/WIFI.TXT` on the FAT card (`ssid`, `password`, optional `timezone` / `ntp_server`) and boot. If the file is present and the station joins, the device stays on your home network.
-- **SoftAP setup:** if `WIFI.TXT` is missing, station join fails, or you select **Configure Wi-Fi**, the e-paper shows AP `Rustmix-Setup` and `http://192.168.4.1`. Join that open network on a phone, open the URL, pick a scanned SSID (or type one), enter the password, and save. The device writes NVS and `WIFI.TXT` (when the card is present), then switches to STA. After it joins, Start Wi-Fi Transfer works as before.
+- **SD card:** put `/RUSTMIX/WIFI.TXT` on the FAT card (`ssid`, `password`, optional `timezone` / `ntp_server`) and boot. If the file is present and the station joins, the device stays on your home network. A password is 8–63 characters or a 64-character hexadecimal PSK. If the file exists but is invalid, the device reports that `WIFI.TXT` is invalid and does not silently use saved NVS credentials.
+- **SoftAP setup:** if `WIFI.TXT` is missing, station join fails, or you select **Configure Wi-Fi**, the e-paper shows AP `Rustmix-Setup` and `http://192.168.4.1`. Join that open network on a phone, open the URL, pick a scanned SSID (or type one), enter the password, and save. The device writes NVS and `WIFI.TXT` (when the card is present), then switches to STA. The setup AP turns itself off after 10 minutes with no phone traffic, and also after 10 minutes total. E-paper then says to restart from **Settings > Network > Configure Wi-Fi**. After the station joins, Start Wi-Fi Transfer works on the home network only.
 
 | Control | Action |
 | --- | --- |

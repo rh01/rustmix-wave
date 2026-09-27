@@ -47,10 +47,10 @@ The generic installer preserves an existing Dictionary and Calendar tree. Use th
 
 Two first-class paths, both kept on the Wi-Fi firmware line (not the BLE build):
 
-1. **SD `/RUSTMIX/WIFI.TXT`** — copy or edit this file, insert the card, and boot. If it exists and the station associates, the device stays in STA mode.
-2. **SoftAP web setup** — when `WIFI.TXT` is missing, station join fails, or you choose **Settings → Network → Configure Wi-Fi**, the device opens an open access point named `Rustmix-Setup`. Join it from a phone and open `http://192.168.4.1`. The page lists nearby SSIDs (refreshable), accepts a password or a manual SSID, then saves.
+1. **SD `/RUSTMIX/WIFI.TXT`** — copy or edit this file, insert the card, and boot. If it exists and the station associates, the device stays in STA mode. If the file exists but is invalid, the device reports `WIFI.TXT is invalid` and does not fall back to NVS.
+2. **SoftAP web setup** — when `WIFI.TXT` is missing, station join fails, or you choose **Settings → Network → Configure Wi-Fi**, the device opens an open access point named `Rustmix-Setup`. Join it from a phone and open `http://192.168.4.1`. The page lists nearby SSIDs (refreshable), accepts a password (8–63 characters, or a 64-character hex PSK) or a manual SSID, then saves. The AP stops after 10 minutes idle and after 10 minutes total; e-paper then shows how to open **Settings → Network → Configure Wi-Fi** again.
 
-SoftAP save writes **NVS and `WIFI.TXT`** (when the SD card is mounted) and switches to STA. After join, **Start Wi-Fi Transfer** is unchanged: LAN portal on the home network.
+SoftAP save writes **NVS and `WIFI.TXT`** (when the SD card is mounted) and switches to STA. After join, **Start Wi-Fi Transfer** is unchanged: LAN portal on the home network. Starting transfer tears down SoftAP first and only continues when the station is associated.
 
 Copy or edit `/RUSTMIX/WIFI.TXT`:
 

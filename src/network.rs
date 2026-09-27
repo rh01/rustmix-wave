@@ -147,6 +147,17 @@ impl NetworkSnapshot {
         self.ipv4_address.as_deref().unwrap_or("--")
     }
 
+    /// True only for a joined station. The SoftAP address is not a connection.
+    #[must_use]
+    pub fn is_station_associated(&self) -> bool {
+        self.wifi_state == WifiConnectionState::Connected
+            && self.ipv4_address.as_deref().is_some_and(|address| {
+                !address.is_empty()
+                    && address != "0.0.0.0"
+                    && address != crate::wifi_setup::WIFI_SETUP_AP_IP
+            })
+    }
+
     #[must_use]
     pub fn rssi_label(&self) -> String {
         self.rssi_dbm
@@ -212,6 +223,10 @@ pub mod espidf {
         snapshot: NetworkSnapshot,
         ntp_reported: bool,
         suspended: bool,
+        /// Shown with the live snapshot when `WIFI.TXT` is present but invalid.
+        config_warning: Option<String>,
+        /// True after a STA or SoftAP start, so teardown can stop a live radio.
+        radio_started: bool,
     }
 
     impl NetworkRuntime {
@@ -223,6 +238,8 @@ pub mod espidf {
                 snapshot: NetworkSnapshot::default(),
                 ntp_reported: false,
                 suspended: false,
+                config_warning: None,
+                radio_started: false,
             }
         }
 
@@ -242,6 +259,8 @@ pub mod espidf {
                 },
                 ntp_reported: false,
                 suspended: false,
+                config_warning: None,
+                radio_started: false,
             }
         }
 
@@ -260,6 +279,8 @@ pub mod espidf {
                 snapshot: NetworkSnapshot::default(),
                 ntp_reported: false,
                 suspended: false,
+                config_warning: None,
+                radio_started: false,
             })
         }
 
@@ -298,6 +319,7 @@ pub mod espidf {
                 auth_method,
                 ..Default::default()
             }))?;
+            self.radio_started = true;
             wifi.start()?;
             wifi.connect()?;
             wifi.wait_netif_up()?;
@@ -317,6 +339,7 @@ pub mod espidf {
                 last_sync_utc: None,
                 error: None,
             };
+            self.config_warning = None;
             self.ntp_reported = false;
             self.suspended = false;
             Ok(())
@@ -341,6 +364,7 @@ pub mod espidf {
                     ..Default::default()
                 },
             ))?;
+            self.radio_started = true;
             wifi.start()?;
             let mut ip = WIFI_SETUP_AP_IP.to_string();
             for _ in 0..25 {
@@ -387,7 +411,45 @@ pub mod espidf {
 
         #[must_use]
         pub fn snapshot(&self) -> NetworkSnapshot {
-            self.snapshot.clone()
+            let mut snapshot = self.snapshot.clone();
+            if snapshot.error.is_none() {
+                snapshot.error = self.config_warning.clone();
+            }
+            snapshot
+        }
+
+        pub fn set_config_warning(&mut self, warning: Option<String>) {
+            self.config_warning = warning;
+        }
+
+        #[must_use]
+        pub fn config_warning(&self) -> Option<String> {
+            self.config_warning.clone()
+        }
+
+        /// Stop STA and SoftAP. Idempotent when the driver was never started.
+        pub fn stop_radio(&mut self) -> Result<()> {
+            let _ = self.sntp.take();
+            let was_started = self.radio_started;
+            if let Some(wifi) = self.wifi.as_mut() {
+                let _ = wifi.disconnect();
+                if let Err(error) = wifi.stop() {
+                    if was_started {
+                        log::warn!("rustmix-wave=wifi-radio status=stop-failed error={error}");
+                    }
+                }
+            }
+            self.radio_started = false;
+            self.snapshot.wifi_state = WifiConnectionState::Disabled;
+            self.snapshot.ntp_state = NtpSyncState::Disabled;
+            self.snapshot.ssid = None;
+            self.snapshot.ipv4_address = None;
+            self.snapshot.rssi_dbm = None;
+            self.snapshot.last_sync_utc = None;
+            self.snapshot.error = None;
+            self.ntp_reported = false;
+            self.suspended = false;
+            Ok(())
         }
 
         #[must_use]
@@ -404,6 +466,7 @@ pub mod espidf {
                 let _ = wifi.disconnect();
                 wifi.stop()?;
             }
+            self.radio_started = false;
             self.snapshot.wifi_state = WifiConnectionState::Disabled;
             self.snapshot.ntp_state = NtpSyncState::Disabled;
             self.snapshot.ipv4_address = None;
@@ -500,6 +563,31 @@ mod tests {
         assert_eq!(snapshot.home_badge(), "SETUP");
         assert_eq!(snapshot.ssid_label(), "Rustmix-Setup");
         assert_eq!(snapshot.ipv4_label(), "192.168.4.1");
+        assert!(!snapshot.is_station_associated());
+    }
+
+    #[test]
+    fn only_a_real_station_address_counts_as_connected() {
+        let connected = NetworkSnapshot {
+            wifi_state: WifiConnectionState::Connected,
+            ipv4_address: Some("192.0.2.20".into()),
+            ..NetworkSnapshot::default()
+        };
+        assert!(connected.is_station_associated());
+
+        let ap_address_marked_connected = NetworkSnapshot {
+            wifi_state: WifiConnectionState::Connected,
+            ipv4_address: Some(crate::wifi_setup::WIFI_SETUP_AP_IP.into()),
+            ..NetworkSnapshot::default()
+        };
+        assert!(!ap_address_marked_connected.is_station_associated());
+
+        let connected_without_address = NetworkSnapshot {
+            wifi_state: WifiConnectionState::Connected,
+            ipv4_address: None,
+            ..NetworkSnapshot::default()
+        };
+        assert!(!connected_without_address.is_station_associated());
     }
     #[test]
     fn log_fingerprint_ignores_rssi_churn() {

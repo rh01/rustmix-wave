@@ -3,7 +3,7 @@
 //! Credentials are loaded at boot from removable storage. Keep parsing here so
 //! firmware wiring never embeds, renders, or logs the password.
 
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{collections::BTreeMap, fs, io::ErrorKind, path::Path};
 
 use anyhow::{bail, Context, Result};
 
@@ -72,12 +72,7 @@ impl NetworkConfig {
         }
 
         let password = values.get("password").cloned().unwrap_or_default();
-        if password.len() > 63 {
-            bail!("password must contain at most 63 UTF-8 bytes");
-        }
-        if !password.is_empty() && password.len() < 8 {
-            bail!("secured Wi-Fi password must contain at least 8 UTF-8 bytes");
-        }
+        validate_wifi_secret(&password)?;
 
         let timezone = values
             .get("timezone")
@@ -143,6 +138,95 @@ fn required<'a>(values: &'a BTreeMap<String, String>, key: &str) -> Result<&'a s
         .ok_or_else(|| anyhow::anyhow!("missing required key {key:?}"))
 }
 
+/// Accept an open network, an 8–63 byte passphrase, or a 64-character hex PSK.
+fn validate_wifi_secret(password: &str) -> Result<()> {
+    if password.is_empty() || (8..=63).contains(&password.len()) {
+        return Ok(());
+    }
+    if password.len() == 64 && password.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(());
+    }
+    if password.len() == 64 {
+        bail!("64-character Wi-Fi key must be a hexadecimal PSK");
+    }
+    bail!("password must contain 8 to 63 UTF-8 bytes, or 64 hexadecimal PSK characters");
+}
+
+/// What `/RUSTMIX/WIFI.TXT` contributed at boot.
+#[derive(Debug)]
+pub enum SdWifiTxt {
+    /// The file is not on the card. NVS may supply credentials.
+    Missing,
+    /// The file is present but unusable. It stays first: do not replace it with NVS.
+    Invalid {
+        detail: String,
+    },
+    Ready(NetworkConfig),
+}
+
+/// Where boot credentials came from after applying the SD-first rule.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BootWifiSource {
+    Sd,
+    Nvs,
+    None,
+}
+
+/// Boot credential choice. An invalid `WIFI.TXT` never falls through to NVS.
+#[derive(Debug)]
+pub struct BootWifiResolution {
+    pub credentials: Option<NetworkConfig>,
+    pub source: BootWifiSource,
+    /// Set when `WIFI.TXT` exists but cannot be used. Includes the words `WIFI.TXT is invalid`.
+    pub invalid_wifi_txt: Option<String>,
+}
+
+/// Read SD `WIFI.TXT`, distinguishing a missing file from an invalid one.
+pub fn load_sd_wifi_txt(path: impl AsRef<Path>) -> SdWifiTxt {
+    let path = path.as_ref();
+    match fs::read_to_string(path) {
+        Err(error) if error.kind() == ErrorKind::NotFound => SdWifiTxt::Missing,
+        Err(error) => SdWifiTxt::Invalid {
+            detail: format!("unable to read WIFI.TXT ({error})"),
+        },
+        Ok(contents) => match NetworkConfig::parse(&contents) {
+            Ok(config) => SdWifiTxt::Ready(config),
+            Err(error) => SdWifiTxt::Invalid {
+                detail: format!("{error:#}"),
+            },
+        },
+    }
+}
+
+/// Keep `WIFI.TXT` first. NVS is only the fallback when that file is missing.
+#[must_use]
+pub fn resolve_boot_wifi(sd: SdWifiTxt, nvs: Option<NetworkConfig>) -> BootWifiResolution {
+    match sd {
+        SdWifiTxt::Ready(config) => BootWifiResolution {
+            credentials: Some(config),
+            source: BootWifiSource::Sd,
+            invalid_wifi_txt: None,
+        },
+        SdWifiTxt::Missing => match nvs {
+            Some(config) => BootWifiResolution {
+                credentials: Some(config),
+                source: BootWifiSource::Nvs,
+                invalid_wifi_txt: None,
+            },
+            None => BootWifiResolution {
+                credentials: None,
+                source: BootWifiSource::None,
+                invalid_wifi_txt: None,
+            },
+        },
+        SdWifiTxt::Invalid { detail } => BootWifiResolution {
+            credentials: None,
+            source: BootWifiSource::None,
+            invalid_wifi_txt: Some(format!("WIFI.TXT is invalid: {detail}")),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{NetworkConfig, DEFAULT_NTP_SERVER, DEFAULT_TIMEZONE};
@@ -181,6 +265,85 @@ mod tests {
         assert!(NetworkConfig::parse("ssid=Lab\nextra=value\n").is_err());
         assert!(NetworkConfig::parse("ssid=Lab\nssid=Other\n").is_err());
         assert!(NetworkConfig::parse("ssid=Lab\npassword=short\n").is_err());
+    }
+
+    #[test]
+    fn accepts_64_character_hex_psk() {
+        let psk = "ab".repeat(32);
+        assert_eq!(psk.len(), 64);
+        let config = NetworkConfig::parse(&format!("ssid=Lab\npassword={psk}\n")).unwrap();
+        assert_eq!(config.password, psk);
+
+        let upper = "AB".repeat(32);
+        let config = NetworkConfig::parse(&format!("ssid=Lab\npassword={upper}\n")).unwrap();
+        assert_eq!(config.password, upper);
+    }
+
+    #[test]
+    fn rejects_64_character_non_hex_and_overlong_secrets() {
+        let non_hex = "z".repeat(64);
+        assert!(NetworkConfig::parse(&format!("ssid=Lab\npassword={non_hex}\n")).is_err());
+        let overlong = "a".repeat(65);
+        assert!(NetworkConfig::parse(&format!("ssid=Lab\npassword={overlong}\n")).is_err());
+        assert!(NetworkConfig::parse("ssid=Lab\npassword=short\n").is_err());
+        let passphrase = "p".repeat(63);
+        assert!(NetworkConfig::parse(&format!("ssid=Lab\npassword={passphrase}\n")).is_ok());
+    }
+
+    #[test]
+    fn invalid_wifi_txt_stays_first_and_does_not_use_nvs() {
+        let nvs = NetworkConfig::parse("ssid=FromNvs\npassword=correct-horse\n").unwrap();
+        let decision = super::resolve_boot_wifi(
+            super::SdWifiTxt::Invalid {
+                detail:
+                    "password must contain 8 to 63 UTF-8 bytes, or 64 hexadecimal PSK characters"
+                        .into(),
+            },
+            Some(nvs),
+        );
+        assert!(decision.credentials.is_none());
+        assert_eq!(decision.source, super::BootWifiSource::None);
+        let message = decision.invalid_wifi_txt.expect("invalid file message");
+        assert!(message.contains("WIFI.TXT is invalid"));
+        assert!(!message.contains("FromNvs"));
+    }
+
+    #[test]
+    fn missing_wifi_txt_falls_back_to_nvs_and_valid_sd_wins() {
+        let nvs = NetworkConfig::parse("ssid=FromNvs\npassword=correct-horse\n").unwrap();
+        let missing = super::resolve_boot_wifi(super::SdWifiTxt::Missing, Some(nvs.clone()));
+        assert_eq!(missing.source, super::BootWifiSource::Nvs);
+        assert_eq!(missing.credentials.unwrap().ssid, "FromNvs");
+        assert!(missing.invalid_wifi_txt.is_none());
+
+        let sd = NetworkConfig::parse("ssid=FromSd\npassword=correct-horse\n").unwrap();
+        let ready = super::resolve_boot_wifi(super::SdWifiTxt::Ready(sd), Some(nvs));
+        assert_eq!(ready.source, super::BootWifiSource::Sd);
+        assert_eq!(ready.credentials.unwrap().ssid, "FromSd");
+    }
+
+    #[test]
+    fn load_sd_wifi_txt_reports_missing_and_invalid_separately() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rustmix-wifi-status-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("missing-WIFI.TXT");
+        assert!(matches!(
+            super::load_sd_wifi_txt(&missing),
+            super::SdWifiTxt::Missing
+        ));
+        let invalid = dir.join("WIFI.TXT");
+        std::fs::write(&invalid, "ssid=Lab\npassword=short\n").unwrap();
+        match super::load_sd_wifi_txt(&invalid) {
+            super::SdWifiTxt::Invalid { detail } => {
+                assert!(!detail.is_empty());
+            }
+            other => panic!("expected invalid WIFI.TXT, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

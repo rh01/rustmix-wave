@@ -14,7 +14,7 @@ button.ssid{text-align:left;background:#f4f4f4;border:1px solid #ccc}
 <ul id="list"></ul>
 <form method="POST" action="/save">
 <label>SSID <input name="ssid" id="ssid" required maxlength="32" autocomplete="off"></label>
-<label>Password <input name="password" id="password" type="password" maxlength="63" placeholder="leave empty if open"></label>
+<label>Password <input name="password" id="password" type="password" maxlength="64" placeholder="8-63 chars, or 64-hex PSK; empty if open"></label>
 <label>Timezone <select name="timezone"><option>America/New_York</option><option>UTC</option></select></label>
 <button type="submit">Save and connect</button>
 </form>

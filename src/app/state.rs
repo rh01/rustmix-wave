@@ -947,7 +947,7 @@ impl AppState {
                     } else {
                         self.reader.activate_selected_preference()
                     };
-                    self.weread.sync_layout(self.reader.preferences.layout());
+                    let _ = self.weread.sync_layout(self.reader.preferences.layout());
                     if rebuild {
                         self.router.navigate_to(ScreenRoute::ReaderLoading);
                     }
@@ -1095,7 +1095,7 @@ impl AppState {
             self.note_select_press();
         }
         let layout = self.reader.preferences.layout();
-        self.weread.sync_layout(layout);
+        let _ = self.weread.sync_layout(layout);
         let previous = self.router.current();
         if let Some(route) = self
             .weread
@@ -1116,7 +1116,7 @@ impl AppState {
         if self.router.current() == ScreenRoute::ReaderPreferences {
             if let Some(return_route) = self.weread_preferences_return.take() {
                 self.reader.finish_preferences_edit();
-                self.weread.sync_layout(self.reader.preferences.layout());
+                let _ = self.weread.sync_layout(self.reader.preferences.layout());
                 self.router.navigate_to(return_route);
                 self.weread.note_route(previous, return_route);
                 self.sync_reader_orientation_for_active_route();
@@ -1649,7 +1649,7 @@ mod tests {
         let mut state = AppState::default();
         state.router.navigate_to(ScreenRoute::ReaderPreferences);
         state.weread.chapter_source = "abcd ".repeat(80);
-        state.weread.sync_layout(state.reader.preferences.layout());
+        assert!(state.weread.sync_layout(state.reader.preferences.layout()));
         let before = state.weread.pages.len();
         state.apply(ButtonEvent::Select);
         assert!(state.weread.pages.len() > before);

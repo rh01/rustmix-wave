@@ -7,7 +7,8 @@ use crate::weread::{
     bitmap::{self, MonoBitmap},
     crypto, decode,
     limits::{
-        MAX_CHAPTER_IMAGES, MAX_HTML_BYTES, MAX_IMAGE_BYTES, MAX_JSON_BYTES, MAX_SHARD_BYTES,
+        DOWNLOAD_CLASSIFY_BYTES, MAX_CHAPTER_IMAGES, MAX_HTML_BYTES, MAX_IMAGE_BYTES,
+        MAX_JSON_BYTES, MAX_SHARD_BYTES,
     },
     parse::{
         self, BookDetail, ChapterMeta, LoginPoll, NoteLine, ReadingProgress, ResponseClass,
@@ -35,12 +36,38 @@ pub struct Response {
     pub content_length: Option<usize>,
 }
 
+/// Prefix and length of a chapter part whose body was streamed to storage.
+#[derive(Clone, Debug)]
+pub struct StreamedPart {
+    pub status: u16,
+    pub set_cookie: String,
+    /// Leading bytes used to tell a zip, a txt envelope, and a shard apart.
+    pub prefix: Vec<u8>,
+    pub total: usize,
+}
+
 pub trait Transport {
     fn idle(&mut self);
     fn call(&mut self, request: &Request) -> Result<Response, String>;
 
     fn cancelled(&self) -> bool {
         false
+    }
+
+    /// Offline download is streaming each response body to the SD card.
+    fn streaming_download(&self) -> bool {
+        false
+    }
+
+    /// Read one chapter part without retaining its body.
+    ///
+    /// The device override writes each read onward. Interactive reads keep using [`call`].
+    fn call_stream(
+        &mut self,
+        _request: &Request,
+        _part: &'static str,
+    ) -> Result<StreamedPart, String> {
+        Err("streaming download is not available".into())
     }
 }
 
@@ -106,6 +133,10 @@ pub enum JobOutput {
         images: Vec<ChapterImage>,
         psvts: String,
         format: String,
+    },
+    /// Raw chapter parts are already on the SD card. Decode when the chapter is opened.
+    ChapterStored {
+        psvts: String,
     },
     ProgressUploaded,
     Notes {
@@ -603,16 +634,20 @@ fn open_book(
     })
 }
 
-fn chapter(
+struct PreparedChapter {
+    psvts: String,
+    unix: u64,
+    referer: String,
+}
+
+fn prepare_chapter(
     transport: &mut dyn Transport,
     session: &mut Session,
     ctx: &mut CallCtx,
     book_id: &str,
     chapter_uid: &str,
-    _chapter_idx: u32,
     psvts: &str,
-    fetch_images: bool,
-) -> Result<JobOutput, JobError> {
+) -> Result<PreparedChapter, JobError> {
     if !session.web_signed_in() {
         return Err(JobError::Message("Chapter text needs a WeRead QR login. An API key only covers shelf, progress, and notes.".into()));
     }
@@ -625,7 +660,32 @@ fn chapter(
             "WeRead reader page had no session token. Sign in again.".into(),
         ))?;
     }
-    let referer = protocol::reader_url(book_id, Some(chapter_uid));
+    Ok(PreparedChapter {
+        psvts,
+        unix,
+        referer: protocol::reader_url(book_id, Some(chapter_uid)),
+    })
+}
+
+fn chapter(
+    transport: &mut dyn Transport,
+    session: &mut Session,
+    ctx: &mut CallCtx,
+    book_id: &str,
+    chapter_uid: &str,
+    _chapter_idx: u32,
+    psvts: &str,
+    fetch_images: bool,
+) -> Result<JobOutput, JobError> {
+    let prepared = prepare_chapter(transport, session, ctx, book_id, chapter_uid, psvts)?;
+    if transport.streaming_download() {
+        return stream_chapter(transport, session, ctx, book_id, chapter_uid, prepared);
+    }
+    let PreparedChapter {
+        psvts,
+        unix,
+        referer,
+    } = prepared;
     let e0 = post_shard(
         transport,
         session,
@@ -912,6 +972,180 @@ fn cover(
         book_id: book_id.to_string(),
         bitmap,
     })
+}
+
+enum ShardPlan {
+    Zip,
+    Empty,
+    Txt,
+    Shards,
+}
+
+fn shard_plan(prefix: &[u8]) -> ShardPlan {
+    let prefix = &prefix[..prefix.len().min(DOWNLOAD_CLASSIFY_BYTES)];
+    if prefix.starts_with(b"PK\x03\x04") {
+        return ShardPlan::Zip;
+    }
+    let text = String::from_utf8_lossy(prefix);
+    let compact = text.trim();
+    if !compact.starts_with('{') {
+        return ShardPlan::Shards;
+    }
+    if compact == "{}" || compact.starts_with("{}") {
+        return ShardPlan::Empty;
+    }
+    if compact.contains("\"bookId\"") {
+        return ShardPlan::Txt;
+    }
+    ShardPlan::Empty
+}
+
+fn stream_chapter(
+    transport: &mut dyn Transport,
+    session: &mut Session,
+    ctx: &mut CallCtx,
+    book_id: &str,
+    chapter_uid: &str,
+    prepared: PreparedChapter,
+) -> Result<JobOutput, JobError> {
+    let e0 = stream_part(
+        transport,
+        session,
+        ctx,
+        "/web/book/chapter/e_0",
+        "e0",
+        book_id,
+        chapter_uid,
+        &prepared.psvts,
+        prepared.unix,
+        &prepared.referer,
+    )?;
+    match shard_plan(&e0.prefix) {
+        ShardPlan::Zip => {}
+        ShardPlan::Empty => {
+            return Err(JobError::Message(
+                "WeRead returned an empty chapter. The session may lack access.".into(),
+            ));
+        }
+        ShardPlan::Txt => {
+            stream_part(
+                transport,
+                session,
+                ctx,
+                "/web/book/chapter/t_0",
+                "t0",
+                book_id,
+                chapter_uid,
+                &prepared.psvts,
+                prepared.unix,
+                &prepared.referer,
+            )?;
+            stream_part(
+                transport,
+                session,
+                ctx,
+                "/web/book/chapter/t_1",
+                "t1",
+                book_id,
+                chapter_uid,
+                &prepared.psvts,
+                prepared.unix,
+                &prepared.referer,
+            )?;
+        }
+        ShardPlan::Shards => {
+            stream_part(
+                transport,
+                session,
+                ctx,
+                "/web/book/chapter/e_1",
+                "e1",
+                book_id,
+                chapter_uid,
+                &prepared.psvts,
+                prepared.unix,
+                &prepared.referer,
+            )?;
+            stream_part(
+                transport,
+                session,
+                ctx,
+                "/web/book/chapter/e_3",
+                "e3",
+                book_id,
+                chapter_uid,
+                &prepared.psvts,
+                prepared.unix,
+                &prepared.referer,
+            )?;
+        }
+    }
+    Ok(JobOutput::ChapterStored {
+        psvts: prepared.psvts,
+    })
+}
+
+fn stream_part(
+    transport: &mut dyn Transport,
+    session: &mut Session,
+    ctx: &mut CallCtx,
+    path: &str,
+    part: &'static str,
+    book_id: &str,
+    chapter_uid: &str,
+    psvts: &str,
+    unix: u64,
+    referer: &str,
+) -> Result<StreamedPart, JobError> {
+    if transport.cancelled() {
+        return Err(JobError::Cancelled);
+    }
+    if ctx.first {
+        ctx.first = false;
+    } else {
+        transport.idle();
+    }
+    if transport.cancelled() {
+        return Err(JobError::Cancelled);
+    }
+    let square = u64::from(ctx.next_u32() % 10_000).saturating_pow(2);
+    let body = protocol::content_json(book_id, chapter_uid, psvts, unix, square, false);
+    if body.len() > MAX_JSON_BYTES {
+        return Err(JobError::Message(
+            "request body exceeds the size limit".into(),
+        ));
+    }
+    let streamed = transport
+        .call_stream(
+            &Request {
+                method: "POST",
+                url: format!("{WEB_ORIGIN}{path}"),
+                body: Some(body),
+                headers: protocol::browser_headers(&session.cookie_header(), referer, true),
+                max_bytes: MAX_SHARD_BYTES,
+            },
+            part,
+        )
+        .map_err(|error| JobError::Message(trim_message(&error)))?;
+    if streamed.total > MAX_SHARD_BYTES {
+        return Err(JobError::Message("response exceeds size limit".into()));
+    }
+    session.absorb_set_cookie(&streamed.set_cookie);
+    let prefix = String::from_utf8_lossy(
+        &streamed.prefix[..streamed.prefix.len().min(DOWNLOAD_CLASSIFY_BYTES)],
+    );
+    match parse::classify(streamed.status, &prefix) {
+        ResponseClass::Expired => Err(JobError::Expired),
+        ResponseClass::Upgrade => Err(JobError::Message(
+            crate::weread::jsonutil::upgrade_message(&prefix)
+                .unwrap_or_else(|| "WeRead asked for a client update.".into()),
+        )),
+        ResponseClass::Rejected => Err(JobError::Message(format!(
+            "WeRead rejected the request (HTTP {}).",
+            streamed.status
+        ))),
+        ResponseClass::Ok => Ok(streamed),
+    }
 }
 
 fn post_shard(
@@ -1216,7 +1450,9 @@ fn trim_message(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{perform, Job, JobError, JobOutput, Request, Response, Transport, Work};
+    use super::{
+        perform, Job, JobError, JobOutput, Request, Response, StreamedPart, Transport, Work,
+    };
     use crate::weread::{decode::seal_plain, session::Session};
 
     struct Script {
@@ -1580,5 +1816,211 @@ mod tests {
         };
         assert!(message.contains("truncated"));
         assert!(!message.to_lowercase().contains("no chapters"));
+    }
+
+    struct RecordingStream {
+        steps: Vec<Response>,
+        index: usize,
+        urls: Vec<String>,
+        chunk_lens: Vec<usize>,
+    }
+
+    impl Transport for RecordingStream {
+        fn idle(&mut self) {}
+        fn call(&mut self, request: &Request) -> Result<Response, String> {
+            self.urls.push(request.url.clone());
+            let response = self
+                .steps
+                .get(self.index)
+                .cloned()
+                .ok_or_else(|| "script ended".to_string())?;
+            self.index += 1;
+            if response.body.len() > request.max_bytes {
+                return Err("response exceeds size limit".into());
+            }
+            Ok(response)
+        }
+        fn streaming_download(&self) -> bool {
+            true
+        }
+        fn call_stream(
+            &mut self,
+            request: &Request,
+            _part: &'static str,
+        ) -> Result<StreamedPart, String> {
+            let response = self.call(request)?;
+            let chunk_bytes = crate::weread::limits::DOWNLOAD_CHUNK_BYTES;
+            for chunk in response.body.chunks(chunk_bytes) {
+                assert!(chunk.len() <= chunk_bytes);
+                self.chunk_lens.push(chunk.len());
+            }
+            let prefix_len = response
+                .body
+                .len()
+                .min(crate::weread::limits::DOWNLOAD_CLASSIFY_BYTES);
+            Ok(StreamedPart {
+                status: response.status,
+                set_cookie: response.set_cookie,
+                prefix: response.body[..prefix_len].to_vec(),
+                total: response.body.len(),
+            })
+        }
+    }
+
+    fn stream_session() -> crate::weread::session::Session {
+        let mut session = Session::default();
+        session.vid = "9".into();
+        session.skey = "tok".into();
+        session.skey_unix = 1_780_488_000;
+        session
+    }
+
+    fn chapter_job(fetch_images: bool) -> Job {
+        Job::Chapter {
+            book_id: "43208843".into(),
+            chapter_uid: "2".into(),
+            chapter_idx: 2,
+            psvts: "ps".into(),
+            fetch_images,
+        }
+    }
+
+    #[test]
+    fn streaming_download_keeps_each_response_chunk_bounded() {
+        let chunk = crate::weread::limits::DOWNLOAD_CHUNK_BYTES;
+        let shard = vec![b'A'; chunk + 100];
+        let mut transport = RecordingStream {
+            steps: vec![
+                Response {
+                    status: 200,
+                    body: shard.clone(),
+                    set_cookie: String::new(),
+                    content_length: Some(shard.len()),
+                },
+                Response {
+                    status: 200,
+                    body: shard.clone(),
+                    set_cookie: String::new(),
+                    content_length: Some(shard.len()),
+                },
+                Response {
+                    status: 200,
+                    body: shard,
+                    set_cookie: String::new(),
+                    content_length: None,
+                },
+            ],
+            index: 0,
+            urls: Vec::new(),
+            chunk_lens: Vec::new(),
+        };
+        let report = perform(
+            &mut transport,
+            Work {
+                generation: 1,
+                job: chapter_job(false),
+                session: stream_session(),
+            },
+            Some(1_780_488_000),
+        );
+        let JobOutput::ChapterStored { .. } = report.result.unwrap() else {
+            panic!("download stores the raw parts and does not return chapter text");
+        };
+        assert!(transport.chunk_lens.iter().any(|len| *len == chunk));
+        assert!(transport.chunk_lens.iter().all(|len| *len <= chunk));
+        assert!(transport
+            .urls
+            .iter()
+            .any(|url| url.contains("/chapter/e_0")));
+        assert!(transport
+            .urls
+            .iter()
+            .any(|url| url.contains("/chapter/e_1")));
+        assert!(transport
+            .urls
+            .iter()
+            .any(|url| url.contains("/chapter/e_3")));
+        assert!(!transport.urls.iter().any(|url| url.contains("/chapter/t_")));
+    }
+
+    #[test]
+    fn streaming_download_classifies_zip_txt_and_empty_from_the_prefix() {
+        let mut zip = RecordingStream {
+            steps: vec![Response {
+                status: 200,
+                body: b"PK\x03\x04chapter-zip".to_vec(),
+                set_cookie: String::new(),
+                content_length: None,
+            }],
+            index: 0,
+            urls: Vec::new(),
+            chunk_lens: Vec::new(),
+        };
+        let report = perform(
+            &mut zip,
+            Work {
+                generation: 1,
+                job: chapter_job(false),
+                session: stream_session(),
+            },
+            Some(1_780_488_000),
+        );
+        assert!(matches!(report.result, Ok(JobOutput::ChapterStored { .. })));
+        assert_eq!(zip.urls.len(), 1);
+        assert!(zip.urls[0].contains("/chapter/e_0"));
+
+        let mut txt = RecordingStream {
+            steps: vec![
+                json_response(r#"{"bookId":"43208843","chapterUid":2}"#),
+                Response {
+                    status: 200,
+                    body: b"t0-shard".to_vec(),
+                    set_cookie: String::new(),
+                    content_length: None,
+                },
+                Response {
+                    status: 200,
+                    body: b"t1-shard".to_vec(),
+                    set_cookie: String::new(),
+                    content_length: None,
+                },
+            ],
+            index: 0,
+            urls: Vec::new(),
+            chunk_lens: Vec::new(),
+        };
+        let report = perform(
+            &mut txt,
+            Work {
+                generation: 2,
+                job: chapter_job(false),
+                session: stream_session(),
+            },
+            Some(1_780_488_000),
+        );
+        assert!(matches!(report.result, Ok(JobOutput::ChapterStored { .. })));
+        assert!(txt.urls.iter().any(|url| url.contains("/chapter/t_0")));
+        assert!(txt.urls.iter().any(|url| url.contains("/chapter/t_1")));
+        assert!(!txt.urls.iter().any(|url| url.contains("/chapter/e_1")));
+
+        let mut empty = RecordingStream {
+            steps: vec![json_response("{}")],
+            index: 0,
+            urls: Vec::new(),
+            chunk_lens: Vec::new(),
+        };
+        let report = perform(
+            &mut empty,
+            Work {
+                generation: 3,
+                job: chapter_job(false),
+                session: stream_session(),
+            },
+            Some(1_780_488_000),
+        );
+        let Err(JobError::Message(message)) = report.result else {
+            panic!("empty chapter must fail");
+        };
+        assert!(message.contains("empty chapter"));
     }
 }

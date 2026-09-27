@@ -480,8 +480,8 @@ mod firmware {
         }
         log_runtime_memory("sd-font-loaded");
         let font_heap = RuntimeMemorySnapshot::capture();
-        let weread_psram_need =
-            weread::limits::MAX_SHARD_BYTES + weread::limits::WEREAD_HTTP_WORKER_STACK_BYTES;
+        let weread_psram_need = weread::limits::DOWNLOAD_CHUNK_BYTES.saturating_mul(4)
+            + weread::limits::WEREAD_HTTP_WORKER_STACK_BYTES;
         info!(
             "rustmix-wave=cjk-font-engine-ready fallback=unifont-gb2312 unifont-glyphs={} unifont-bytes={} sd-faces={} sd-font-file-bytes={} sd-dirs={} cache-budget-bytes={} psram=spiram-malloc flash-impact=unifont-subset+fontdue heap-free-psram-bytes={} heap-largest-psram-block-bytes={}",
             font_status.unifont_glyphs,
@@ -497,11 +497,12 @@ mod firmware {
             && font_heap.heap_largest_psram_block_bytes < weread_psram_need
         {
             warn!(
-                "rustmix-wave=weread-heap status=psram-tight largest-psram-block-bytes={} need-bytes={} shard-cap-bytes={} worker-stack-bytes={} cause=sd-font-outlines",
+                "rustmix-wave=weread-heap status=psram-tight largest-psram-block-bytes={} need-bytes={} download-chunk-bytes={} worker-stack-bytes={} open-shard-cap-bytes={} cause=sd-font-outlines",
                 font_heap.heap_largest_psram_block_bytes,
                 weread_psram_need,
-                weread::limits::MAX_SHARD_BYTES,
-                weread::limits::WEREAD_HTTP_WORKER_STACK_BYTES
+                weread::limits::DOWNLOAD_CHUNK_BYTES,
+                weread::limits::WEREAD_HTTP_WORKER_STACK_BYTES,
+                weread::limits::MAX_SHARD_BYTES
             );
         }
         let reader_persistence = state.reader.load_persistent_state();
@@ -804,7 +805,7 @@ mod firmware {
         info!("rustmix-wave=voice-notes-organizer-controls-export-ready gain-persistence=SETTINGS.TXT metadata=META.TXT titles=friendly-sidecar filenames=fat83-wav recording-date-time=rtc-local storage=esp-vfs-fat-info delete-confirmation=true pause-resume=rx-discard export=wifi-transfer-shortcut");
         info!("rustmix-wave=offline-dictionary-x4-pack-native-foundation-ready root={DICTIONARY_ROOT} index=INDEX.TXT shards=DATA/*.JSN shard-max-bytes={DICTIONARY_SHARD_MAX_BYTES} lookup=exact-prefix-fallback wildcard=true ui=native-rust");
         info!("rustmix-wave=lexicon-vocab-ready root=/sdcard/RUSTMIX/LEXICON format=RMXLEX1 lists=RMXWLS1 vocab=/sdcard/RUSTMIX/VOCAB scheduler=fsrs6,sm2");
-        info!("rustmix-wave=weread-reader-ready root=/sdcard/RUSTMIX/WEREAD login=qr-web chapter=signed-e progress=web-upload offline=sd-text notes=official-gateway worker=weread-http-long-lived stack-bytes={WEREAD_HTTP_WORKER_STACK_BYTES} stack-caps=psram download-retry=chapter font=reading-preferences repaginate=on-layout-change");
+        info!("rustmix-wave=weread-reader-ready root=/sdcard/RUSTMIX/WEREAD login=qr-web chapter=signed-e progress=web-upload offline=sd-stream-chunk download-chunk-bytes={} notes=official-gateway worker=weread-http-long-lived stack-bytes={WEREAD_HTTP_WORKER_STACK_BYTES} stack-caps=psram download-retry=chapter font=reading-preferences repaginate=on-layout-change", weread::limits::DOWNLOAD_CHUNK_BYTES);
         info!("rustmix-wave=dictionary-keyboard-boot-axis-navigation-ready short-press=boot toggle=horizontal,vertical default-axis=horizontal selected-key=preserved long-press=hierarchical-back helper=keyboard-grid-navigation");
         info!(
             "rustmix-wave=voice-notes-catalog status=completed notes={} root={VOICE_NOTES_ROOT}",

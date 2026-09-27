@@ -154,7 +154,7 @@ Reading uses the same font, size, and CJK faces as the TXT/EPUB reader, includin
 
 While a request is running the footer says WORKING. SELECT cancels it. Buttons and the idle timer keep running; a slow request does not put the panel to sleep the moment it returns.
 
-**Download** saves every chapter as plain text under `/RUSTMIX/WEREAD/<8 hex>/<8 hex>.TXT`. One worker thread is reused for every chapter. If a chapter fails, the device retries it and then continues with the rest of the book. SELECT cancels the chapter that is downloading, and BOOT long leaves the screen. Saved chapters open with no network. The clock must be synced over Wi-Fi before a chapter can be fetched; the device treats the RTC value as UTC+8 wall time.
+**Download** writes each chapter response to `/RUSTMIX/WEREAD/<8 hex>/<8 hex>.TXT` in 8 KiB chunks, using a temporary file that is renamed when the chapter finishes. The download does not keep the chapter in memory or paginate it. Opening a saved chapter decodes it and paginates it. One worker thread is reused for every chapter. If a chapter fails, the device retries it and then continues with the rest of the book. SELECT cancels the chapter that is downloading, and BOOT long leaves the screen. Saved chapters open with no network. The clock must be synced over Wi-Fi before a chapter can be fetched; the device treats the RTC value as UTC+8 wall time.
 
 Highlights and notes use the official read-only API and need the `wrk-` key. Phone-number one-time-password login is not supported: finish that step in the WeRead app, then scan again.
 

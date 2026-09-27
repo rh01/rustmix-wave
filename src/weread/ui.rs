@@ -1157,6 +1157,30 @@ impl WereadUi {
                     touch_activity: false,
                 }
             }
+            JobOutput::ChapterStored { psvts } => {
+                if !psvts.is_empty() {
+                    self.psvts = psvts;
+                }
+                // The raw parts are already on the SD card. Paginate only when opened.
+                self.pages = Vec::new();
+                self.images = Vec::new();
+                self.chapter_source = String::new();
+                self.paginated_layout = None;
+                if self.phase == Phase::Download && !self.download_cancel {
+                    self.download_attempts = 0;
+                    self.download_done = self.count_cached(mounted);
+                    self.queue_next_download(mounted, now_ms.saturating_add(MIN_REQUEST_GAP_MS));
+                    if self.pending.is_some() {
+                        self.status =
+                            format!("Saved {} / {}", self.download_done, self.chapters.len());
+                    }
+                }
+                ServiceOutcome {
+                    refresh: true,
+                    route: None,
+                    touch_activity: false,
+                }
+            }
             JobOutput::ProgressUploaded => {
                 self.session_dirty = true;
                 self.status = "Progress uploaded.".into();
@@ -1376,15 +1400,21 @@ mod tests {
         weread::{
             client::{Job, JobError, JobOutput, Report},
             limits::DOWNLOAD_ATTEMPTS,
-            offline::{self, CachedChapter},
+            offline::{self, CachedChapter, ChapterDownload, DownloadEvent},
             parse::{BookDetail, ChapterMeta, ReadingProgress},
             session::Session,
         },
     };
     use std::fs;
 
+    fn sd_root_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
     #[test]
     fn cached_chapter_paginates_and_expiry_returns_to_the_qr() {
+        let _sd = sd_root_lock();
         let dir = std::env::temp_dir().join(format!("weread-ui-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -1840,6 +1870,65 @@ mod tests {
         assert!(ui.chapter_source.is_empty());
         assert!(ui.images.is_empty());
         assert!(ui.pending.is_none());
+    }
+
+    #[test]
+    fn download_stores_raw_chunks_and_paginates_only_when_opened() {
+        let _sd = sd_root_lock();
+        let dir = std::env::temp_dir().join(format!("weread-ui-stream-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("WEREAD_SD_ROOT", &dir);
+        let book_id = "43208843";
+        let shard = crate::weread::decode::seal_plain("<p>Hello 微信</p>");
+        let mut download = ChapterDownload::begin(&dir, book_id, "1", 1).unwrap();
+        download.apply(DownloadEvent::BeginPart("e0")).unwrap();
+        for chunk in shard.as_bytes().chunks(100) {
+            download
+                .apply(DownloadEvent::Chunk(chunk.to_vec()))
+                .unwrap();
+        }
+        download.apply(DownloadEvent::EndPart).unwrap();
+        download.commit().unwrap();
+
+        let mut ui = signed_in();
+        ui.book_id = book_id.into();
+        ui.phase = super::Phase::Download;
+        ui.chapters = vec![chapter("1", 1, "One")];
+        ui.generation = 3;
+        ui.chapter_source = "old".into();
+        ui.pages = vec![vec![crate::reader::ReaderPageLine {
+            text: "old".into(),
+            paragraph_end: true,
+        }]];
+        ui.apply_report(
+            Report {
+                generation: 3,
+                job: Job::Chapter {
+                    book_id: book_id.into(),
+                    chapter_uid: "1".into(),
+                    chapter_idx: 1,
+                    psvts: "ps".into(),
+                    fetch_images: false,
+                },
+                session: ui.session.clone(),
+                result: Ok(JobOutput::ChapterStored { psvts: "ps".into() }),
+            },
+            ReaderPreferences::default().layout(),
+            true,
+            10,
+        );
+        assert!(ui.pages.is_empty());
+        assert!(ui.chapter_source.is_empty());
+        assert!(ui.pending.is_none());
+        assert!(ui.status.contains("Saved"));
+        assert_eq!(ui.psvts, "ps");
+        assert!(ui.begin_read(ReaderPreferences::default().layout(), true));
+        assert!(ui.chapter_source.contains("Hello"));
+        assert!(ui.chapter_source.contains("微信"));
+        assert!(!ui.pages.is_empty());
+        std::env::remove_var("WEREAD_SD_ROOT");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

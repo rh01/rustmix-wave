@@ -44,6 +44,11 @@ pub const HTTP_TIMEOUT_SECS: u64 = 20;
 /// First try plus two retries. A failed chapter does not cancel the book.
 pub const DOWNLOAD_ATTEMPTS: u8 = 3;
 pub const DOWNLOAD_RETRY_MS: u64 = 1_000;
+/// Offline download writes this many bytes to the SD card at a time.
+/// The worker does not retain the chapter shard.
+pub const DOWNLOAD_CHUNK_BYTES: usize = 8 * 1024;
+/// Leading bytes kept on the worker to tell a zip, txt envelope, and shard apart.
+pub const DOWNLOAD_CLASSIFY_BYTES: usize = 512;
 /// One long-lived `weread-http` pthread stack, allocated from PSRAM.
 pub const WEREAD_HTTP_WORKER_STACK_BYTES: usize = 32 * 1024;
 /// `esp_http_client` RX and TX buffers. Each stays under
@@ -61,8 +66,8 @@ pub const SESSION_BAK: &str = "SESS.BAK";
 #[cfg(test)]
 mod tests {
     use super::{
-        HTTP_IO_BUFFER_BYTES, MAX_CHAPTER_TEXT, MAX_SHARD_BYTES, MODULE_PSRAM_BYTES,
-        WEREAD_HTTP_WORKER_STACK_BYTES,
+        DOWNLOAD_CHUNK_BYTES, HTTP_IO_BUFFER_BYTES, MAX_CHAPTER_TEXT, MAX_SHARD_BYTES,
+        MODULE_PSRAM_BYTES, WEREAD_HTTP_WORKER_STACK_BYTES,
     };
     use crate::fonts::{
         GLYPH_CACHE_BUDGET_BYTES, MAX_SD_FONT_BYTES, SD_FONT_RESIDENT_BUDGET_BYTES,
@@ -72,18 +77,28 @@ mod tests {
     fn sd_font_worker_and_tls_fit_beside_a_chapter() {
         assert_eq!(MAX_SD_FONT_BYTES, 2 * 1024 * 1024);
         assert!(SD_FONT_RESIDENT_BUDGET_BYTES > MAX_SD_FONT_BYTES);
-        let psram = SD_FONT_RESIDENT_BUDGET_BYTES
+        // Download holds a handful of 8 KiB chunks, not the shard or decoded text.
+        let download = SD_FONT_RESIDENT_BUDGET_BYTES
             + WEREAD_HTTP_WORKER_STACK_BYTES
+            + DOWNLOAD_CHUNK_BYTES * 4
+            + GLYPH_CACHE_BUDGET_BYTES;
+        assert!(
+            download < MODULE_PSRAM_BYTES,
+            "download psram budget {download} exceeds {MODULE_PSRAM_BYTES}"
+        );
+        // Opening one stored chapter decodes a single shard after download has finished.
+        let opened = SD_FONT_RESIDENT_BUDGET_BYTES
             + MAX_SHARD_BYTES
             + MAX_CHAPTER_TEXT
             + GLYPH_CACHE_BUDGET_BYTES;
         assert!(
-            psram < MODULE_PSRAM_BYTES,
-            "psram budget {psram} exceeds {MODULE_PSRAM_BYTES}"
+            opened < MODULE_PSRAM_BYTES,
+            "open-chapter psram budget {opened} exceeds {MODULE_PSRAM_BYTES}"
         );
-        // TLS I/O stays under the internal-malloc threshold, so it does not
-        // need a PSRAM hole next to the font outlines.
+        // TLS I/O and download chunks stay under the internal-malloc threshold.
         assert!(HTTP_IO_BUFFER_BYTES * 2 <= 16 * 1024);
+        assert!((4 * 1024..=8 * 1024).contains(&DOWNLOAD_CHUNK_BYTES));
+        assert!(DOWNLOAD_CHUNK_BYTES <= 16 * 1024);
         assert!(WEREAD_HTTP_WORKER_STACK_BYTES <= 32 * 1024);
     }
 }

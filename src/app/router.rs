@@ -65,6 +65,7 @@ pub enum ScreenRoute {
     Network,
     NetworkDetails,
     WifiTransfer,
+    WifiSetup,
     Weather,
     WeatherDetails,
 }
@@ -134,6 +135,7 @@ impl ScreenRoute {
             Self::Network => "Network",
             Self::NetworkDetails => "Provisioning details",
             Self::WifiTransfer => "Wi-Fi Transfer",
+            Self::WifiSetup => "Configure Wi-Fi",
             Self::Weather => "Weather",
             Self::WeatherDetails => "Weather details",
         }
@@ -203,6 +205,7 @@ impl ScreenRoute {
             Self::Network => "network",
             Self::NetworkDetails => "network-details",
             Self::WifiTransfer => "wifi-transfer",
+            Self::WifiSetup => "wifi-setup",
             Self::Weather => "weather",
             Self::WeatherDetails => "weather-details",
         }
@@ -270,7 +273,7 @@ impl ScreenRoute {
             Self::EnvironmentDetails => Some(Self::Environment),
             Self::MotionEvents => Some(Self::Motion),
             Self::MotionDetails => Some(Self::MotionEvents),
-            Self::NetworkDetails | Self::WifiTransfer => Some(Self::Network),
+            Self::NetworkDetails | Self::WifiTransfer | Self::WifiSetup => Some(Self::Network),
             Self::WeatherDetails => Some(Self::Weather),
         }
     }
@@ -302,6 +305,7 @@ impl ScreenRoute {
                 | Self::Network
                 | Self::NetworkDetails
                 | Self::WifiTransfer
+                | Self::WifiSetup
                 | Self::Alarms
                 | Self::Calendar
                 | Self::CalendarAgenda
@@ -382,6 +386,11 @@ mod tests {
             ScreenRoute::LuaGameError.parent(),
             Some(ScreenRoute::LuaApps)
         );
+        assert_eq!(
+            ScreenRoute::WifiTransfer.parent(),
+            Some(ScreenRoute::Network)
+        );
+        assert_eq!(ScreenRoute::WifiSetup.parent(), Some(ScreenRoute::Network));
         assert_eq!(ScreenRoute::Home.parent(), None);
         assert_eq!(ScreenRoute::Lexicon.parent(), Some(ScreenRoute::Tools));
         assert_eq!(

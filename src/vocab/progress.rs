@@ -21,6 +21,8 @@ pub const DICTS_FILE: &str = "DICTS.TXT";
 pub const MYWORDS_FILE: &str = "MYWORDS.TXT";
 const MAGIC: &[u8; 8] = b"RMXSRS1\0";
 const RECORD_LEN: usize = 32;
+/// Wi-Fi and SD can replace `PROGRESS.BIN`. Refuse to load more than this.
+pub const MAX_PROGRESS_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredCard {
@@ -200,6 +202,10 @@ pub fn decode_progress(bytes: &[u8]) -> Result<ProgressFile> {
 }
 
 fn read_progress_file(path: &Path) -> Result<ProgressFile> {
+    let len = fs::metadata(path)?.len();
+    if len > MAX_PROGRESS_BYTES {
+        bail!("progress file exceeds {MAX_PROGRESS_BYTES} bytes");
+    }
     let bytes = fs::read(path)?;
     decode_progress(&bytes)
 }
@@ -463,6 +469,21 @@ mod tests {
             message.contains("overflow") || message.contains("mismatch"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn oversized_progress_file_is_rejected_before_read() {
+        let dir = temp_vocab_dir("huge-progress");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PROGRESS_BIN);
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(super::MAX_PROGRESS_BYTES + 1).unwrap();
+        drop(file);
+        let error = super::read_progress_file(&path).unwrap_err();
+        assert!(error.to_string().contains("exceeds"), "{}", error);
+        assert!(load_progress(&dir).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

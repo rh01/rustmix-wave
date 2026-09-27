@@ -1,9 +1,13 @@
 //! WeRead shelf, login, book, and reading state.
 //!
-//! One network job is handed to the main loop at a time. Login polls and
-//! whole-book downloads return between requests so the buttons stay live.
+//! One network job is handed to the main loop at a time. The device polls that
+//! job instead of joining it, so buttons and sleep stay live. Login polls and
+//! whole-book downloads also return between requests.
 
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{atomic::AtomicBool, Arc},
+};
 
 use crate::{
     app::router::ScreenRoute,
@@ -67,6 +71,8 @@ pub struct WereadUi {
     progress_not_before: u64,
     download_cancel: bool,
     session_dirty: bool,
+    pub busy: bool,
+    cancel_requested: bool,
 }
 
 impl Default for WereadUi {
@@ -103,6 +109,8 @@ impl Default for WereadUi {
             progress_not_before: 0,
             download_cancel: false,
             session_dirty: false,
+            busy: false,
+            cancel_requested: false,
         }
     }
 }
@@ -126,6 +134,8 @@ impl std::fmt::Debug for WereadUi {
 pub struct ServiceOutcome {
     pub refresh: bool,
     pub route: Option<ScreenRoute>,
+    /// Restart the panel idle timer. Set while a job is running and when it returns.
+    pub touch_activity: bool,
 }
 
 impl WereadUi {
@@ -142,6 +152,7 @@ impl WereadUi {
         }
         self.phase = Phase::Shelf;
         self.pending = None;
+        self.cancel_requested = self.busy;
         self.shelf_cursor = 0;
         self.progress_arm = false;
         if self.session.web_signed_in() || self.session.has_api_key() {
@@ -154,7 +165,7 @@ impl WereadUi {
 
     #[must_use]
     pub fn holds_panel(&self) -> bool {
-        matches!(self.phase, Phase::Login | Phase::Download) || self.pending.is_some()
+        self.busy || matches!(self.phase, Phase::Login | Phase::Download) || self.pending.is_some()
     }
 
     pub fn note_route(&mut self, previous: ScreenRoute, current: ScreenRoute) {
@@ -171,6 +182,9 @@ impl WereadUi {
             self.pending = None;
             self.progress_arm = false;
             self.download_cancel = true;
+            if self.busy {
+                self.cancel_requested = true;
+            }
             return;
         }
         self.phase = phase_from_route(current);
@@ -185,6 +199,18 @@ impl WereadUi {
         mounted: bool,
     ) -> Option<ScreenRoute> {
         self.phase = phase_from_route(route);
+        if self.busy {
+            if event == ButtonEvent::Select {
+                self.cancel_requested = true;
+                self.download_cancel = true;
+                self.status = if self.phase == Phase::Download {
+                    "Download stopped. Saved chapters stay on the SD card.".into()
+                } else {
+                    "Cancelling...".into()
+                };
+            }
+            return None;
+        }
         match self.phase {
             Phase::Shelf => self.on_shelf(event),
             Phase::Login => self.on_login(event),
@@ -702,6 +728,7 @@ impl WereadUi {
             return ServiceOutcome {
                 refresh: false,
                 route: None,
+                touch_activity: false,
             };
         }
         self.session = report.session;
@@ -733,6 +760,7 @@ impl WereadUi {
                 ServiceOutcome {
                     refresh: true,
                     route: Some(ScreenRoute::WeReadLogin),
+                    touch_activity: false,
                 }
             }
             JobOutput::LoginPending => {
@@ -742,6 +770,7 @@ impl WereadUi {
                     ServiceOutcome {
                         refresh: true,
                         route: None,
+                        touch_activity: false,
                     }
                 } else if self.phase == Phase::Login {
                     self.queue(
@@ -754,11 +783,13 @@ impl WereadUi {
                     ServiceOutcome {
                         refresh: false,
                         route: None,
+                        touch_activity: false,
                     }
                 } else {
                     ServiceOutcome {
                         refresh: false,
                         route: None,
+                        touch_activity: false,
                     }
                 }
             }
@@ -775,6 +806,7 @@ impl WereadUi {
                 ServiceOutcome {
                     refresh: true,
                     route: Some(ScreenRoute::WeRead),
+                    touch_activity: false,
                 }
             }
             JobOutput::Shelf { books } => {
@@ -785,6 +817,7 @@ impl WereadUi {
                 ServiceOutcome {
                     refresh: true,
                     route: None,
+                    touch_activity: false,
                 }
             }
             JobOutput::Book {
@@ -817,6 +850,7 @@ impl WereadUi {
                 ServiceOutcome {
                     refresh: true,
                     route: None,
+                    touch_activity: false,
                 }
             }
             JobOutput::Chapter {
@@ -866,6 +900,7 @@ impl WereadUi {
                 ServiceOutcome {
                     refresh: true,
                     route: None,
+                    touch_activity: false,
                 }
             }
             JobOutput::ProgressUploaded => {
@@ -874,6 +909,7 @@ impl WereadUi {
                 ServiceOutcome {
                     refresh: true,
                     route: None,
+                    touch_activity: false,
                 }
             }
             JobOutput::Notes { lines } => {
@@ -887,6 +923,7 @@ impl WereadUi {
                 ServiceOutcome {
                     refresh: true,
                     route: None,
+                    touch_activity: false,
                 }
             }
             JobOutput::Cover { book_id, bitmap } => {
@@ -899,6 +936,7 @@ impl WereadUi {
                 ServiceOutcome {
                     refresh: true,
                     route: None,
+                    touch_activity: false,
                 }
             }
         }
@@ -916,6 +954,16 @@ impl WereadUi {
                 ServiceOutcome {
                     refresh: true,
                     route: Some(ScreenRoute::WeReadLogin),
+                    touch_activity: false,
+                }
+            }
+            JobError::Cancelled => {
+                self.download_cancel = true;
+                self.status = error.to_string();
+                ServiceOutcome {
+                    refresh: true,
+                    route: None,
+                    touch_activity: false,
                 }
             }
             JobError::OtpRequired | JobError::Clock | JobError::Message(_) => {
@@ -926,19 +974,74 @@ impl WereadUi {
                 ServiceOutcome {
                     refresh: true,
                     route: None,
+                    touch_activity: false,
                 }
             }
         }
     }
 }
 
-pub fn service(
+/// Start or poll one WeRead job without waiting for it to finish.
+///
+/// `start` may return a handle immediately. Later calls pass the same `inflight`
+/// slot and `poll` until it yields a report. SELECT sets `cancel_requested`;
+/// the returned report is ignored after the generation moves on.
+pub fn drive_with<H>(
     ui: &mut WereadUi,
+    inflight: &mut Option<H>,
     unix: Option<u64>,
     now_ms: u64,
     layout: ReaderLayout,
     mounted: bool,
+    mut start: impl FnMut(Work, Option<u64>, Arc<AtomicBool>) -> Result<H, Report>,
+    mut poll: impl FnMut(&mut H) -> Option<Report>,
+    mut cancel: impl FnMut(&H),
 ) -> ServiceOutcome {
+    if let Some(job) = inflight.as_mut() {
+        let mut refresh = false;
+        if ui.cancel_requested {
+            cancel(job);
+            ui.generation = ui.generation.saturating_add(1);
+            ui.cancel_requested = false;
+            ui.download_cancel = true;
+            if ui.status != "Cancelling..." && !ui.status.starts_with("Download stopped") {
+                ui.status = "Cancelling...".into();
+                refresh = true;
+            }
+        }
+        if let Some(report) = poll(job) {
+            inflight.take();
+            ui.busy = false;
+            if report.generation != ui.generation {
+                if !ui.status.starts_with("Download stopped") {
+                    ui.status = "Cancelled.".into();
+                }
+                return ServiceOutcome {
+                    refresh: true,
+                    route: None,
+                    touch_activity: true,
+                };
+            }
+            let mut outcome = ui.apply_report(report, layout, mounted, now_ms);
+            if ui.session_dirty {
+                persist(ui, mounted);
+            }
+            outcome.touch_activity = true;
+            return outcome;
+        }
+        let became_busy = !ui.busy;
+        ui.busy = true;
+        return ServiceOutcome {
+            refresh: refresh || became_busy,
+            route: None,
+            touch_activity: true,
+        };
+    }
+
+    ui.busy = false;
+    if ui.cancel_requested {
+        ui.cancel_requested = false;
+    }
     let Some(work) = ui.take_work(now_ms, mounted) else {
         if ui.session_dirty {
             persist(ui, mounted);
@@ -946,14 +1049,29 @@ pub fn service(
         return ServiceOutcome {
             refresh: false,
             route: None,
+            touch_activity: false,
         };
     };
-    let report = dispatch_work(work, unix);
-    let outcome = ui.apply_report(report, layout, mounted, now_ms);
-    if ui.session_dirty {
-        persist(ui, mounted);
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    match start(work, unix, Arc::clone(&cancel_flag)) {
+        Ok(handle) => {
+            *inflight = Some(handle);
+            ui.busy = true;
+            ServiceOutcome {
+                refresh: true,
+                route: None,
+                touch_activity: true,
+            }
+        }
+        Err(report) => {
+            let mut outcome = ui.apply_report(report, layout, mounted, now_ms);
+            if ui.session_dirty {
+                persist(ui, mounted);
+            }
+            outcome.touch_activity = true;
+            outcome
+        }
     }
-    outcome
 }
 
 fn persist(ui: &mut WereadUi, mounted: bool) {
@@ -962,23 +1080,6 @@ fn persist(ui: &mut WereadUi, mounted: bool) {
     }
     nvs::save(&ui.session);
     ui.session_dirty = false;
-}
-
-#[cfg(target_os = "espidf")]
-fn dispatch_work(work: Work, unix: Option<u64>) -> Report {
-    crate::weread::http::run_work(work, unix)
-}
-
-#[cfg(not(target_os = "espidf"))]
-fn dispatch_work(work: Work, _unix: Option<u64>) -> Report {
-    Report {
-        generation: work.generation,
-        job: work.job,
-        session: work.session,
-        result: Err(JobError::Message(
-            "WeRead network runs on the device.".into(),
-        )),
-    }
 }
 
 fn phase_from_route(route: ScreenRoute) -> Phase {
@@ -1148,5 +1249,84 @@ mod tests {
         assert_eq!(outcome.route, Some(ScreenRoute::WeRead));
         assert!(ui.qr_cookie.is_empty());
         assert!(ui.status.contains("Ada"));
+    }
+
+    #[test]
+    fn inflight_job_stays_busy_and_select_drops_the_late_report() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let mut ui = WereadUi::default();
+        ui.queue(Job::Shelf, 0);
+        let mut inflight = None;
+        let open = Arc::new(AtomicBool::new(false));
+        let layout = ReaderPreferences::default().layout();
+        let step = |ui: &mut WereadUi, inflight: &mut Option<Gate>, open: &Arc<AtomicBool>| {
+            let open = Arc::clone(open);
+            super::drive_with(
+                ui,
+                inflight,
+                None,
+                0,
+                layout,
+                false,
+                move |work, _, cancel| {
+                    Ok(Gate {
+                        generation: work.generation,
+                        job: work.job,
+                        session: work.session,
+                        open: Arc::clone(&open),
+                        cancel,
+                    })
+                },
+                |gate| {
+                    if !gate.open.load(Ordering::Relaxed) {
+                        return None;
+                    }
+                    Some(Report {
+                        generation: gate.generation,
+                        job: gate.job.clone(),
+                        session: gate.session.clone(),
+                        result: Ok(JobOutput::Shelf { books: Vec::new() }),
+                    })
+                },
+                |gate| gate.cancel.store(true, Ordering::Relaxed),
+            )
+        };
+
+        let outcome = step(&mut ui, &mut inflight, &open);
+        assert!(outcome.touch_activity);
+        assert!(ui.busy);
+        assert!(ui.holds_panel());
+        assert!(inflight.is_some());
+        let outcome = step(&mut ui, &mut inflight, &open);
+        assert!(outcome.touch_activity);
+        assert!(!outcome.refresh);
+        assert!(ui
+            .on_button(ScreenRoute::WeRead, ButtonEvent::Select, layout, false)
+            .is_none());
+        assert_eq!(ui.status, "Cancelling...");
+        let outcome = step(&mut ui, &mut inflight, &open);
+        assert!(outcome.touch_activity);
+        assert!(ui.busy);
+        assert!(inflight.as_ref().unwrap().cancel.load(Ordering::Relaxed));
+        open.store(true, Ordering::Relaxed);
+        let outcome = step(&mut ui, &mut inflight, &open);
+        assert!(outcome.touch_activity);
+        assert!(!ui.busy);
+        assert!(inflight.is_none());
+        assert_eq!(ui.status, "Cancelled.");
+        assert!(ui.books.is_empty());
+        let _ = outcome;
+    }
+
+    struct Gate {
+        generation: u64,
+        job: Job,
+        session: crate::weread::session::Session,
+        open: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 }

@@ -33,7 +33,7 @@ ESP-IDF event loop and native hardware ownership
               voice_notes.rs / voice_note_metadata.rs
               dictionary.rs / keyboard_navigation.rs
               calendar.rs
-              wifi_transfer.rs
+              wifi_transfer.rs / wifi_setup.rs / wifi_nvs.rs
               alarm.rs / rtc.rs / rtc_alarm_interrupt.rs
               power_key.rs / power_key_menu.rs
               sleep_mode.rs / sleep_images.rs / sleep_network.rs
@@ -151,7 +151,7 @@ Reader writes use FAT 8.3-safe `.TMP` and `.BAK` siblings. Bookmarks retain byte
 
 ## WeRead boundary
 
-`src/weread/` is the personal WeChat Reading client. Host-testable code owns the web session, the official agent gateway, signed chapter requests, shard decoding, a bounded JSON scanner, QR module generation, and SD cache records. `src/weread/ui.rs` paginates chapter text with `reader::paginate_plain_text`, so CJK line breaks match the TXT/EPUB reader. The ESP-IDF HTTP worker is `weread-http` and is compiled only for the device.
+`src/weread/` is the personal WeChat Reading client. Host-testable code owns the web session, the official agent gateway, signed chapter requests, shard decoding, a bounded JSON scanner, QR module generation, and SD cache records. `src/weread/ui.rs` paginates chapter text with `reader::paginate_plain_text`, so CJK line breaks match the TXT/EPUB reader. The ESP-IDF HTTP worker is `weread-http` and is compiled only for the device. The main loop polls that worker, shows a busy footer, and SELECT cancels the job. The idle-sleep timer restarts when the job returns.
 
 ```text
 /sdcard/RUSTMIX/WEREAD.TXT
@@ -244,7 +244,11 @@ Personal rows in `EVENTS.TXT` are writable. `US2026.TXT` is read-only. `HINDU26.
 
 ## Wi-Fi transfer boundary
 
-`src/wifi_transfer.rs` owns an explicit LAN-only portal rooted at `/sdcard/RUSTMIX`. It is off after boot and starts only from Settings. Requests require the displayed session code, remain root-confined, use bounded stream buffers, and write replacement files atomically.
+`src/wifi_transfer.rs` owns an explicit LAN-only portal rooted at `/sdcard/RUSTMIX`. It is off after boot and starts only from Settings while the device is a Wi-Fi station. Requests require the displayed session code, remain root-confined, use bounded stream buffers, and write replacement files atomically.
+
+## SoftAP Wi-Fi setup
+
+`src/wifi_setup.rs` owns the captive setup portal. Station credentials still load first from `/RUSTMIX/WIFI.TXT`. NVS (`rw_wifi`) is the fallback only when that file is missing. If `WIFI.TXT` is present but invalid, firmware logs `WIFI.TXT is invalid` and does not use NVS. SoftAP `Rustmix-Setup` at `http://192.168.4.1` starts when the file is missing, STA join fails, or Settings → Network → Configure Wi-Fi is selected. The open AP stops after 10 minutes idle or 10 minutes total, the same budget as the transfer portal: HTTP and the AP radio both stop, and e-paper shows Settings → Network → Configure Wi-Fi. Every other exit uses that same teardown. Saving writes NVS and, when the SD card is present, writes `WIFI.TXT`, then switches to STA. Passwords are an 8–63 byte passphrase or a 64-character hex PSK. The transfer portal stays a separate STA-only service on port 80 and will not bind `192.168.4.1`.
 
 Protected paths include device configuration and internal sidecars such as:
 
@@ -289,7 +293,7 @@ Heavy operations are deliberately moved away from the main task:
 | Full EPUB parse | short-lived `epub-parser` thread | 64 KiB worker stack | heap-owned bounded EPUB document |
 | EPUB title lookup during library scans | short-lived EPUB title thread | 32 KiB worker stack | compact title string |
 | HTTPS weather fetch | `runtime_worker::run_named_worker("weather-fetch", ...)` | 64 KiB worker stack, bounded 8 KiB response | parsed weather snapshot or classified error |
-| WeRead HTTPS job | `runtime_worker::run_named_worker("weread-http", ...)` | 96 KiB worker stack, capped JSON/HTML/shard/image bodies | one login, shelf, chapter, progress, notes, or cover result |
+| WeRead HTTPS job | `runtime_worker::NamedWorkerHandle::spawn("weread-http", ...)` polled from the main loop | 96 KiB worker stack, capped JSON/HTML/shard/image bodies | one login, shelf, chapter, progress, notes, or cover result |
 | Lua app open | `runtime_worker::run_named_worker("lua-loader", ...)` | 32 KiB worker stack, bounded script size | compact native Lua session and canvas |
 | Wi-Fi transfer portal | ESP-IDF HTTP server task | 24 KiB task stack, 4 KiB streaming chunks, 64 MiB upload cap | compact lifecycle snapshot |
 | Voice Notes PCM record/playback | cooperative main-loop chunks | bounded I2S RX/TX buffers, streamed `.TMP` finalization | compact UI progress snapshots |
@@ -320,6 +324,7 @@ Writable exceptions are deliberately narrow:
 - Voice Notes WAV and sidecar files
 - Calendar personal events
 - explicit Wi-Fi portal writes
+- SoftAP write-back of `WIFI.TXT`
 
 ## Screenshot-driven user documentation
 

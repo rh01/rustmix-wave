@@ -1,7 +1,8 @@
 //! Whole-book cache on the SD card.
 //!
 //! Directory names are 8 hex characters so they stay FAT 8.3 safe. Chapter files
-//! are `CHxxxx.TXT`. Reads refuse files larger than the chapter cap before allocating.
+//! are 8 hex digits plus `.TXT`, which stays 8.3 for every `u32` index. Reads
+//! refuse files larger than their cap before allocating.
 
 use std::{
     fs::{self, File},
@@ -10,7 +11,7 @@ use std::{
 };
 
 use crate::weread::{
-    limits::{MAX_CHAPTERS, MAX_CHAPTER_TEXT, MAX_TITLE_CHARS},
+    limits::{MAX_CHAPTERS, MAX_CHAPTER_TEXT, MAX_META_BYTES, MAX_TITLE_CHARS},
     parse::{ChapterMeta, ReadingProgress},
     session::atomic_write,
 };
@@ -54,6 +55,9 @@ pub fn save_catalog(
         one_line(author),
         chapters.len().min(MAX_CHAPTERS)
     );
+    if meta.len() > MAX_META_BYTES {
+        return Err("book metadata exceeds the size limit".into());
+    }
     atomic_write(
         &dir.join("META.TXT"),
         &dir.join("META.TMP"),
@@ -81,7 +85,10 @@ pub fn save_catalog(
 }
 
 pub fn load_psvts(root: &Path, book_id: &str) -> String {
-    let text = fs::read_to_string(book_dir(root, book_id).join("META.TXT")).unwrap_or_default();
+    let Ok(bytes) = read_capped(&book_dir(root, book_id).join("META.TXT"), MAX_META_BYTES) else {
+        return String::new();
+    };
+    let text = String::from_utf8_lossy(&bytes);
     text.lines()
         .find_map(|line| line.strip_prefix("psvts="))
         .unwrap_or("")
@@ -218,9 +225,10 @@ pub fn load_local_progress(root: &Path, book_id: &str) -> Option<(ReadingProgres
     ))
 }
 
+/// Eight hex digits plus `.TXT`. `CH{index:04}` grows past 8.3 once `chapterIdx` exceeds 9999.
 #[must_use]
 pub fn chapter_name(index: u32) -> String {
-    format!("CH{index:04}.TXT")
+    format!("{index:08X}.TXT")
 }
 
 pub fn read_capped(path: &Path, max: usize) -> Result<Vec<u8>, &'static str> {
@@ -302,9 +310,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load_chapter(&dir, "43208843", 2).unwrap().text, "你好");
+        assert_eq!(super::load_psvts(&dir, "43208843"), "ps");
+        let meta = super::book_dir(&dir, "43208843").join("META.TXT");
+        fs::write(&meta, vec![b'x'; super::MAX_META_BYTES + 1]).unwrap();
+        assert!(super::load_psvts(&dir, "43208843").is_empty());
         let huge = dir.join("HUGE.TXT");
         fs::write(&huge, vec![b'x'; 64]).unwrap();
         assert!(read_capped(&huge, 16).is_err());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chapter_filenames_stay_fat83_for_large_indexes() {
+        use crate::wifi_transfer::is_fat83_component;
+        for index in [0, 9_999, 10_000, u32::MAX] {
+            let name = super::chapter_name(index);
+            assert!(is_fat83_component(&name), "{name}");
+            assert_eq!(name.len(), 12);
+        }
+        assert_eq!(super::chapter_name(0x10), "00000010.TXT");
     }
 }

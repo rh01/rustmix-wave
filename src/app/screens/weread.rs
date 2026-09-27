@@ -86,7 +86,11 @@ pub fn render_shelf(
         state.display.detail_style(),
     )
     .draw(display)?;
-    draw_footer(display, state.display, "MOVE  SELECT OPEN  HOLD BOOT BACK")
+    draw_footer(
+        display,
+        state.display,
+        footer(weread.busy, "MOVE  SELECT OPEN  HOLD BOOT BACK"),
+    )
 }
 
 pub fn render_login(
@@ -118,7 +122,11 @@ pub fn render_login(
         state.display.body_style(),
     )
     .draw(display)?;
-    draw_footer(display, state.display, "SELECT NEW QR  HOLD BOOT BACK")
+    draw_footer(
+        display,
+        state.display,
+        footer(state.weread.busy, "SELECT NEW QR  HOLD BOOT BACK"),
+    )
 }
 
 pub fn render_book(
@@ -175,7 +183,11 @@ pub fn render_book(
         state.display.detail_style(),
     )
     .draw(display)?;
-    draw_footer(display, state.display, "MOVE  SELECT  HOLD BOOT BACK")
+    draw_footer(
+        display,
+        state.display,
+        footer(weread.busy, "MOVE  SELECT  HOLD BOOT BACK"),
+    )
 }
 
 pub fn render_toc(
@@ -209,7 +221,11 @@ pub fn render_toc(
             "OPEN",
         )?;
     }
-    draw_footer(display, state.display, "MOVE  SELECT OPEN  HOLD BOOT BACK")
+    draw_footer(
+        display,
+        state.display,
+        footer(weread.busy, "MOVE  SELECT OPEN  HOLD BOOT BACK"),
+    )
 }
 
 pub fn render_read(
@@ -270,7 +286,7 @@ pub fn render_read(
     draw_footer(
         display,
         state.display,
-        "MOVE PAGE  SELECT BOOK  HOLD BOOT BACK",
+        footer(weread.busy, "MOVE PAGE  SELECT BOOK  HOLD BOOT BACK"),
     )
 }
 
@@ -302,7 +318,11 @@ pub fn render_notes(
             "",
         )?;
     }
-    draw_footer(display, state.display, "MOVE  HOLD BOOT BACK")
+    draw_footer(
+        display,
+        state.display,
+        footer(weread.busy, "MOVE  HOLD BOOT BACK"),
+    )
 }
 
 pub fn render_download(
@@ -336,12 +356,24 @@ pub fn render_download(
     )
     .draw(display)?;
     Text::new(
-        "SELECT stops between chapters.",
+        "SELECT cancels the current request.",
         Point::new(24, 360),
         state.display.detail_style(),
     )
     .draw(display)?;
-    draw_footer(display, state.display, "SELECT STOP  HOLD BOOT BACK")
+    draw_footer(
+        display,
+        state.display,
+        footer(weread.busy, "SELECT STOP  HOLD BOOT BACK"),
+    )
+}
+
+fn footer<'a>(busy: bool, idle: &'a str) -> &'a str {
+    if busy {
+        "WORKING  SELECT CANCEL"
+    } else {
+        idle
+    }
 }
 
 fn shelf_start(cursor: usize, books: usize) -> usize {

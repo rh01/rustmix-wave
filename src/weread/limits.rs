@@ -8,6 +8,8 @@ pub const MAX_HTML_BYTES: usize = 384 * 1024;
 pub const MAX_SHARD_BYTES: usize = 768 * 1024;
 /// Plain text retained for one chapter.
 pub const MAX_CHAPTER_TEXT: usize = 512 * 1024;
+/// `META.TXT` book record. The portal can upload 64 MiB, so this read is capped.
+pub const MAX_META_BYTES: usize = 8 * 1024;
 /// Cover or inline image download.
 pub const MAX_IMAGE_BYTES: usize = 96 * 1024;
 /// Decoded image edge before downscale.

@@ -1,5 +1,8 @@
 # Copy this file to /RUSTMIX/WIFI.TXT on the FAT-formatted SD card.
-# Edit it locally. Do not commit or share your real password.
+# Edit it locally, or skip this file and use Settings > Network > Configure Wi-Fi
+# (join AP Rustmix-Setup, then open http://192.168.4.1). SoftAP save writes this
+# file back when the card is present, and also stores credentials in NVS.
+# Do not commit or share your real password.
 ssid=YOUR_NETWORK
 password=YOUR_PASSWORD
 timezone=America/New_York

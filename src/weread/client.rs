@@ -38,6 +38,10 @@ pub struct Response {
 pub trait Transport {
     fn idle(&mut self);
     fn call(&mut self, request: &Request) -> Result<Response, String>;
+
+    fn cancelled(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,6 +128,7 @@ pub enum JobError {
     Expired,
     OtpRequired,
     Clock,
+    Cancelled,
     Message(String),
 }
 
@@ -137,6 +142,7 @@ impl std::fmt::Display for JobError {
             Self::Clock => {
                 formatter.write_str("Sync the clock over Wi-Fi before reading WeRead chapters.")
             }
+            Self::Cancelled => formatter.write_str("Cancelled."),
             Self::Message(message) => formatter.write_str(message),
         }
     }
@@ -996,11 +1002,14 @@ fn renew(
         },
         false,
     )?;
+    let previous_skey = session.skey.clone();
     session.absorb_set_cookie(&response.set_cookie);
     let text = body_text(&response).unwrap_or_default();
     if parse::renewal_succeeded(&text) {
-        if let Some(now) = ctx.unix {
-            session.skey_unix = now;
+        if session.skey != previous_skey {
+            if let Some(now) = ctx.unix {
+                session.skey_unix = now;
+            }
         }
         Ok(())
     } else {
@@ -1015,10 +1024,16 @@ fn call(
     request: Request,
     retry_expired: bool,
 ) -> Result<Response, JobError> {
+    if transport.cancelled() {
+        return Err(JobError::Cancelled);
+    }
     if ctx.first {
         ctx.first = false;
     } else {
         transport.idle();
+    }
+    if transport.cancelled() {
+        return Err(JobError::Cancelled);
     }
     if let Some(len) = request.body.as_ref().map(String::len) {
         if len > MAX_JSON_BYTES {
@@ -1291,5 +1306,65 @@ mod tests {
             .urls
             .iter()
             .all(|url| url.contains("/api/agent/gateway")));
+    }
+
+    #[test]
+    fn renewal_keeps_skey_unix_until_wr_skey_changes() {
+        let unix = 1_780_488_000;
+        let mut unchanged = Script {
+            steps: vec![
+                Response {
+                    status: 200,
+                    body: br#"{"succ":1}"#.to_vec(),
+                    set_cookie: "wr_vid=9; Path=/, wr_rt=same-rt".into(),
+                    content_length: Some(10),
+                },
+                json_response(r#"{"books":[]}"#),
+            ],
+            index: 0,
+            waits: 0,
+            urls: Vec::new(),
+        };
+        let mut session = Session::default();
+        session.vid = "9".into();
+        session.skey = "old-key".into();
+        session.skey_unix = 1;
+        let report = perform(
+            &mut unchanged,
+            Work {
+                generation: 1,
+                job: Job::Shelf,
+                session: session.clone(),
+            },
+            Some(unix),
+        );
+        assert_eq!(report.session.skey, "old-key");
+        assert_eq!(report.session.skey_unix, 1);
+
+        let mut rotated = Script {
+            steps: vec![
+                Response {
+                    status: 200,
+                    body: br#"{"succ":1}"#.to_vec(),
+                    set_cookie: "wr_skey=new-key; Path=/".into(),
+                    content_length: Some(10),
+                },
+                json_response(r#"{"books":[]}"#),
+            ],
+            index: 0,
+            waits: 0,
+            urls: Vec::new(),
+        };
+        let report = perform(
+            &mut rotated,
+            Work {
+                generation: 2,
+                job: Job::Shelf,
+                session,
+            },
+            Some(unix),
+        );
+        assert_eq!(report.session.skey, "new-key");
+        assert_eq!(report.session.skey_unix, unix);
     }
 }

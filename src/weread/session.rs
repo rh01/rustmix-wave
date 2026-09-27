@@ -356,6 +356,31 @@ fn truncate_cookie(value: &str) -> String {
     value.chars().take(MAX_COOKIE_CHARS).collect()
 }
 
+/// Join every `Set-Cookie` value. ESP-IDF's header map keeps only the last
+/// one, so the HTTP client calls this from the on-header event instead.
+pub fn append_set_cookie(combined: &mut String, value: &str, max_bytes: usize) {
+    let value = value.trim();
+    if value.is_empty() || combined.len() >= max_bytes {
+        return;
+    }
+    let separator = if combined.is_empty() { "" } else { ", " };
+    let mut addition = String::new();
+    addition.push_str(separator);
+    addition.push_str(value);
+    let room = max_bytes.saturating_sub(combined.len());
+    if addition.len() > room {
+        let mut end = room;
+        while end > 0 && !addition.is_char_boundary(end) {
+            end -= 1;
+        }
+        addition.truncate(end);
+    }
+    if addition.is_empty() || addition == ", " {
+        return;
+    }
+    combined.push_str(&addition);
+}
+
 fn cookie_value(header: &str, name: &str) -> Option<String> {
     let needle = format!("{name}=");
     let start = header.find(&needle)?;
@@ -423,6 +448,18 @@ mod tests {
         assert_eq!(session.skey, "new-key");
         assert_eq!(session.rt, "rt2");
         assert!(session.cookie_header().contains("wr_skey=new-key"));
+        let mut jar = String::new();
+        super::append_set_cookie(&mut jar, "wr_vid=9; Path=/", 256);
+        super::append_set_cookie(&mut jar, "wr_skey=rotated; HttpOnly", 256);
+        super::append_set_cookie(&mut jar, "wr_rt=rt-new; Secure", 256);
+        session.absorb_set_cookie(&jar);
+        assert_eq!(session.vid, "9");
+        assert_eq!(session.skey, "rotated");
+        assert_eq!(session.rt, "rt-new");
+        let mut capped = String::new();
+        super::append_set_cookie(&mut capped, "wr_vid=1; Path=/", 12);
+        super::append_set_cookie(&mut capped, "wr_skey=too-long", 12);
+        assert!(capped.len() <= 12);
     }
 
     #[test]

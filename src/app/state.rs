@@ -25,6 +25,7 @@ use crate::{
     voice_notes::{VoiceNotesUiRequest, VoiceNotesUiState},
     weather::WeatherSnapshot,
     weread::WereadUi,
+    wifi_setup::{WifiSetupSnapshot, WifiSetupUiRequest},
     wifi_transfer::{WifiTransferSnapshot, WifiTransferState, WifiTransferUiRequest},
 };
 
@@ -40,8 +41,8 @@ pub const AUDIO_ACTION_COUNT: usize = 6;
 pub const DISPLAY_ACTION_COUNT: usize = 2;
 /// Number of selectable rows in the Weather overview screen.
 pub const WEATHER_ACTION_COUNT: usize = 2;
-/// Start/stop portal and provisioning-details rows on the Network screen.
-pub const NETWORK_ACTION_COUNT: usize = 2;
+/// Transfer, Configure Wi-Fi, and provisioning-details rows on the Network screen.
+pub const NETWORK_ACTION_COUNT: usize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppState {
@@ -85,11 +86,14 @@ pub struct AppState {
     pub audio_action_selected: usize,
     /// Selected Weather-overview action: refresh or details.
     pub weather_action_selected: usize,
-    /// Selected Network action: portal toggle or provisioning details.
+    /// Selected Network action: portal toggle, SoftAP setup, or provisioning details.
     pub network_action_selected: usize,
     /// Compact LAN portal lifecycle snapshot.
     pub wifi_transfer: WifiTransferSnapshot,
     wifi_transfer_request: Option<WifiTransferUiRequest>,
+    /// SoftAP captive-portal snapshot (AP name + 192.168.4.1).
+    pub wifi_setup: WifiSetupSnapshot,
+    wifi_setup_request: Option<WifiSetupUiRequest>,
     /// SD-backed PCM WAV voice-note catalog and recorder UI snapshot.
     pub voice_notes: VoiceNotesUiState,
     /// Global display-maintenance menu opened by a physical Power short press.
@@ -135,6 +139,8 @@ impl Default for AppState {
             network_action_selected: 0,
             wifi_transfer: WifiTransferSnapshot::default(),
             wifi_transfer_request: None,
+            wifi_setup: WifiSetupSnapshot::default(),
+            wifi_setup_request: None,
             voice_notes: VoiceNotesUiState::default(),
             power_key_menu: PowerKeyMenuUiState::default(),
             power_key_menu_return_route: ScreenRoute::Home,
@@ -267,6 +273,10 @@ impl AppState {
                             WifiTransferUiRequest::Start
                         });
                         self.router.navigate_to(ScreenRoute::WifiTransfer);
+                    } else if self.network_action_selected == 1 {
+                        self.request_wifi_transfer_stop();
+                        self.wifi_setup_request = Some(WifiSetupUiRequest::Start);
+                        self.router.navigate_to(ScreenRoute::WifiSetup);
                     } else {
                         self.router.navigate_to(ScreenRoute::NetworkDetails);
                     }
@@ -274,6 +284,11 @@ impl AppState {
                 (ScreenRoute::WifiTransfer, ButtonEvent::Select) => {
                     self.note_select_press();
                     self.wifi_transfer_request = Some(WifiTransferUiRequest::Stop);
+                    self.router.navigate_to(ScreenRoute::Network);
+                }
+                (ScreenRoute::WifiSetup, ButtonEvent::Select) => {
+                    self.note_select_press();
+                    self.wifi_setup_request = Some(WifiSetupUiRequest::Stop);
                     self.router.navigate_to(ScreenRoute::Network);
                 }
                 (ScreenRoute::DeviceInfo, ButtonEvent::Select) => {
@@ -300,6 +315,7 @@ impl AppState {
                     | ScreenRoute::MotionDetails
                     | ScreenRoute::NetworkDetails
                     | ScreenRoute::WifiTransfer
+                    | ScreenRoute::WifiSetup
                     | ScreenRoute::WeatherDetails,
                     _,
                 )
@@ -1147,9 +1163,18 @@ impl AppState {
         self.wifi_transfer = snapshot;
     }
 
+    pub fn update_wifi_setup_snapshot(&mut self, snapshot: WifiSetupSnapshot) {
+        self.wifi_setup = snapshot;
+    }
+
     #[must_use]
     pub fn take_wifi_transfer_request(&mut self) -> Option<WifiTransferUiRequest> {
         self.wifi_transfer_request.take()
+    }
+
+    #[must_use]
+    pub fn take_wifi_setup_request(&mut self) -> Option<WifiSetupUiRequest> {
+        self.wifi_setup_request.take()
     }
 
     /// Start the existing LAN portal from a feature shortcut without exposing
@@ -1345,6 +1370,25 @@ mod tests {
         assert_eq!(
             state.take_wifi_transfer_request(),
             Some(crate::wifi_transfer::WifiTransferUiRequest::Stop)
+        );
+    }
+
+    #[test]
+    fn network_configure_wifi_starts_softap_setup_from_settings() {
+        let mut state = AppState::default();
+        state.router.navigate_to(ScreenRoute::Network);
+        state.apply(ButtonEvent::Down);
+        state.apply(ButtonEvent::Select);
+        assert_eq!(state.active_route(), ScreenRoute::WifiSetup);
+        assert_eq!(
+            state.take_wifi_setup_request(),
+            Some(crate::wifi_setup::WifiSetupUiRequest::Start)
+        );
+        state.apply(ButtonEvent::Select);
+        assert_eq!(state.active_route(), ScreenRoute::Network);
+        assert_eq!(
+            state.take_wifi_setup_request(),
+            Some(crate::wifi_setup::WifiSetupUiRequest::Stop)
         );
     }
 

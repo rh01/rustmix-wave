@@ -25,4 +25,4 @@ pub mod ui;
 #[cfg(target_os = "espidf")]
 pub mod http;
 
-pub use ui::{service, WereadUi};
+pub use ui::WereadUi;

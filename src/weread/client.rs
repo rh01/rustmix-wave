@@ -27,6 +27,8 @@ pub struct Request {
     pub body: Option<String>,
     pub headers: Vec<(String, String)>,
     pub max_bytes: usize,
+    /// Image fetches stay on the allowlisted host. Other calls may follow redirects.
+    pub follow_redirects: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -428,6 +430,7 @@ fn login_uid(
             body: None,
             headers: protocol::browser_headers("", &format!("{WEB_ORIGIN}/"), false),
             max_bytes: 32 * 1024,
+            follow_redirects: true,
         },
         false,
     );
@@ -448,6 +451,7 @@ fn login_uid(
                 true,
             ),
             max_bytes: MAX_JSON_BYTES,
+            follow_redirects: true,
         },
         true,
     )?;
@@ -484,6 +488,7 @@ fn poll_login(
             body: None,
             headers: protocol::browser_headers(cookie, &protocol::skills_page_url(), true),
             max_bytes: MAX_JSON_BYTES,
+            follow_redirects: true,
         },
         true,
     )?;
@@ -580,6 +585,7 @@ fn shelf(
                     true,
                 ),
                 max_bytes: MAX_JSON_BYTES,
+                follow_redirects: true,
             },
             true,
         )?;
@@ -627,6 +633,7 @@ fn open_book(
                     true,
                 ),
                 max_bytes: MAX_JSON_BYTES,
+                follow_redirects: true,
             },
             true,
         )?;
@@ -649,6 +656,7 @@ fn open_book(
                     true,
                 ),
                 max_bytes: MAX_JSON_BYTES,
+                follow_redirects: true,
             },
             true,
         ) {
@@ -960,11 +968,12 @@ fn fetch_inline_image(
             body: None,
             headers: protocol::browser_headers("", WEB_ORIGIN, false),
             max_bytes: MAX_CHAPTER_IMAGE_BYTES,
+            follow_redirects: false,
         },
         false,
     );
     let bitmap = fetched.ok().and_then(|response| {
-        bitmap::decode_mono(&response.body, IMAGE_TARGET_WIDTH, IMAGE_TARGET_HEIGHT).ok()
+        bitmap::decode_mono(response.body, IMAGE_TARGET_WIDTH, IMAGE_TARGET_HEIGHT).ok()
     });
     ChapterImage {
         alt: image.alt.clone(),
@@ -974,7 +983,7 @@ fn fetch_inline_image(
 
 fn stream_image(
     transport: &mut dyn Transport,
-    session: &mut Session,
+    _session: &mut Session,
     ctx: &mut CallCtx,
     url: &str,
 ) -> Result<JobOutput, JobError> {
@@ -1005,6 +1014,7 @@ fn stream_image(
                 body: None,
                 headers: protocol::browser_headers("", WEB_ORIGIN, false),
                 max_bytes: MAX_CHAPTER_IMAGE_BYTES,
+                follow_redirects: false,
             },
             "img",
         )
@@ -1020,7 +1030,11 @@ fn stream_image(
     ) {
         return Err(JobError::Message(error.into()));
     }
-    session.absorb_set_cookie(&streamed.set_cookie);
+    // Image hosts must not refresh wr_skey. A redirected or hostile Set-Cookie
+    // used to overwrite the session.
+    if streamed.total == 0 {
+        return Err(JobError::Message("empty image".into()));
+    }
     if streamed.status != 200 {
         return Err(JobError::Message(format!(
             "WeRead image was not available (HTTP {}).",
@@ -1088,6 +1102,7 @@ fn upload_progress(
                 true,
             ),
             max_bytes: 8 * 1024,
+            follow_redirects: true,
         },
         true,
     )?;
@@ -1151,10 +1166,11 @@ fn cover(
             body: None,
             headers: protocol::browser_headers("", WEB_ORIGIN, false),
             max_bytes: MAX_IMAGE_BYTES,
+            follow_redirects: false,
         },
         false,
     )?;
-    let bitmap = bitmap::decode_mono(&response.body, 48, 64)
+    let bitmap = bitmap::decode_mono(response.body, 48, 64)
         .map_err(|error| JobError::Message(error.into()))?;
     Ok(JobOutput::Cover {
         book_id: book_id.to_string(),
@@ -1311,6 +1327,7 @@ fn stream_part(
                 body: Some(body),
                 headers: protocol::browser_headers(&session.cookie_header(), referer, true),
                 max_bytes: MAX_SHARD_BYTES,
+                follow_redirects: true,
             },
             part,
         )
@@ -1366,6 +1383,7 @@ fn post_shard(
             body: Some(body),
             headers: protocol::browser_headers(&session.cookie_header(), referer, true),
             max_bytes: MAX_SHARD_BYTES,
+            follow_redirects: true,
         },
         true,
     )
@@ -1391,6 +1409,7 @@ fn fetch_reader_html(
                 false,
             ),
             max_bytes: MAX_HTML_BYTES,
+            follow_redirects: true,
         },
         true,
     )?;
@@ -1423,6 +1442,7 @@ fn gateway_response(
             body: Some(protocol::gateway_body(api_name, fields)),
             headers: protocol::official_headers(&session.api_key),
             max_bytes: MAX_JSON_BYTES,
+            follow_redirects: true,
         },
         true,
     )?;
@@ -1504,6 +1524,7 @@ fn authed_get(
             body: None,
             headers,
             max_bytes: MAX_JSON_BYTES,
+            follow_redirects: true,
         },
         true,
     )?;
@@ -1547,6 +1568,7 @@ fn renew(
                 true,
             ),
             max_bytes: 8 * 1024,
+            follow_redirects: true,
         },
         false,
     )?;
@@ -2096,6 +2118,7 @@ mod tests {
             index: 0,
             urls: Vec::new(),
             chunk_lens: Vec::new(),
+            redirects: Vec::new(),
         };
         let report = perform(
             &mut short,
@@ -2252,12 +2275,14 @@ mod tests {
         index: usize,
         urls: Vec<String>,
         chunk_lens: Vec<usize>,
+        redirects: Vec<bool>,
     }
 
     impl Transport for RecordingStream {
         fn idle(&mut self) {}
         fn call(&mut self, request: &Request) -> Result<Response, String> {
             self.urls.push(request.url.clone());
+            self.redirects.push(request.follow_redirects);
             let response = self
                 .steps
                 .get(self.index)
@@ -2352,6 +2377,7 @@ mod tests {
             index: 0,
             urls: Vec::new(),
             chunk_lens: Vec::new(),
+            redirects: Vec::new(),
         };
         let report = perform(
             &mut transport,
@@ -2394,6 +2420,7 @@ mod tests {
             index: 0,
             urls: Vec::new(),
             chunk_lens: Vec::new(),
+            redirects: Vec::new(),
         };
         let report = perform(
             &mut zip,
@@ -2427,6 +2454,7 @@ mod tests {
             index: 0,
             urls: Vec::new(),
             chunk_lens: Vec::new(),
+            redirects: Vec::new(),
         };
         let report = perform(
             &mut txt,
@@ -2447,6 +2475,7 @@ mod tests {
             index: 0,
             urls: Vec::new(),
             chunk_lens: Vec::new(),
+            redirects: Vec::new(),
         };
         let report = perform(
             &mut empty,
@@ -2478,6 +2507,7 @@ mod tests {
             index: 0,
             urls: Vec::new(),
             chunk_lens: Vec::new(),
+            redirects: Vec::new(),
         };
         let report = perform(
             &mut transport,
@@ -2496,6 +2526,68 @@ mod tests {
         assert!(matches!(report.result, Ok(JobOutput::ImageStored)));
         assert!(transport.chunk_lens.iter().all(|len| *len <= chunk));
         assert_eq!(transport.chunk_lens.iter().sum::<usize>(), body.len());
+        assert_eq!(transport.redirects, vec![false]);
+        assert_eq!(report.session.skey, "tok");
+
+        let mut cooked = RecordingStream {
+            steps: vec![Response {
+                status: 200,
+                body: b"image".to_vec(),
+                set_cookie: "wr_skey=evil-key".into(),
+                content_length: Some(5),
+            }],
+            index: 0,
+            urls: Vec::new(),
+            chunk_lens: Vec::new(),
+            redirects: Vec::new(),
+        };
+        let report = perform(
+            &mut cooked,
+            Work {
+                generation: 4,
+                job: Job::ChapterImage {
+                    book_id: "43208843".into(),
+                    chapter_idx: 2,
+                    image_index: 3,
+                    url: "https://res.weread.qq.com/c.jpg".into(),
+                },
+                session: stream_session(),
+            },
+            Some(1_780_488_000),
+        );
+        assert!(matches!(report.result, Ok(JobOutput::ImageStored)));
+        assert_eq!(report.session.skey, "tok");
+
+        let mut blank = RecordingStream {
+            steps: vec![Response {
+                status: 200,
+                body: Vec::new(),
+                set_cookie: String::new(),
+                content_length: Some(0),
+            }],
+            index: 0,
+            urls: Vec::new(),
+            chunk_lens: Vec::new(),
+            redirects: Vec::new(),
+        };
+        let report = perform(
+            &mut blank,
+            Work {
+                generation: 5,
+                job: Job::ChapterImage {
+                    book_id: "43208843".into(),
+                    chapter_idx: 2,
+                    image_index: 4,
+                    url: "https://res.weread.qq.com/d.jpg".into(),
+                },
+                session: stream_session(),
+            },
+            Some(1_780_488_000),
+        );
+        let Err(JobError::Message(message)) = report.result else {
+            panic!("empty image must fail");
+        };
+        assert!(message.contains("empty image"));
 
         let mut short = RecordingStream {
             steps: vec![Response {
@@ -2507,6 +2599,7 @@ mod tests {
             index: 0,
             urls: Vec::new(),
             chunk_lens: Vec::new(),
+            redirects: Vec::new(),
         };
         let report = perform(
             &mut short,

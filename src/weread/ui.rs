@@ -5,6 +5,7 @@
 //! whole-book downloads also return between requests.
 
 use std::{
+    collections::VecDeque,
     path::PathBuf,
     sync::{atomic::AtomicBool, Arc},
 };
@@ -13,12 +14,14 @@ use crate::{
     app::router::ScreenRoute,
     buttons::ButtonEvent,
     reader::ReaderLayout,
+    runtime_worker::NamedWorkerHandle,
     weread::{
         bitmap::{self, MonoBitmap},
         client::{ChapterImage, Job, JobError, JobOutput, Report, Work},
         limits::{
             DOWNLOAD_ATTEMPTS, DOWNLOAD_RETRY_MS, IMAGE_TARGET_HEIGHT, IMAGE_TARGET_WIDTH,
-            LOGIN_POLL_MS, LOGIN_TIMEOUT_MS, MIN_REQUEST_GAP_MS, PROGRESS_DELAY_MS,
+            LOGIN_POLL_MS, LOGIN_TIMEOUT_MS, MAX_CHAPTER_IMAGES, MIN_REQUEST_GAP_MS,
+            PROGRESS_DELAY_MS,
         },
         nvs,
         offline::{self, CachedChapter},
@@ -61,6 +64,9 @@ pub struct WereadUi {
     pub pages: Vec<Vec<text::FlowItem>>,
     pub page_index: usize,
     pub images: Vec<ChapterImage>,
+    decode_slots: VecDeque<u16>,
+    decode_inflight: bool,
+    decode_generation: u64,
     pub notes: Vec<NoteLine>,
     pub download_done: usize,
     pub qr_url: String,
@@ -116,6 +122,9 @@ impl Default for WereadUi {
             pages: Vec::new(),
             page_index: 0,
             images: Vec::new(),
+            decode_slots: VecDeque::new(),
+            decode_inflight: false,
+            decode_generation: 0,
             notes: Vec::new(),
             download_done: 0,
             qr_url: String::new(),
@@ -168,6 +177,80 @@ pub struct ServiceOutcome {
     pub route: Option<ScreenRoute>,
     /// Restart the panel idle timer. Set while a job is running and when it returns.
     pub touch_activity: bool,
+}
+
+struct ImageDecodeJob {
+    generation: u64,
+    chapter_index: u32,
+    slot: u16,
+    handle: NamedWorkerHandle<Option<MonoBitmap>, &'static str>,
+}
+
+/// Decode handle for one stored chapter image.
+///
+/// It stays outside [`WereadUi`] so the UI can stay `Clone` without copying a
+/// thread or a 1 MiB file. The main loop polls it; the 16 KiB main task does not
+/// run the decoder.
+#[derive(Default)]
+pub struct ImageDecodeJobs {
+    job: Option<ImageDecodeJob>,
+}
+
+impl ImageDecodeJobs {
+    #[must_use]
+    pub fn busy(&self) -> bool {
+        self.job.is_some()
+    }
+
+    /// Start or finish one decode. `true` when the open chapter gained a bitmap.
+    pub fn poll(&mut self, ui: &mut WereadUi, layout: ReaderLayout) -> bool {
+        let mut refresh = false;
+        if let Some(mut job) = self.job.take() {
+            match job.handle.try_join() {
+                None => {
+                    self.job = Some(job);
+                    return false;
+                }
+                Some(Ok(Some(bitmap))) if job.generation == ui.decode_generation => {
+                    refresh = ui.install_decoded_image(job.chapter_index, job.slot, bitmap, layout);
+                }
+                Some(_) => {}
+            }
+            ui.decode_inflight = false;
+        }
+        if self.job.is_none() {
+            if let Some(next) = ui.take_image_decode() {
+                match bitmap::spawn_image_decode(
+                    next.bytes,
+                    IMAGE_TARGET_WIDTH,
+                    IMAGE_TARGET_HEIGHT,
+                ) {
+                    Ok(handle) => {
+                        self.job = Some(ImageDecodeJob {
+                            generation: next.generation,
+                            chapter_index: next.chapter_index,
+                            slot: next.slot,
+                            handle,
+                        });
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "rustmix-wave=weread-image status=decode-start-failed error={error}"
+                        );
+                        ui.decode_inflight = false;
+                    }
+                }
+            }
+        }
+        refresh
+    }
+}
+
+struct PendingImageDecode {
+    generation: u64,
+    chapter_index: u32,
+    slot: u16,
+    bytes: Vec<u8>,
 }
 
 impl WereadUi {
@@ -663,30 +746,17 @@ impl WereadUi {
         let chapter = self.chapters[self.chapter_pos].clone();
         if mounted {
             if let Some(cached) = offline::load_chapter(&sd_root(), &self.book_id, chapter.index) {
-                self.images = offline::load_chapter_bitmaps(
-                    &sd_root(),
-                    &self.book_id,
-                    chapter.index,
-                    IMAGE_TARGET_WIDTH,
-                    IMAGE_TARGET_HEIGHT,
-                )
-                .into_iter()
-                .map(|bitmap| ChapterImage {
-                    alt: String::new(),
-                    bitmap,
-                })
-                .collect();
+                self.images.clear();
                 self.show_text(&cached.text, layout);
-                if self.page_index == usize::MAX {
-                    self.page_index = self.pages.len().saturating_sub(1);
-                }
-                self.page_index = self.page_index.min(self.pages.len().saturating_sub(1));
+                self.place_open_page();
+                self.queue_stored_images(chapter.index);
                 self.arm_progress(0);
                 self.remember_local_progress(mounted);
                 self.status = chapter.title.clone();
                 return true;
             }
         }
+        self.cancel_image_decode();
         if !self.session.web_signed_in() {
             self.status =
                 "Chapter text needs a QR sign-in. An API key covers shelf, progress, and notes."
@@ -716,10 +786,6 @@ impl WereadUi {
         let measures = self.image_measures(layout);
         self.pages = text::paginate_blocks(&blocks, layout, &measures);
         self.paginated_layout = Some(layout);
-        if self.page_index == usize::MAX {
-            self.page_index = self.pages.len().saturating_sub(1);
-        }
-        self.page_index = self.page_index.min(self.pages.len().saturating_sub(1));
     }
 
     /// Rebuild the open chapter after a shared reader layout change.
@@ -728,16 +794,11 @@ impl WereadUi {
             self.paginated_layout = None;
             return;
         }
-        let page = self.page_index;
-        self.refresh_stored_images(layout);
+        let offset = self.chapter_offset();
         let source = std::mem::take(&mut self.chapter_source);
         self.show_text(&source, layout);
         self.chapter_source = source;
-        if self.pages.is_empty() {
-            self.page_index = 0;
-        } else {
-            self.page_index = page.min(self.pages.len() - 1);
-        }
+        self.page_index = text::page_for_text_offset(&self.pages, offset);
     }
 
     /// Rebuild when Reading Preferences changed the layout after the chapter loaded.
@@ -783,9 +844,36 @@ impl WereadUi {
             .iter()
             .take(self.page_index)
             .flat_map(|page| page.iter())
-            .map(|item| item.line_text().chars().count())
-            .sum::<usize>()
-            .min(u32::MAX as usize) as u32
+            .map(text::flow_text_chars)
+            .fold(0u32, |sum, chars| sum.saturating_add(chars as u32))
+    }
+
+    /// Resume by text offset. A stored page number shifts when a placeholder
+    /// becomes a real image, or the other way around.
+    fn place_open_page(&mut self) {
+        if self.pages.is_empty() {
+            self.page_index = 0;
+            return;
+        }
+        if self.page_index == usize::MAX {
+            self.page_index = self.pages.len() - 1;
+            return;
+        }
+        if let Some(offset) = self.progress_offset_for_open_chapter() {
+            self.page_index = text::page_for_text_offset(&self.pages, offset);
+            return;
+        }
+        self.page_index = self.page_index.min(self.pages.len() - 1);
+    }
+
+    fn progress_offset_for_open_chapter(&self) -> Option<u32> {
+        let progress = self.progress.as_ref()?;
+        let chapter = self.chapters.get(self.chapter_pos)?;
+        if progress.chapter_uid == chapter.uid {
+            Some(progress.chapter_offset)
+        } else {
+            None
+        }
     }
 
     fn percent(&self) -> u8 {
@@ -1049,34 +1137,79 @@ impl WereadUi {
             .collect()
     }
 
-    fn refresh_stored_images(&mut self, _layout: ReaderLayout) {
-        let Some(chapter) = self.chapters.get(self.chapter_pos) else {
-            return;
-        };
-        let loaded = offline::load_chapter_bitmaps(
-            &sd_root(),
-            &self.book_id,
-            chapter.index,
-            IMAGE_TARGET_WIDTH,
-            IMAGE_TARGET_HEIGHT,
-        );
-        if loaded.iter().all(Option::is_none) {
-            return;
+    fn cancel_image_decode(&mut self) {
+        self.decode_generation = self.decode_generation.saturating_add(1);
+        self.decode_slots.clear();
+    }
+
+    fn queue_stored_images(&mut self, chapter_index: u32) {
+        self.cancel_image_decode();
+        let root = sd_root();
+        for slot in 0..MAX_CHAPTER_IMAGES {
+            if offline::image_cached(&root, &self.book_id, chapter_index, slot as u16) {
+                self.decode_slots.push_back(slot as u16);
+            }
         }
-        if self.images.len() < loaded.len() {
+    }
+
+    /// True while a stored image is queued or handed to the decode thread.
+    #[must_use]
+    pub fn images_decoding(&self) -> bool {
+        self.decode_inflight || !self.decode_slots.is_empty()
+    }
+
+    fn take_image_decode(&mut self) -> Option<PendingImageDecode> {
+        if self.decode_inflight || self.phase == Phase::Download {
+            return None;
+        }
+        let chapter_index = self.chapters.get(self.chapter_pos)?.index;
+        while let Some(slot) = self.decode_slots.pop_front() {
+            let Ok(bytes) =
+                offline::read_chapter_image(&sd_root(), &self.book_id, chapter_index, slot)
+            else {
+                continue;
+            };
+            self.decode_inflight = true;
+            return Some(PendingImageDecode {
+                generation: self.decode_generation,
+                chapter_index,
+                slot,
+                bytes,
+            });
+        }
+        None
+    }
+
+    fn install_decoded_image(
+        &mut self,
+        chapter_index: u32,
+        slot: u16,
+        bitmap: MonoBitmap,
+        layout: ReaderLayout,
+    ) -> bool {
+        let Some(chapter) = self.chapters.get(self.chapter_pos) else {
+            return false;
+        };
+        if chapter.index != chapter_index || self.chapter_source.is_empty() {
+            return false;
+        }
+        let slot = usize::from(slot);
+        if self.images.len() <= slot {
             self.images.resize(
-                loaded.len(),
+                slot + 1,
                 ChapterImage {
                     alt: String::new(),
                     bitmap: None,
                 },
             );
         }
-        for (slot, bitmap) in loaded.into_iter().enumerate() {
-            if let Some(bitmap) = bitmap {
-                self.images[slot].bitmap = Some(bitmap);
-            }
-        }
+        self.images[slot].bitmap = Some(bitmap);
+        let offset = self.chapter_offset();
+        let source = std::mem::take(&mut self.chapter_source);
+        self.show_text(&source, layout);
+        self.chapter_source = source;
+        self.page_index = text::page_for_text_offset(&self.pages, offset);
+        true
     }
 
     fn requeue_current_chapter(&mut self, due_ms: u64) {
@@ -1396,6 +1529,7 @@ impl WereadUi {
                 } else {
                     self.images = images;
                     self.show_text(&text, layout);
+                    self.place_open_page();
                 }
                 if mounted {
                     if let Some(chapter) = self.chapters.get(self.chapter_pos) {
@@ -2417,6 +2551,86 @@ mod tests {
             .any(|item| item.line_text().contains("[image:")));
         std::env::remove_var("WEREAD_SD_ROOT");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stored_images_decode_off_the_main_task_and_corrupt_files_stay_placeholders() {
+        let _sd = sd_root_lock();
+        let dir = std::env::temp_dir().join(format!("weread-ui-decode-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("WEREAD_SD_ROOT", &dir);
+        let book_id = "43208843";
+        offline::save_chapter(
+            &dir,
+            book_id,
+            &CachedChapter {
+                uid: "1".into(),
+                index: 1,
+                title: "One".into(),
+                text: "Hello\n[[weread-img:0|图]]\nAfter".into(),
+            },
+        )
+        .unwrap();
+        let image_path = offline::book_dir(&dir, book_id).join(offline::image_name(1, 0));
+        fs::write(&image_path, tiny_png()).unwrap();
+        let mut ui = signed_in();
+        ui.book_id = book_id.into();
+        ui.chapters = vec![chapter("1", 1, "One")];
+        let layout = ReaderPreferences::default().layout();
+        assert!(ui.begin_read(layout, true));
+        assert!(ui.images_decoding());
+        assert!(ui
+            .images
+            .first()
+            .and_then(|image| image.bitmap.as_ref())
+            .is_none());
+        let mut decode = super::ImageDecodeJobs::default();
+        let started = std::time::Instant::now();
+        while (ui.images_decoding() || decode.busy())
+            && started.elapsed() < std::time::Duration::from_secs(3)
+        {
+            decode.poll(&mut ui, layout);
+            std::thread::yield_now();
+        }
+        assert!(
+            ui.images
+                .first()
+                .and_then(|image| image.bitmap.as_ref())
+                .is_some(),
+            "decoded bitmap missing"
+        );
+        fs::write(&image_path, b"\xff\xd8\xff").unwrap();
+        assert!(ui.begin_read(layout, true));
+        let started = std::time::Instant::now();
+        while (ui.images_decoding() || decode.busy())
+            && started.elapsed() < std::time::Duration::from_secs(3)
+        {
+            decode.poll(&mut ui, layout);
+            std::thread::yield_now();
+        }
+        assert!(ui
+            .images
+            .first()
+            .and_then(|image| image.bitmap.as_ref())
+            .is_none());
+        assert!(ui
+            .pages
+            .iter()
+            .flatten()
+            .any(|item| item.line_text().contains("[image:")));
+        std::env::remove_var("WEREAD_SD_ROOT");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        use image::ImageEncoder;
+        let image = image::GrayImage::from_pixel(2, 2, image::Luma([0]));
+        let mut bytes = Vec::new();
+        image::codecs::png::PngEncoder::new(std::io::Cursor::new(&mut bytes))
+            .write_image(image.as_raw(), 2, 2, image::ColorType::L8)
+            .unwrap();
+        bytes
     }
 
     #[test]

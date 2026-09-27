@@ -324,7 +324,7 @@ fn worker_slot() -> &'static Mutex<Option<WorkerSlot>> {
 
 fn start_worker() -> Result<LongLivedWorker<QueuedJob, Report>, std::io::Error> {
     log_runtime_memory("weread-http-spawn");
-    let _psram_stack = PsramStackGuard::enter(WEREAD_HTTP_WORKER_STACK_BYTES);
+    let _psram_stack = PsramStackGuard::enter(WEREAD_HTTP_WORKER_STACK_BYTES, c"weread-http");
     LongLivedWorker::spawn(
         "weread-http",
         WEREAD_HTTP_WORKER_STACK_BYTES,
@@ -366,7 +366,8 @@ struct PsramStackGuard {
 }
 
 impl PsramStackGuard {
-    fn enter(stack_bytes: usize) -> Self {
+    fn enter(stack_bytes: usize, label: &'static CStr) -> Self {
+        let name = label.to_str().unwrap_or("weread-worker");
         unsafe {
             let fallback = sys::esp_pthread_get_default_config();
             let mut restore = fallback;
@@ -377,19 +378,25 @@ impl PsramStackGuard {
             cfg.stack_size = stack_bytes;
             cfg.stack_alloc_caps = sys::MALLOC_CAP_SPIRAM | sys::MALLOC_CAP_8BIT;
             cfg.inherit_cfg = false;
-            cfg.thread_name = c"weread-http".as_ptr();
+            cfg.thread_name = label.as_ptr();
             if sys::esp_pthread_set_cfg(&cfg) == ESP_OK {
                 log::info!(
-                    "rustmix-wave=weread-http status=psram-stack stack-bytes={stack_bytes} caps=spiram"
+                    "rustmix-wave={name} status=psram-stack stack-bytes={stack_bytes} caps=spiram"
                 );
             } else {
                 log::warn!(
-                    "rustmix-wave=weread-http status=psram-stack-cfg-failed stack-bytes={stack_bytes} fallback=internal"
+                    "rustmix-wave={name} status=psram-stack-cfg-failed stack-bytes={stack_bytes} fallback=internal"
                 );
             }
             Self { restore }
         }
     }
+}
+
+/// PSRAM pthread stack for the next `std::thread` spawn. Drop restores the
+/// previous config so other workers stay on internal stacks.
+pub(crate) fn psram_stack(stack_bytes: usize, label: &'static CStr) -> PsramStackGuard {
+    PsramStackGuard::enter(stack_bytes, label)
 }
 
 impl Drop for PsramStackGuard {
@@ -588,6 +595,7 @@ fn http_call(
     config.event_handler = Some(on_http_event);
     config.user_data = &mut cookies as *mut CookieList as *mut core::ffi::c_void;
     config.crt_bundle_attach = Some(sys::esp_crt_bundle_attach);
+    config.disable_auto_redirect = !request.follow_redirects;
     let raw = unsafe { esp_http_client_init(&config) };
     if raw.is_null() {
         return Err("HTTP connection init failed".into());
@@ -697,6 +705,7 @@ fn http_call_stream(
     config.event_handler = Some(on_http_event);
     config.user_data = &mut cookies as *mut CookieList as *mut core::ffi::c_void;
     config.crt_bundle_attach = Some(sys::esp_crt_bundle_attach);
+    config.disable_auto_redirect = !request.follow_redirects;
     let raw = unsafe { esp_http_client_init(&config) };
     if raw.is_null() {
         return Err("HTTP connection init failed".into());

@@ -11,7 +11,6 @@ use std::{
 };
 
 use crate::weread::{
-    bitmap::{self, MonoBitmap},
     decode,
     limits::{
         DOWNLOAD_CHUNK_BYTES, MAX_CHAPTERS, MAX_CHAPTER_IMAGES, MAX_CHAPTER_IMAGE_BYTES,
@@ -370,6 +369,9 @@ impl ImageDownload {
         if self.part_open {
             return Err("image download incomplete".into());
         }
+        if self.len == 0 {
+            return Err("empty image".into());
+        }
         if let Some(file) = self.file.as_mut() {
             file.sync_all()
                 .map_err(|error| explain_storage_error(&error.to_string()))?;
@@ -659,9 +661,25 @@ pub fn image_name(chapter_index: u32, slot: u16) -> String {
 
 #[must_use]
 pub fn image_cached(root: &Path, book_id: &str, chapter_index: u32, slot: u16) -> bool {
-    book_dir(root, book_id)
-        .join(image_name(chapter_index, slot))
-        .is_file()
+    fs::metadata(book_dir(root, book_id).join(image_name(chapter_index, slot)))
+        .is_ok_and(|meta| meta.len() > 0 && meta.len() <= MAX_CHAPTER_IMAGE_BYTES as u64)
+}
+
+/// Read one stored chapter image. Empty files are failures so they are fetched again.
+pub fn read_chapter_image(
+    root: &Path,
+    book_id: &str,
+    chapter_index: u32,
+    slot: u16,
+) -> Result<Vec<u8>, &'static str> {
+    let bytes = read_capped(
+        &book_dir(root, book_id).join(image_name(chapter_index, slot)),
+        MAX_CHAPTER_IMAGE_BYTES,
+    )?;
+    if bytes.is_empty() {
+        return Err("empty image");
+    }
+    Ok(bytes)
 }
 
 /// Written after the image pass for a chapter, including when every image was skipped.
@@ -705,32 +723,6 @@ pub fn chapter_image_refs(root: &Path, book_id: &str, index: u32) -> Vec<ImageRe
         })
         .take(MAX_CHAPTER_IMAGES)
         .collect()
-}
-
-/// Decode chapter images saved beside the text. Missing or hostile files are `None`.
-pub fn load_chapter_bitmaps(
-    root: &Path,
-    book_id: &str,
-    index: u32,
-    max_width: u32,
-    max_height: u32,
-) -> Vec<Option<MonoBitmap>> {
-    let mut out = Vec::new();
-    for slot in 0..MAX_CHAPTER_IMAGES {
-        let path = book_dir(root, book_id).join(image_name(index, slot as u16));
-        if !path.is_file() {
-            out.push(None);
-            continue;
-        }
-        let bitmap = read_capped(&path, MAX_CHAPTER_IMAGE_BYTES)
-            .ok()
-            .and_then(|bytes| bitmap::decode_mono(&bytes, max_width, max_height).ok());
-        out.push(bitmap);
-    }
-    while out.last().is_some_and(Option::is_none) {
-        out.pop();
-    }
-    out
 }
 
 pub fn load_chapter(root: &Path, book_id: &str, index: u32) -> Option<CachedChapter> {
@@ -1288,6 +1280,12 @@ mod tests {
         image.apply(DownloadEvent::EndPart).unwrap();
         image.commit().unwrap();
         assert!(super::image_cached(&dir, &book, 2, 0));
+        let mut empty = super::ImageDownload::begin(&dir, &book, 2, 3).unwrap();
+        empty.apply(DownloadEvent::BeginPart("img")).unwrap();
+        empty.apply(DownloadEvent::EndPart).unwrap();
+        assert!(empty.commit().unwrap_err().contains("empty"));
+        assert!(!super::image_cached(&dir, &book, 2, 3));
+        assert!(!super::book_dir(&dir, &book).join("IMG.TMP").exists());
         let stored = fs::read(super::book_dir(&dir, &book).join(&name)).unwrap();
         assert_eq!(stored, bytes);
 

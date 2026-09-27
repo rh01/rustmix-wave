@@ -17,14 +17,20 @@ pub const MAX_IMAGE_BYTES: usize = MAX_COVER_BYTES;
 /// One chapter image, compressed. Larger responses are skipped with a placeholder.
 ///
 /// On device this buffer is a heap `Vec`. Allocations above
-/// `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` (16 KiB) land in PSRAM.
+/// `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` (16 KiB) land in PSRAM. It is dropped
+/// before the luma plane is allocated.
 pub const MAX_CHAPTER_IMAGE_BYTES: usize = 1024 * 1024;
 /// Source edge accepted before decode. Larger headers are skipped.
-pub const MAX_IMAGE_EDGE: u32 = 1_600;
-/// Pixel count accepted before decode. RGBA at this size stays near 2 MiB.
-pub const MAX_DECODE_PIXELS: u32 = 800 * 800;
-/// Decode allocation cap passed to the image crate, beside one compressed image.
-pub const MAX_IMAGE_DECODE_BYTES: usize = 2 * 1024 * 1024;
+///
+/// A square at this edge is the largest RGBA buffer that still fits in PSRAM
+/// beside the SD font, glyph cache, and both WeRead stacks.
+pub const MAX_IMAGE_EDGE: u32 = 752;
+/// Pixel count accepted before decode.
+pub const MAX_DECODE_PIXELS: u32 = MAX_IMAGE_EDGE * MAX_IMAGE_EDGE;
+/// One decoded buffer (RGBA, 4 bytes per pixel). The image crate refuses
+/// anything larger. The compressed file is not still live when a second plane
+/// is allocated.
+pub const MAX_IMAGE_DECODE_BYTES: usize = (MAX_DECODE_PIXELS as usize) * 4;
 /// Widest reader measure. Bitmaps are decoded to this and scaled again to the
 /// open layout when the chapter is drawn.
 pub const IMAGE_TARGET_WIDTH: u32 = 752;
@@ -81,6 +87,9 @@ pub const DOWNLOAD_CHUNK_BYTES: usize = 8 * 1024;
 pub const DOWNLOAD_CLASSIFY_BYTES: usize = 512;
 /// One long-lived `weread-http` pthread stack, allocated from PSRAM.
 pub const WEREAD_HTTP_WORKER_STACK_BYTES: usize = 32 * 1024;
+/// `weread-img` pthread stack, allocated from PSRAM. JPEG/PNG decode runs here
+/// so the 16 KiB main task stays free for buttons and page turns.
+pub const IMAGE_DECODE_STACK_BYTES: usize = 64 * 1024;
 /// `esp_http_client` RX and TX buffers. Each stays under
 /// `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` so TLS I/O uses internal RAM.
 pub const HTTP_IO_BUFFER_BYTES: usize = 2 * 1024;
@@ -97,9 +106,9 @@ pub const SESSION_BAK: &str = "SESS.BAK";
 mod tests {
     use super::{
         DOWNLOAD_CHUNK_BYTES, HTTP_CHAPTER_LIMIT_MS, HTTP_IDLE_LIMIT_MS, HTTP_IO_BUFFER_BYTES,
-        HTTP_READ_TIMEOUT_MS, HTTP_TIMEOUT_SECS, MAX_CHAPTER_IMAGES, MAX_CHAPTER_IMAGE_BYTES,
-        MAX_CHAPTER_TEXT, MAX_IMAGE_DECODE_BYTES, MAX_SHARD_BYTES, MODULE_PSRAM_BYTES,
-        WEREAD_HTTP_WORKER_STACK_BYTES,
+        HTTP_READ_TIMEOUT_MS, HTTP_TIMEOUT_SECS, IMAGE_DECODE_STACK_BYTES, MAX_CHAPTER_IMAGES,
+        MAX_CHAPTER_IMAGE_BYTES, MAX_CHAPTER_TEXT, MAX_DECODE_PIXELS, MAX_IMAGE_DECODE_BYTES,
+        MAX_SHARD_BYTES, MODULE_PSRAM_BYTES, WEREAD_HTTP_WORKER_STACK_BYTES,
     };
     use crate::fonts::{
         GLYPH_CACHE_BUDGET_BYTES, MAX_SD_FONT_BYTES, SD_FONT_RESIDENT_BUDGET_BYTES,
@@ -138,11 +147,23 @@ mod tests {
         assert_eq!(HTTP_CHAPTER_LIMIT_MS, 120_000);
         assert!(HTTP_CHAPTER_LIMIT_MS > HTTP_IDLE_LIMIT_MS);
         assert!(HTTP_IDLE_LIMIT_MS > HTTP_READ_TIMEOUT_MS as u64);
-        // One compressed chapter image plus its decode buffer, not every image at once.
-        let image = MAX_CHAPTER_IMAGE_BYTES + MAX_IMAGE_DECODE_BYTES;
+        // Peak is the compressed file plus one RGBA decode. The file is dropped
+        // before the luma plane, so that plane is not added on top.
+        assert_eq!(
+            MAX_IMAGE_DECODE_BYTES,
+            MAX_DECODE_PIXELS as usize * 4,
+            "decode cap is one RGBA buffer"
+        );
+        let image_peak = MAX_CHAPTER_IMAGE_BYTES + MAX_IMAGE_DECODE_BYTES;
+        let luma_after_drop = MAX_IMAGE_DECODE_BYTES + MAX_DECODE_PIXELS as usize;
+        assert!(
+            luma_after_drop <= image_peak,
+            "luma conversion must not exceed the file-plus-decode peak"
+        );
         let with_image = SD_FONT_RESIDENT_BUDGET_BYTES
             + WEREAD_HTTP_WORKER_STACK_BYTES
-            + image
+            + IMAGE_DECODE_STACK_BYTES
+            + image_peak
             + GLYPH_CACHE_BUDGET_BYTES;
         assert!(
             with_image < MODULE_PSRAM_BYTES,
@@ -150,6 +171,6 @@ mod tests {
         );
         assert_eq!(MAX_CHAPTER_IMAGE_BYTES, 1024 * 1024);
         assert!(MAX_CHAPTER_IMAGES <= 8);
-        assert!(MAX_IMAGE_DECODE_BYTES <= 2 * 1024 * 1024);
+        assert!(IMAGE_DECODE_STACK_BYTES >= 48 * 1024);
     }
 }

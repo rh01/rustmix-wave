@@ -52,6 +52,42 @@ impl FlowItem {
     }
 }
 
+/// Characters of real chapter text. Placeholders and pictures contribute nothing,
+/// so a saved offset still lands on the same words after an image decodes.
+#[must_use]
+pub fn flow_text_chars(item: &FlowItem) -> usize {
+    match item {
+        FlowItem::Line(line) if is_image_placeholder(&line.text) => 0,
+        FlowItem::Line(line) => line.text.chars().count(),
+        FlowItem::Image { .. } => 0,
+    }
+}
+
+/// Page whose text contains `offset`, counting only [`flow_text_chars`].
+#[must_use]
+pub fn page_for_text_offset(pages: &[Vec<FlowItem>], offset: u32) -> usize {
+    if pages.is_empty() {
+        return 0;
+    }
+    let mut seen = 0u32;
+    for (index, page) in pages.iter().enumerate() {
+        let chars = page
+            .iter()
+            .map(flow_text_chars)
+            .fold(0u32, |sum, chars| sum.saturating_add(chars as u32));
+        if seen.saturating_add(chars) > offset {
+            return index;
+        }
+        seen = seen.saturating_add(chars);
+    }
+    pages.len() - 1
+}
+
+#[must_use]
+pub fn is_image_placeholder(text: &str) -> bool {
+    text.starts_with("[image:") && text.ends_with(']')
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Block {
     Text(TextBlock),
@@ -520,8 +556,8 @@ fn is_html_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        blocks_from_markup, image_placeholder, paginate_blocks, plain_from_blocks, zip_html_text,
-        Block, FlowItem, ImageMeasure,
+        blocks_from_markup, flow_text_chars, image_placeholder, page_for_text_offset,
+        paginate_blocks, plain_from_blocks, zip_html_text, Block, FlowItem, ImageMeasure,
     };
     use crate::reader::ReaderPreferences;
 
@@ -590,6 +626,37 @@ mod tests {
             .iter()
             .flatten()
             .any(|item| item.line_text().contains("[image: fig]")));
+
+        let offset = text_chars_before(&tall, "After");
+        assert_eq!(offset, text_chars_before(&missing, "After"));
+        assert_ne!(offset, 0);
+        assert!(page_has(
+            &tall,
+            page_for_text_offset(&tall, offset),
+            "After"
+        ));
+        assert!(page_has(
+            &missing,
+            page_for_text_offset(&missing, offset),
+            "After"
+        ));
+    }
+
+    fn text_chars_before(pages: &[Vec<FlowItem>], needle: &str) -> u32 {
+        let mut seen = 0u32;
+        for item in pages.iter().flatten() {
+            if item.line_text().contains(needle) {
+                return seen;
+            }
+            seen = seen.saturating_add(flow_text_chars(item) as u32);
+        }
+        seen
+    }
+
+    fn page_has(pages: &[Vec<FlowItem>], index: usize, needle: &str) -> bool {
+        pages
+            .get(index)
+            .is_some_and(|page| page.iter().any(|item| item.line_text().contains(needle)))
     }
 
     #[test]

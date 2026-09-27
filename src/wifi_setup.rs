@@ -562,10 +562,7 @@ pub mod espidf {
     };
 
     use anyhow::Result;
-    use embedded_svc::{
-        http::Method,
-        io::Write as _,
-    };
+    use embedded_svc::{http::Method, io::Write as _};
     use esp_idf_svc::http::server::{Configuration, EspHttpServer};
     use log::{info, warn};
 

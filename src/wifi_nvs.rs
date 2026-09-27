@@ -93,17 +93,17 @@ fn load_espidf() -> Option<NetworkConfig> {
     fn read_str(
         handle: esp_idf_svc::sys::nvs_handle_t,
         key: &str,
-        buf: &mut [u8],
+        buf: &mut [core::ffi::c_char],
     ) -> Option<String> {
         let key = CString::new(key).ok()?;
         let mut len = buf.len();
-        // Xtensa `c_char` is unsigned.
         let status = unsafe { nvs_get_str(handle, key.as_ptr(), buf.as_mut_ptr(), &mut len) };
         if status != ESP_OK || len == 0 {
             return None;
         }
-        let end = len.saturating_sub(1).min(buf.len());
-        core::str::from_utf8(&buf[..end]).ok().map(str::to_owned)
+        let n = len.saturating_sub(1).min(buf.len());
+        let bytes = unsafe { core::slice::from_raw_parts(buf.as_ptr() as *const u8, n) };
+        core::str::from_utf8(bytes).ok().map(str::to_owned)
     }
 
     unsafe {
@@ -112,10 +112,10 @@ fn load_espidf() -> Option<NetworkConfig> {
         if nvs_open(ns.as_ptr(), nvs_open_mode_t_NVS_READONLY, &mut handle) != ESP_OK {
             return None;
         }
-        let mut ssid_buf = [0u8; 40];
-        let mut pass_buf = [0u8; 80];
-        let mut tz_buf = [0u8; 40];
-        let mut ntp_buf = [0u8; 80];
+        let mut ssid_buf = [0 as core::ffi::c_char; 40];
+        let mut pass_buf = [0 as core::ffi::c_char; 80];
+        let mut tz_buf = [0 as core::ffi::c_char; 40];
+        let mut ntp_buf = [0 as core::ffi::c_char; 80];
         let ssid = read_str(handle, KEY_SSID, &mut ssid_buf);
         let password = read_str(handle, KEY_PASSWORD, &mut pass_buf).unwrap_or_default();
         let timezone =

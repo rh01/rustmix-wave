@@ -43,7 +43,13 @@ for path in root.rglob('*'):
         continue
     if path.is_file() and (path.suffix in {'.zip', '.sha256', '.pyc', '.orig', '.rej'} or path.name == '.DS_Store'):
         raise AssertionError(f'local artifact present: {path}')
-    if path.is_dir() and path.name == '__pycache__':
+    # Same prune as scripts/test-host.sh:
+    # find . \( -path ./target -o -path ./.embuild \) -prune -o -name '__pycache__'
+    if (
+        path.is_dir()
+        and path.name == '__pycache__'
+        and path.parts[:1] not in {('target',), ('.embuild',)}
+    ):
         raise AssertionError(f'python cache directory present: {path}')
 
 # Durable documentation is intentionally small and consolidated.

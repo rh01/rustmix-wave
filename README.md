@@ -152,6 +152,7 @@ Use the Wi-Fi firmware release for normal Wi-Fi transfer, weather, NTP/time sync
 - Voice Notes records PCM16 mono 16 kHz WAV files to SD, supports microphone gain, pause/resume, saved-note playback, titles, timestamps, delete confirmation, storage telemetry, and LAN export.
 - Native Dictionary reuses the Rustmix X4 prefix-shard SD pack and uses BOOT-short `NAV H` / `NAV V` keyboard-axis switching.
 - Lexicon looks up SD `RMXLEX1` dictionaries (English, kana, and pinyin keyboards) and Vocabulary reviews those lists with FSRS-6 or SM-2. Optional SD clips pronounce the current word.
+- WeRead, under Reader, signs in with a WeChat QR code, reads shelf chapters with the existing CJK reader, uploads progress, and can keep a whole book on the SD card.
 - Native Calendar loads personal events and the U.S.-only 2026 pack, renders a daily agenda, and supports recovery-safe personal-event creation, editing, and deletion.
 - Wi-Fi transfer portal provides explicit LAN-only SD access with protected configuration paths and atomic file replacement.
 - SoftAP captive setup (`Rustmix-Setup`, `http://192.168.4.1`) provisions Wi-Fi from a phone when `WIFI.TXT` is missing or STA join fails, while SD `WIFI.TXT` remains a first-class manual path.
@@ -179,6 +180,7 @@ See [`docs/BOARD_CONTRACT.md`](docs/BOARD_CONTRACT.md) for the stable board boun
 | Category | Application | Status |
 | --- | --- | --- |
 | Reader | Continue Reading, Library, Bookmarks | Ready: TXT and bounded reflowable EPUB |
+| Reader | WeRead | Ready: QR login, shelf, chapters, progress, notes, SD offline |
 | Productivity | Calendar | Ready: U.S.-only agenda and personal-event editor |
 | Productivity | Voice Notes | Ready: record, pause/resume, playback, title, delete, export |
 | Productivity | Vocabulary | Ready: FSRS-6 default, optional SM-2, SD progress |

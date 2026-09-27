@@ -166,6 +166,12 @@ pub fn is_protected_portal_path(relative: &str) -> bool {
             | "APPS/CALENDAR/EVENTS.BAK"
             | "VOCAB/PROGRESS.TMP"
             | "VOCAB/PROGRESS.BAK"
+            | "WEREAD.TXT"
+            | "WEREAD.TMP"
+            | "WEREAD.BAK"
+            | "WEREAD/SESS.TXT"
+            | "WEREAD/SESS.TMP"
+            | "WEREAD/SESS.BAK"
     )
 }
 
@@ -267,6 +273,7 @@ body{font-family:sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem}butt
 <label>Session code <input id="code" maxlength="6"><button onclick="saveCode()">Unlock</button></label>
 <p><button onclick="loadList('/')">Home</button><button onclick="loadList(current)">Refresh</button></p>
 <p>Path: <code id="path">/</code></p><div id="list"></div>
+<h2>WeRead</h2><input id="wereadkey" placeholder="wrk-... optional"><label><input id="wereadcovers" type="checkbox"> Covers</label><button onclick="saveWeread()">Save WeRead key</button>
 <h2>Upload</h2><input id="file" type="file"><input id="name" placeholder="BOOK0001.TXT"><button onclick="upload()">Upload</button>
 <h2>Folder</h2><input id="folder" placeholder="NEWFOLD"><button onclick="mkdir()">Create folder</button>
 <pre id="status">Enter the six-digit code displayed on the device.</pre>
@@ -282,6 +289,7 @@ async function upload(){try{let f=document.getElementById('file').files[0];let n
 async function mkdir(){try{await api('/api/mkdir?path='+enc(join(document.getElementById('folder').value)),{method:'POST'});status('Folder created');loadList(current)}catch(e){status(e.message)}}
 async function renamePath(p){try{let n=prompt('New FAT 8.3-safe name');if(!n)return;let parent=p.substring(0,p.lastIndexOf('/'))||'/';let to=(parent==='/'?'/':parent+'/')+n;await api('/api/rename?from='+enc(p)+'&to='+enc(to),{method:'POST'});status('Renamed');loadList(current)}catch(e){status(e.message)}}
 async function del(p){try{await api('/api/delete?path='+enc(p),{method:'POST'});status('Deleted');loadList(current)}catch(e){status(e.message)}}
+async function saveWeread(){try{let k=document.getElementById('wereadkey').value;let c=document.getElementById('wereadcovers').checked?'1':'0';await api('/api/weread',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:'api_key='+enc(k)+'&covers='+c});status('WeRead settings saved')}catch(e){status(e.message)}}
 loadList('/');
 </script></body></html>"#;
 
@@ -330,7 +338,7 @@ loadList('/');
                 stack_size: WIFI_TRANSFER_SERVER_STACK_BYTES,
                 max_open_sockets: 2,
                 max_sessions: 2,
-                max_uri_handlers: 10,
+                max_uri_handlers: 12,
                 session_timeout: Duration::from_secs(60),
                 ..Default::default()
             })?;
@@ -459,6 +467,36 @@ loadList('/');
                 lock(&rename_shared).touch(format!("Renamed {from}"), 0);
                 info!("rustmix-wave=wifi-transfer-request method=POST route=rename from={from} to={to} status=completed");
                 request.into_ok_response()?.write_all(b"renamed")?;
+                Ok::<(), anyhow::Error>(())
+            })?;
+
+            let weread_shared = Arc::clone(&shared);
+            let weread_code = code.clone();
+            server.fn_handler("/api/weread", Method::Post, move |mut request| {
+                authenticate(request.uri(), &weread_code)?;
+                let mut buffer = [0_u8; 256];
+                let mut total = 0usize;
+                loop {
+                    if total == buffer.len() {
+                        bail!("WeRead portal body is too large");
+                    }
+                    let read = request.read(&mut buffer[total..])?;
+                    if read == 0 {
+                        break;
+                    }
+                    total += read;
+                }
+                let text = std::str::from_utf8(&buffer[..total])
+                    .map_err(|_| anyhow!("WeRead portal body is not UTF-8"))?;
+                let update = crate::weread::session::parse_portal_body(text)
+                    .map_err(|error| anyhow!(error))?;
+                crate::weread::session::apply_portal_update(Path::new(WIFI_TRANSFER_ROOT), &update)
+                    .map_err(|error| anyhow!(error))?;
+                lock(&weread_shared).touch("Saved WeRead settings", total);
+                info!(
+                    "rustmix-wave=wifi-transfer-request method=POST route=weread status=completed"
+                );
+                request.into_ok_response()?.write_all(b"saved")?;
                 Ok::<(), anyhow::Error>(())
             })?;
 
@@ -636,6 +674,13 @@ mod tests {
         assert!(!is_protected_portal_path("APPS/CALENDAR/EVENTS.TXT"));
         assert!(!is_protected_portal_path("/VOICE/VOICE001.WAV"));
         assert!(!is_protected_portal_path("/BOOKS/NOTES001.TXT"));
+        assert!(is_protected_portal_path("WEREAD.TXT"));
+        assert!(is_protected_portal_path("/WEREAD.TMP"));
+        assert!(is_protected_portal_path("WEREAD.BAK"));
+        assert!(is_protected_portal_path("WEREAD/SESS.TXT"));
+        assert!(is_protected_portal_path("/WEREAD/SESS.TMP"));
+        assert!(is_protected_portal_path("WEREAD/SESS.BAK"));
+        assert!(!is_protected_portal_path("WEREAD/CH0001.TXT"));
     }
 
     #[test]

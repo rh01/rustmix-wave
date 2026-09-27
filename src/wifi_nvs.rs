@@ -101,9 +101,8 @@ fn load_espidf() -> Option<NetworkConfig> {
         if status != ESP_OK || len == 0 {
             return None;
         }
-        let bytes = unsafe {
-            core::slice::from_raw_parts(buf.as_ptr() as *const u8, len.saturating_sub(1))
-        };
+        let n = len.saturating_sub(1).min(buf.len());
+        let bytes = unsafe { core::slice::from_raw_parts(buf.as_ptr() as *const u8, n) };
         core::str::from_utf8(bytes).ok().map(str::to_owned)
     }
 

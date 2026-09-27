@@ -20,6 +20,12 @@ Calendar personal events and U.S. holidays are active. U.S. holiday rows remain 
 
 Dictionary exact and prefix lookup is active through the complete X4 pack. Saved words, search history, and Reader word-selection lookup remain deferred.
 
+## WeRead
+
+WeRead chapter text uses the documented web reader endpoints. Those responses are obfuscated, not a DRM envelope, but the signing inputs and cookie lifetime can change on the server without notice. Host tests cover the published vectors; a live QR scan, TLS session, and chapter download still need the device.
+
+Phone-number one-time-password login is not implemented. SELECT cancels an in-flight WeRead request; the HTTPS read itself still ends within the 20 second timeout. Renewal does not extend `wr_skey` unless that cookie value actually changes. Covers and inline images accept JPEG and PNG only, and only from WeRead or Tencent image hosts. Covers stay off until the shelf row is toggled. Offline files are decoded chapter text; inline bitmaps are not stored. Progress upload sends a character offset derived from the local page, and it needs the QR session. The official API key cannot fetch chapter text or update progress. Chapter fetches require an SNTP-synced clock because the RTC is stored as UTC+8 wall time. The official skill payload uses version 1.0.4.
+
 ## Merged factory-image release artifact
 
 The supported release artifact is the ESP-IDF ELF flashed through `espflash flash`.

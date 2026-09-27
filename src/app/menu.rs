@@ -20,8 +20,8 @@ pub struct MenuEntry {
 const HOME_ENTRIES: [MenuEntry; MAIN_CATEGORY_COUNT] = [
     MenuEntry {
         label: "Reader",
-        subtitle: "Books, progress and bookmarks",
-        badge: "3",
+        subtitle: "Books, WeRead, and bookmarks",
+        badge: "4",
         route: ScreenRoute::Reader,
     },
     MenuEntry {
@@ -50,7 +50,7 @@ const HOME_ENTRIES: [MenuEntry; MAIN_CATEGORY_COUNT] = [
     },
 ];
 
-const READER_ENTRIES: [MenuEntry; 3] = [
+const READER_ENTRIES: [MenuEntry; 4] = [
     MenuEntry {
         label: "Continue Reading",
         subtitle: "Resume the last saved book",
@@ -68,6 +68,12 @@ const READER_ENTRIES: [MenuEntry; 3] = [
         subtitle: "Saved reading positions",
         badge: "READY",
         route: ScreenRoute::Bookmarks,
+    },
+    MenuEntry {
+        label: "WeRead",
+        subtitle: "WeChat shelf, chapters, and offline",
+        badge: "READY",
+        route: ScreenRoute::WeRead,
     },
 ];
 
@@ -220,7 +226,7 @@ mod tests {
     #[test]
     fn exposes_requested_main_category_counts_without_synthetic_back_rows() {
         assert_eq!(home_entries().len(), MAIN_CATEGORY_COUNT);
-        assert_eq!(category_entries(ScreenRoute::Reader).len(), 3);
+        assert_eq!(category_entries(ScreenRoute::Reader).len(), 4);
         assert_eq!(category_entries(ScreenRoute::Productivity).len(), 3);
         assert_eq!(category_entries(ScreenRoute::Games).len(), 1);
         assert_eq!(category_entries(ScreenRoute::Tools).len(), 4);
@@ -245,6 +251,7 @@ mod tests {
             ScreenRoute::ContinueReading,
             ScreenRoute::Library,
             ScreenRoute::Bookmarks,
+            ScreenRoute::WeRead,
         ] {
             let entry = reader
                 .iter()

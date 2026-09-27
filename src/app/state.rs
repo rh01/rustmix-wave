@@ -24,6 +24,7 @@ use crate::{
     vocab::ui::{ResultSave, VocabUiState},
     voice_notes::{VoiceNotesUiRequest, VoiceNotesUiState},
     weather::WeatherSnapshot,
+    weread::WereadUi,
     wifi_setup::{WifiSetupSnapshot, WifiSetupUiRequest},
     wifi_transfer::{WifiTransferSnapshot, WifiTransferState, WifiTransferUiRequest},
 };
@@ -100,6 +101,8 @@ pub struct AppState {
     power_key_menu_return_route: ScreenRoute,
     power_key_manual_refresh_requested: bool,
     weather_refresh_requested: bool,
+    /// WeRead shelf, QR login, chapter reading, and offline cache.
+    pub weread: WereadUi,
     /// One-shot word clip. The main loop plays it in short I2S chunks.
     pronounce_request: Option<PronounceTarget>,
 }
@@ -143,6 +146,7 @@ impl Default for AppState {
             power_key_menu_return_route: ScreenRoute::Home,
             power_key_manual_refresh_requested: false,
             weather_refresh_requested: false,
+            weread: WereadUi::default(),
             pronounce_request: None,
         }
     }
@@ -213,6 +217,8 @@ impl AppState {
                 | ScreenRoute::ReaderToc
         ) {
             self.apply_reader(event);
+        } else if route.is_weread() {
+            self.apply_weread(event);
         } else if route.is_placeholder() {
             // Placeholders are intentionally inert. Hierarchical navigation is
             // consistently handled by the dedicated GPIO0 BOOT long press.
@@ -381,6 +387,9 @@ impl AppState {
                 if target == ScreenRoute::Vocab {
                     self.vocab.load_default();
                     self.sync_vocab_clock();
+                }
+                if target == ScreenRoute::WeRead {
+                    self.weread.enter(self.storage.mounted);
                 }
                 if target == ScreenRoute::ContinueReading && self.reader.session.is_some() {
                     self.router.navigate_to(ScreenRoute::ReaderPage);
@@ -1045,7 +1054,23 @@ impl AppState {
 
     /// Navigate one level toward Home. The hardware runtime calls this after a
     /// validated GPIO0 BOOT-button long press.
+    fn apply_weread(&mut self, event: ButtonEvent) {
+        if event == ButtonEvent::Select {
+            self.note_select_press();
+        }
+        let layout = self.reader.preferences.layout();
+        let previous = self.router.current();
+        if let Some(route) = self
+            .weread
+            .on_button(previous, event, layout, self.storage.mounted)
+        {
+            self.router.navigate_to(route);
+            self.weread.note_route(previous, route);
+        }
+    }
+
     pub fn back(&mut self) {
+        let previous = self.router.current();
         if self.router.current() == ScreenRoute::PowerKeyMenu {
             self.close_power_key_menu();
             return;
@@ -1092,6 +1117,7 @@ impl AppState {
         } else {
             self.router.back();
         }
+        self.weread.note_route(previous, self.router.current());
         self.sync_reader_orientation_for_active_route();
     }
 

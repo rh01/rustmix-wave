@@ -19,6 +19,13 @@ pub enum ScreenRoute {
     ReaderOptions,
     ReaderPreferences,
     ReaderToc,
+    WeRead,
+    WeReadLogin,
+    WeReadBook,
+    WeReadToc,
+    WeReadRead,
+    WeReadNotes,
+    WeReadDownload,
     Calendar,
     CalendarAgenda,
     CalendarEventDetails,
@@ -82,6 +89,13 @@ impl ScreenRoute {
             Self::ReaderOptions => "Reader Options",
             Self::ReaderPreferences => "Reading Preferences",
             Self::ReaderToc => "Table of Contents",
+            Self::WeRead => "WeRead",
+            Self::WeReadLogin => "WeRead Sign In",
+            Self::WeReadBook => "WeRead Book",
+            Self::WeReadToc => "WeRead Contents",
+            Self::WeReadRead => "WeRead Chapter",
+            Self::WeReadNotes => "WeRead Notes",
+            Self::WeReadDownload => "WeRead Download",
             Self::Calendar => "Calendar",
             Self::CalendarAgenda => "Daily Agenda",
             Self::CalendarEventDetails => "Calendar Event",
@@ -145,6 +159,13 @@ impl ScreenRoute {
             Self::ReaderOptions => "reader-options",
             Self::ReaderPreferences => "reader-preferences",
             Self::ReaderToc => "reader-toc",
+            Self::WeRead => "weread",
+            Self::WeReadLogin => "weread-login",
+            Self::WeReadBook => "weread-book",
+            Self::WeReadToc => "weread-toc",
+            Self::WeReadRead => "weread-read",
+            Self::WeReadNotes => "weread-notes",
+            Self::WeReadDownload => "weread-download",
             Self::Calendar => "calendar",
             Self::CalendarAgenda => "calendar-agenda",
             Self::CalendarEventDetails => "calendar-event-details",
@@ -210,7 +231,13 @@ impl ScreenRoute {
             Self::Reader | Self::Productivity | Self::Games | Self::Tools | Self::Settings => {
                 Some(Self::Home)
             }
-            Self::ContinueReading | Self::Library | Self::Bookmarks => Some(Self::Reader),
+            Self::ContinueReading | Self::Library | Self::Bookmarks | Self::WeRead => {
+                Some(Self::Reader)
+            }
+            Self::WeReadLogin | Self::WeReadBook => Some(Self::WeRead),
+            Self::WeReadToc | Self::WeReadRead | Self::WeReadNotes | Self::WeReadDownload => {
+                Some(Self::WeReadBook)
+            }
             Self::ReaderBookmarks => Some(Self::ReaderOptions),
             Self::ReaderLoading | Self::ReaderPage => Some(Self::Library),
             Self::ReaderOptions => Some(Self::ReaderPage),
@@ -249,6 +276,20 @@ impl ScreenRoute {
             Self::NetworkDetails | Self::WifiTransfer | Self::WifiSetup => Some(Self::Network),
             Self::WeatherDetails => Some(Self::Weather),
         }
+    }
+
+    #[must_use]
+    pub const fn is_weread(self) -> bool {
+        matches!(
+            self,
+            Self::WeRead
+                | Self::WeReadLogin
+                | Self::WeReadBook
+                | Self::WeReadToc
+                | Self::WeReadRead
+                | Self::WeReadNotes
+                | Self::WeReadDownload
+        )
     }
 
     #[must_use]
@@ -360,6 +401,13 @@ mod tests {
             ScreenRoute::LexiconSources.parent(),
             Some(ScreenRoute::Lexicon)
         );
+        assert_eq!(ScreenRoute::WeRead.parent(), Some(ScreenRoute::Reader));
+        assert_eq!(ScreenRoute::WeReadLogin.parent(), Some(ScreenRoute::WeRead));
+        assert_eq!(
+            ScreenRoute::WeReadRead.parent(),
+            Some(ScreenRoute::WeReadBook)
+        );
+        assert!(ScreenRoute::WeReadRead.is_weread());
         assert_eq!(ScreenRoute::Vocab.parent(), Some(ScreenRoute::Productivity));
         assert_eq!(ScreenRoute::VocabSession.parent(), Some(ScreenRoute::Vocab));
         assert_eq!(ScreenRoute::VocabStats.parent(), Some(ScreenRoute::Vocab));

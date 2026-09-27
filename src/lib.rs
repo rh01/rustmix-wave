@@ -50,6 +50,7 @@ pub mod voice_note_metadata;
 pub mod voice_notes;
 pub mod weather;
 pub mod weather_config;
+pub mod weread;
 pub mod wifi_nvs;
 pub mod wifi_setup;
 pub mod wifi_transfer;

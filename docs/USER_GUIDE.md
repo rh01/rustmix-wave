@@ -23,7 +23,7 @@ The home dashboard shows date, time, battery, weather summary, Wi-Fi state, and 
 
 | Row | Opens |
 | --- | --- |
-| Reader | Continue Reading, Library, and Bookmarks |
+| Reader | Continue Reading, Library, Bookmarks, and WeRead |
 | Productivity | Calendar, Voice Notes, and Vocabulary |
 | Games | SD-loaded apps backed by native Rust game surfaces |
 | Tools | File Browser, Dictionary, Lexicon, and Unit Converter |
@@ -42,6 +42,7 @@ The Reader category contains:
 - **Continue Reading**: reopen the most recently saved book position.
 - **Library**: browse TXT and EPUB files.
 - **Bookmarks**: open saved reading anchors directly.
+- **WeRead**: personal WeChat Reading shelf. The category screenshot above was captured before this row existed.
 
 Navigation: rotate to choose a row, SELECT to open, BOOT long to return home.
 
@@ -128,6 +129,34 @@ The EPUB TOC lists chapter entries. Rotate to choose a chapter, SELECT to open i
 </table>
 
 Bookmarks retain byte-offset anchors as the authoritative jump target. EPUB rows show chapter-relative labels when available; TXT rows show page labels. Rotate to choose a saved anchor, SELECT to open it, and hold BOOT to return.
+
+### WeRead
+
+WeRead is a personal reader for the owner's WeChat Reading account. It is not a public service and it does not ship a WeRead account.
+
+Open **Reader > WeRead**. The first row is **Sign in** until a session exists. SELECT shows a QR code. Scan it with WeChat. The device polls for about three minutes, then asks for a new code. The session is stored in `/RUSTMIX/WEREAD/SESS.TXT` and mirrored to NVS so it can survive a missing card. `wr_skey` is renewed before it expires. If the server says the session timed out, the QR screen comes back.
+
+Optional official API key: start **Settings > Network > Wi-Fi Transfer**, open the portal, and use the **WeRead** form. Paste a user-generated `wrk-...` key. Leave the field empty to clear it. The key is written to `/RUSTMIX/WEREAD.TXT`. That file and `WEREAD/SESS.TXT` are hidden from the portal file browser. An API key can load the shelf, book details, contents, progress, highlights, and notes. Chapter text and progress upload still need the QR login.
+
+Shelf rows:
+
+| Row | Action |
+| --- | --- |
+| Refresh shelf / Sign in | Reload the shelf, or open the QR screen |
+| Covers | Toggle small monochrome cover thumbnails. Off by default |
+| A book | Open that book |
+
+Book rows are **Read**, **Contents**, **Notes**, **Download**, and **Refresh**.
+
+Reading uses the same font, size, and CJK faces as the TXT/EPUB reader. Rotate up and down to change pages. At the ends of a chapter the control moves to the previous or next chapter. SELECT returns to the book menu. BOOT long does the same. After a page turn the device waits a few seconds, then uploads progress to WeRead when a web session is present.
+
+While a request is running the footer says WORKING. SELECT cancels it. Buttons and the idle timer keep running; a slow request does not put the panel to sleep the moment it returns.
+
+**Download** saves every chapter as plain text under `/RUSTMIX/WEREAD/<8 hex>/<8 hex>.TXT`. SELECT cancels the chapter that is downloading, and BOOT long leaves the screen. Saved chapters open with no network. The clock must be synced over Wi-Fi before a chapter can be fetched; the device treats the RTC value as UTC+8 wall time.
+
+Highlights and notes use the official read-only API and need the `wrk-` key. Phone-number one-time-password login is not supported: finish that step in the WeRead app, then scan again.
+
+Requests are spaced by at least 350 ms. Response sizes are capped before the buffer is allocated, and large buffers prefer PSRAM.
 
 ## 3. Productivity
 

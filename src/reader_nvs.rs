@@ -104,8 +104,8 @@ fn load_espidf(prefs: &mut ReaderPreferences) -> bool {
         let mut buf = [0u8; 40];
         let mut len = buf.len();
         if nvs_get_str(handle, face_key.as_ptr(), buf.as_mut_ptr(), &mut len) == ESP_OK {
-            let bytes = &buf[..len.saturating_sub(1)];
-            if let Ok(text) = core::str::from_utf8(bytes) {
+            let end = len.saturating_sub(1).min(buf.len());
+            if let Ok(text) = core::str::from_utf8(&buf[..end]) {
                 if let Ok(font) = BookFont::parse(text) {
                     prefs.apply_parsed_book_font(font, text);
                     changed = true;

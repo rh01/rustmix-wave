@@ -2771,6 +2771,50 @@ fn paginate_decoded(decoded: &[(char, u64)], layout: ReaderLayout) -> (Vec<Reade
     (lines, consumed)
 }
 
+/// Paginate plain text with the Reader line breaker used by TXT and EPUB pages.
+///
+/// `max_pages` is a hard cap so a hostile or huge chapter cannot grow without
+/// bound. The function stops early if a page does not advance.
+#[must_use]
+pub fn paginate_plain_text(
+    text: &str,
+    layout: ReaderLayout,
+    max_pages: usize,
+) -> Vec<Vec<ReaderPageLine>> {
+    let bytes = text.as_bytes();
+    let mut offset = 0u64;
+    let mut pages = Vec::new();
+    let limit = max_pages.min(4_096);
+    while (offset as usize) < bytes.len() && pages.len() < limit {
+        let start = offset as usize;
+        let end = previous_utf8_boundary(
+            bytes,
+            start
+                .saturating_add(READER_PAGE_READ_BYTES)
+                .min(bytes.len()),
+        )
+        .max(start);
+        if end == start {
+            break;
+        }
+        let decoded = decode_with_offsets(&bytes[start..end], TextEncoding::Utf8, start as u64);
+        let normalized = normalize_decoded(&decoded);
+        let (lines, consumed) = paginate_decoded(&normalized, layout);
+        if consumed <= offset {
+            break;
+        }
+        offset = consumed.min(bytes.len() as u64);
+        pages.push(lines);
+    }
+    if pages.is_empty() {
+        pages.push(vec![ReaderPageLine {
+            text: String::new(),
+            paragraph_end: true,
+        }]);
+    }
+    pages
+}
+
 fn decode_windows_1252(byte: u8) -> char {
     match byte {
         0x80 => '€',

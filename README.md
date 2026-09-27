@@ -153,6 +153,7 @@ Use the Wi-Fi firmware release for normal Wi-Fi transfer, weather, NTP/time sync
 - Native Dictionary reuses the Rustmix X4 prefix-shard SD pack and uses BOOT-short `NAV H` / `NAV V` keyboard-axis switching.
 - Native Calendar loads personal events and the U.S.-only 2026 pack, renders a daily agenda, and supports recovery-safe personal-event creation, editing, and deletion.
 - Wi-Fi transfer portal provides explicit LAN-only SD access with protected configuration paths and atomic file replacement.
+- SoftAP captive setup (`Rustmix-Setup`, `http://192.168.4.1`) provisions Wi-Fi from a phone when `WIFI.TXT` is missing or STA join fails, while SD `WIFI.TXT` remains a first-class manual path.
 - RTC alarms, weather, unit conversion, file browsing, audio diagnostics, sensors, Lua apps, and native motion games remain available.
 
 ## Hardware target
@@ -189,7 +190,7 @@ See [`docs/BOARD_CONTRACT.md`](docs/BOARD_CONTRACT.md) for the stable board boun
 | Settings | Display | Ready: UI font family and size persistence |
 | Settings | Environment | Ready: temperature and humidity |
 | Settings | Motion | Ready: IMU diagnostics |
-| Settings | Network | Ready: Wi-Fi, SNTP, explicit LAN transfer portal |
+| Settings | Network | Ready: WIFI.TXT and SoftAP setup, SNTP, explicit LAN transfer portal |
 | Settings | Weather | Ready with bounded retries and last-known-good cache |
 
 ## Sensor-driven utilities and motion games
@@ -204,7 +205,7 @@ Rustmix Wave uses the board peripherals as product features rather than treating
 | QMI8658 accelerometer and gyroscope | Live Motion diagnostics, debounced `TILT`, `SHAKE`, `ROTATE`, and `LEVEL` events, Tilt Maze, Motion 2048, and Sokoban Tilt |
 | ES8311 audio codec and I2S | Alarm chime, audio diagnostics, Voice Notes recording, and saved-WAV playback |
 | SDMMC storage | Reader library, Voice Notes, Dictionary shards, Calendar events, sleep images, Wi-Fi transfer, and SD-loaded app packs |
-| Wi-Fi and SNTP | Network status, RTC synchronization, weather fetch, and explicit LAN file transfer |
+| Wi-Fi and SNTP | Network status, SoftAP captive setup at 192.168.4.1, RTC synchronization, weather fetch, and explicit LAN file transfer |
 
 The native IMU event bridge keeps raw QMI8658 I2C samples inside Rust. It converts fixed-point accelerometer and gyroscope snapshots into debounced events with release latching and cooldowns. Motion games receive those bounded native events rather than raw I2C access:
 

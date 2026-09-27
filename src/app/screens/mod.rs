@@ -73,6 +73,7 @@ pub fn render_active_screen(
         ScreenRoute::Network => network::render_network(display, state),
         ScreenRoute::NetworkDetails => network::render_network_details(display, state),
         ScreenRoute::WifiTransfer => network::render_wifi_transfer(display, state),
+        ScreenRoute::WifiSetup => network::render_wifi_setup(display, state),
         ScreenRoute::Weather => weather::render_weather(display, state),
         ScreenRoute::WeatherDetails => weather::render_weather_details(display, state),
         ScreenRoute::Alarms => alarms::render_alarms(display, state),

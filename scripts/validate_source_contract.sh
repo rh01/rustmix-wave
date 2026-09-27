@@ -269,6 +269,7 @@ power = Path('src/power_key.rs').read_text()
 for module in (
     'calendar', 'dictionary', 'keyboard_navigation', 'power_key', 'power_key_menu',
     'reader', 'reader_nvs', 'fonts', 'epub', 'voice_notes', 'voice_note_metadata', 'wifi_transfer',
+    'wifi_setup', 'wifi_nvs',
     'alarm', 'sleep_mode', 'sleep_images', 'sleep_network', 'lua_runtime', 'games',
 ):
     assert f'pub mod {module};' in lib, f'library module missing: {module}'
@@ -281,6 +282,7 @@ for marker in (
     'rustmix-wave=offline-dictionary-x4-pack-native-foundation-ready',
     'rustmix-wave=voice-notes-organizer-controls-export-ready',
     'rustmix-wave=wifi-transfer-web-portal-ready',
+    'rustmix-wave=wifi-softap-setup-ready',
     'rustmix-wave=cjk-font-engine-ready',
     'rustmix-wave=panel-refresh-coordinator-ready',
 ):

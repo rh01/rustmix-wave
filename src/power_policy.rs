@@ -823,10 +823,11 @@ mod tests {
         alarm_wake_plan, clamp_auto_sleep_minutes, classify_wake_cause,
         cycle_auto_deep_sleep_minutes, days_from_civil, deep_sleep_blocked, format_battery,
         keep_retained_frame, mcu_mode, next_block_ms, panel_sleep_follow_up, plan_panel_transport,
-        power_key_poll_ms, sd_clock_khz, seconds_until, AlarmWakePlan, McuPowerMode, McuWake,
-        PanelSleepFollowUp, PanelTransport, PowerDebugSnapshot, RadioIdle, RadioJob, RefreshCause,
-        SleepResume, WaitInput, CURRENT_DRAW_ESTIMATES, DEFAULT_AUTO_DEEP_SLEEP_MINUTES,
-        RADIO_IDLE_TIMEOUT_SECS, SD_IDLE_CLOCK_KHZ,
+        power_key_poll_ms, sd_clock_khz, sd_host_can_idle, seconds_until, AlarmWakePlan,
+        McuPowerMode, McuWake, PanelSleepFollowUp, PanelTransport, PowerDebugSnapshot, RadioIdle,
+        RadioJob, RefreshCause, SleepResume, WaitInput, CURRENT_DRAW_ESTIMATES,
+        DEFAULT_AUTO_DEEP_SLEEP_MINUTES, RADIO_IDLE_TIMEOUT_SECS, SD_ACTIVE_CLOCK_KHZ,
+        SD_IDLE_CLOCK_KHZ,
     };
     use crate::rtc::RtcDateTime;
 

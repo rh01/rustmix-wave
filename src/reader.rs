@@ -106,7 +106,16 @@ const CACHE_FNV_PRIME: u64 = 0x100000001b3;
 std::thread_local! {
     static LAYOUT_BUTTON_POLL: Cell<Option<NonNull<dyn FnMut() -> bool + 'static>>> =
         const { Cell::new(None) };
+    static LIBRARY_SCAN_PAUSES: Cell<u32> = const { Cell::new(0) };
 }
+
+/// Progress and bookmark files are small text records. A multi-megabyte file
+/// in this slot is corrupt and must not be loaded onto the heap.
+const READER_PROGRESS_BYTES_LIMIT: u64 = 64 * 1024;
+/// TXT `.CCH` anchor files stay bounded by [`READER_CACHE_OFFSET_LIMIT`].
+const READER_ANCHOR_CACHE_BYTES_LIMIT: u64 = 256 * 1024;
+/// How many legacy whole-book `*.EPI` names to unlink on one library open.
+const LEGACY_INDEX_CLEANUP_LIMIT: usize = 128;
 
 /// Run `body` while EPUB layout batches can poll buttons.
 ///
@@ -141,6 +150,13 @@ pub fn with_layout_button_poll<R>(poll: &mut dyn FnMut() -> bool, body: impl FnO
 
 fn layout_button_pending() -> bool {
     LAYOUT_BUTTON_POLL.with(|slot| slot.get().is_some_and(|poll| unsafe { (*poll.as_ptr())() }))
+}
+
+/// Let the idle task run between library EPUB title reads so a long SD scan
+/// cannot sit in `thread::join` until the task watchdog fires.
+fn pause_between_library_books() {
+    LIBRARY_SCAN_PAUSES.with(|count| count.set(count.get().saturating_add(1)));
+    std::thread::sleep(Duration::from_millis(READER_EPUB_INDEX_YIELD_MILLIS));
 }
 
 /// Reader-supported content types. TXT and bounded reflowable EPUB are active.
@@ -3235,6 +3251,10 @@ impl ReaderUiState {
     }
 
     pub fn refresh_library(&mut self) {
+        let removed = discard_legacy_whole_book_indexes(&self.cache_directory());
+        if removed > 0 {
+            log::info!("rustmix-wave=epub-legacy-index status=removed count={removed}");
+        }
         match scan_txt_library(&self.books_root) {
             Ok(books) => {
                 self.books = books;
@@ -4701,6 +4721,9 @@ pub fn scan_txt_library(root: impl AsRef<Path>) -> Result<Vec<ReaderBook>, Strin
             .unwrap_or("Untitled book")
             .to_string();
         let title = if format == BookFormat::Epub {
+            // One bounded metadata read per book. The main task is blocked in
+            // the worker join, so pause first and never slurp the whole ZIP.
+            pause_between_library_books();
             read_epub_title_on_worker(&path)
                 .ok()
                 .filter(|value| !value.trim().is_empty())
@@ -5441,16 +5464,18 @@ fn parse_anchor_cache(
 }
 
 fn load_preferences(path: &Path) -> Result<Option<ReaderPreferences>, String> {
-    load_with_backup(path, ReaderPreferences::parse)
+    load_with_backup(path, READER_PROGRESS_BYTES_LIMIT, ReaderPreferences::parse)
 }
 
 fn load_location_record(path: &Path) -> Result<Option<ReaderLocation>, String> {
-    load_with_backup(path, parse_location_record)
+    load_with_backup(path, READER_PROGRESS_BYTES_LIMIT, parse_location_record)
 }
 
 fn load_location_list(path: &Path, limit: usize) -> Result<Vec<ReaderLocation>, String> {
-    load_with_backup(path, |text| parse_location_list(text, limit))
-        .map(|value| value.unwrap_or_default())
+    load_with_backup(path, READER_PROGRESS_BYTES_LIMIT, |text| {
+        parse_location_list(text, limit)
+    })
+    .map(|value| value.unwrap_or_default())
 }
 
 fn load_anchor_cache(
@@ -5458,11 +5483,14 @@ fn load_anchor_cache(
     book: &ReaderBook,
     layout: ReaderLayout,
 ) -> Result<Option<ReaderAnchorCache>, String> {
-    load_with_backup(path, |text| parse_anchor_cache(text, book, layout))
+    load_with_backup(path, READER_ANCHOR_CACHE_BYTES_LIMIT, |text| {
+        parse_anchor_cache(text, book, layout)
+    })
 }
 
 fn load_with_backup<T>(
     path: &Path,
+    max_bytes: u64,
     parser: impl Fn(&str) -> Result<T, String>,
 ) -> Result<Option<T>, String> {
     let backup = with_extension(path, "BAK");
@@ -5471,7 +5499,7 @@ fn load_with_backup<T>(
         if !candidate.exists() {
             continue;
         }
-        match fs::read_to_string(&candidate) {
+        match read_capped_string(&candidate, max_bytes) {
             Ok(text) => match parser(&text) {
                 Ok(value) => return Ok(Some(value)),
                 Err(error) => errors.push(format!("{}: {error}", candidate.display())),
@@ -5484,6 +5512,50 @@ fn load_with_backup<T>(
     } else {
         Err(errors.join("; "))
     }
+}
+
+fn read_capped_string(path: &Path, max_bytes: u64) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let len = file
+        .metadata()
+        .map_err(|error| format!("stat {}: {error}", path.display()))?
+        .len();
+    if len > max_bytes {
+        return Err(format!(
+            "{} is {len} bytes; refusing to load more than {max_bytes}",
+            path.display()
+        ));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    Ok(text)
+}
+
+/// Unlink leftover whole-book `CACHE/*.EPI` indexes by name. Their bodies can
+/// be larger than RAM; nothing here opens or parses them.
+fn discard_legacy_whole_book_indexes(cache_dir: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(cache_dir) else {
+        return 0;
+    };
+    let mut removed = 0_usize;
+    for entry in entries.flatten().take(LEGACY_INDEX_CLEANUP_LIMIT) {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.to_ascii_uppercase().ends_with(".EPI") {
+            continue;
+        }
+        pause_between_library_books();
+        if fs::remove_file(&path).is_ok() {
+            removed = removed.saturating_add(1);
+        }
+    }
+    removed
 }
 
 fn is_fat83_safe_file_name(path: &Path) -> bool {
@@ -6428,6 +6500,90 @@ mod tests {
             reader.loading_stage(),
             Some(ReaderLoadingStage::OpeningFile)
         );
+    }
+
+    #[test]
+    fn library_open_pauses_between_epubs_and_unlinks_legacy_epi_without_parsing() {
+        super::LIBRARY_SCAN_PAUSES.with(|count| count.set(0));
+        let books = temp_dir("library-scan-books");
+        let state = temp_dir("library-scan-state");
+        let cache = state.join("CACHE");
+        fs::create_dir_all(&cache).unwrap();
+        let legacy = cache.join("DEADBEEF.EPI");
+        fs::write(&legacy, vec![0xA5_u8; 48 * 1024]).unwrap();
+        fs::write(cache.join("KEEPME.CCH"), b"version=3\n").unwrap();
+        for (name, opf) in [
+            (
+                "one.epub",
+                "<package><metadata><dc:title>Alpha</dc:title></metadata></package>",
+            ),
+            (
+                "two.epub",
+                "<package><metadata><dc:title>Beta</dc:title></metadata></package>",
+            ),
+        ] {
+            let bytes = stored_zip(&[
+                (
+                    "META-INF/container.xml",
+                    "<container><rootfiles><rootfile full-path='book.opf'/></rootfiles></container>",
+                ),
+                ("book.opf", opf),
+            ]);
+            fs::write(books.join(name), bytes).unwrap();
+        }
+        let mut reader = ReaderUiState::with_roots(
+            books.to_string_lossy().into_owned(),
+            state.to_string_lossy().into_owned(),
+        );
+        reader.refresh_library();
+        assert!(!legacy.exists());
+        assert!(cache.join("KEEPME.CCH").is_file());
+        let titles: Vec<_> = reader
+            .books
+            .iter()
+            .map(|book| book.title.as_str())
+            .collect();
+        assert_eq!(titles, vec!["Alpha", "Beta"]);
+        assert!(super::LIBRARY_SCAN_PAUSES.with(|count| count.get()) >= 2);
+        let _ = fs::remove_dir_all(books);
+        let _ = fs::remove_dir_all(state);
+    }
+
+    #[test]
+    fn oversized_or_corrupt_progress_is_ignored_without_panicking() {
+        let books = temp_dir("progress-cap-books");
+        let state = temp_dir("progress-cap-state");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(state.join("STATE.TXT"), vec![b'A'; 70 * 1024]).unwrap();
+        fs::write(
+            state.join("POSITS.TXT"),
+            "version=1\nentry=good.epub\tGood\tepub\t10\t0\t4\t20\tnot-a-number\nentry=also.epub\tAlso\tepub\t10\t0\t1\t2\t3\t4\t5\nentry=old.txt\tOld\ttxt\t8\t1\t2\t9\n",
+        )
+        .unwrap();
+        fs::write(state.join("MARKS.TXT"), b"\xff\xfe not utf-8").unwrap();
+        let mut reader = ReaderUiState::with_roots(
+            books.to_string_lossy().into_owned(),
+            state.to_string_lossy().into_owned(),
+        );
+        let report = reader.load_persistent_state();
+        assert!(reader.resume.is_none());
+        let warning = report.warning.unwrap_or_default();
+        assert!(warning.contains("STATE.TXT"), "{warning}");
+        assert!(warning.contains("MARKS.TXT"), "{warning}");
+        assert_eq!(reader.positions.len(), 2);
+        assert_eq!(reader.positions[0].title, "Also");
+        assert_eq!(
+            reader.positions[0]
+                .epub_chapter
+                .as_ref()
+                .map(|chapter| chapter.chapter_number),
+            Some(3)
+        );
+        assert_eq!(reader.positions[1].title, "Old");
+        assert!(reader.positions[1].epub_chapter.is_none());
+        assert!(reader.bookmarks.is_empty());
+        let _ = fs::remove_dir_all(books);
+        let _ = fs::remove_dir_all(state);
     }
 
     fn push_u16(output: &mut Vec<u8>, value: u16) {

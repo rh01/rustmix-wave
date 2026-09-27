@@ -2111,11 +2111,24 @@ mod firmware {
                     if let Some(request) = state.apply_audio_button(event) {
                         apply_audio_request(&mut audio_runtime, &mut state, request);
                     }
-                } else {
+                } else if matches!(
+                    previous_route,
+                    ScreenRoute::ReaderLoading | ScreenRoute::ReaderPage
+                ) {
+                    // Page turns lay out EPUB text and must notice a key.
+                    // Library open also spawns a title worker; wrapping that
+                    // path adds frames on the 16 KB main stack.
                     waveshare_epd397_rust_app::reader::with_layout_button_poll(
                         &mut || buttons.any_pressed().unwrap_or(false),
                         || state.apply_hardware_key(press),
                     );
+                } else {
+                    state.apply(event);
+                }
+                if !matches!(
+                    previous_route,
+                    ScreenRoute::Files | ScreenRoute::Alarms | ScreenRoute::Audio
+                ) {
                     log_lua_runtime_events(&mut state);
                     if state.active_route() == ScreenRoute::Files {
                         storage_browser.refresh();
